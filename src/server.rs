@@ -1,0 +1,1341 @@
+//! An HTTP server with the OpenAI API (`/v1/chat/completions`, `/v1/completions`, `/v1/models`),
+//! so that existing clients and SDKs work unchanged, plus SGLang's native `/generate`.
+
+use crate::chat::{self, ChatTemplate};
+use crate::engine::{
+    EngineHandle, Event, FinishReason, GenerateParams, Request, STACK_BYTES, TokenLogprob, Usage,
+};
+use crate::grammar::{Grammar, Vocabulary};
+use crate::sampler::SamplingParams;
+use crate::tokenizer::Tokenizer;
+use crate::tools::{self, ToolFormat, ToolOptions, ToolOutput, ToolParser, ToolReading};
+use anyhow::{Context, Result};
+use axum::Router;
+use axum::body::{Body, Bytes};
+use axum::extract::{DefaultBodyLimit, State};
+use axum::http::{HeaderValue, StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::serve::ListenerExt;
+use futures_util::stream::{self, BoxStream};
+use futures_util::{Stream, StreamExt};
+use serde::Deserialize;
+use serde_json::{Map, Value, json};
+use std::collections::{HashMap, HashSet};
+use std::convert::Infallible;
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Instant, SystemTime};
+use tokio::sync::mpsc::UnboundedReceiver;
+use tower_http::cors::CorsLayer;
+
+/// Largest request body accepted, which is what limits prompt size in practice.
+const MAX_BODY_BYTES: usize = 64 << 20;
+const MAX_CHOICES: usize = 128;
+
+/// Sampling settings the model's authors chose, from `generation_config.json`.
+#[derive(Clone, Copy)]
+pub struct SamplingDefaults {
+    temperature: f32,
+    top_p: f32,
+    top_k: usize,
+    repeat_penalty: f32,
+}
+
+impl SamplingDefaults {
+    pub fn load(dir: &Path) -> Self {
+        let config: Value = std::fs::read_to_string(dir.join("generation_config.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or(Value::Null);
+        let float = |name: &str, default: f32| config[name].as_f64().map_or(default, |v| v as f32);
+        Self {
+            temperature: float("temperature", 1.0),
+            top_p: float("top_p", 1.0),
+            top_k: config["top_k"].as_u64().unwrap_or(0) as usize,
+            repeat_penalty: float("repetition_penalty", 1.0),
+        }
+    }
+}
+
+pub struct Server {
+    pub engine: EngineHandle,
+    pub tokenizer: Arc<Tokenizer>,
+    pub template: Option<ChatTemplate>,
+    pub model_name: String,
+    pub stop_tokens: HashSet<u32>,
+    pub defaults: SamplingDefaults,
+    pub vocab_size: usize,
+    /// The notation the model writes tool calls in, if it has one.
+    pub tool_format: Option<ToolFormat>,
+}
+
+struct App {
+    server: Server,
+    created: u64,
+    next_id: AtomicU64,
+    vocabulary: Arc<Vocabulary>,
+    /// For tool calls in a notation that needs special tokens, made if it's ever needed.
+    marker_vocabulary: OnceLock<Arc<Vocabulary>>,
+    /// Compiled grammars, so that repeating a schema doesn't compile it again.
+    grammars: Mutex<HashMap<String, Arc<Grammar>>>,
+}
+
+/// Run the server until Ctrl-C.
+pub fn serve(server: Server, address: &str) -> Result<()> {
+    let vocabulary = Arc::new(Vocabulary::new(&server.tokenizer, server.vocab_size));
+    let app = Arc::new(App {
+        server,
+        created: unix_time(),
+        next_id: AtomicU64::new(1),
+        vocabulary,
+        marker_vocabulary: OnceLock::new(),
+        grammars: Mutex::new(HashMap::new()),
+    });
+    let router = Router::new()
+        .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/completions", post(completions))
+        .route("/v1/models", get(models))
+        .route("/generate", post(generate))
+        .route("/health", get(|| async { StatusCode::OK }))
+        .route("/metrics", get(metrics))
+        .route("/get_model_info", get(model_info))
+        .route("/get_server_info", get(server_info))
+        .route("/flush_cache", post(flush_cache))
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .layer(CorsLayer::permissive())
+        .with_state(app);
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_stack_size(STACK_BYTES)
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        let listener = tokio::net::TcpListener::bind(address)
+            .await
+            .with_context(|| format!("couldn't listen on {address}"))?;
+        eprintln!("Serving an OpenAI-compatible API on http://{address}/v1");
+        // Small writes are the whole point of streaming, and without this the kernel holds each
+        // one back until the last has been acknowledged, which can take 40 ms.
+        let listener = listener.tap_io(|connection| {
+            let _ = connection.set_nodelay(true);
+        });
+        axum::serve(listener, router)
+            .with_graceful_shutdown(async {
+                let _ = tokio::signal::ctrl_c().await;
+            })
+            .await
+            .context("the server failed")
+    })
+}
+
+fn unix_time() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// An error in OpenAI's format.
+struct ApiError {
+    status: StatusCode,
+    message: String,
+    kind: &'static str,
+    code: Option<&'static str>,
+}
+
+impl ApiError {
+    fn invalid(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: message.into(),
+            kind: "invalid_request_error",
+            code: None,
+        }
+    }
+
+    fn internal(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: message.into(),
+            kind: "server_error",
+            code: None,
+        }
+    }
+
+    fn body(&self) -> Value {
+        json!({ "error": {
+            "message": self.message,
+            "type": self.kind,
+            "param": null,
+            "code": self.code,
+        }})
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        json_response(self.status, &self.body())
+    }
+}
+
+fn json_response(status: StatusCode, value: &Value) -> Response {
+    let mut response = (status, value.to_string()).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    response
+}
+
+fn parse_body<'a, T: Deserialize<'a>>(body: &'a [u8]) -> Result<T, ApiError> {
+    serde_json::from_slice(body).map_err(|err| ApiError::invalid(format!("invalid request: {err}")))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Requests
+// ---------------------------------------------------------------------------------------------
+
+/// A value that may be given as one item or a list of them.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum OneOrMany<T> {
+    One(T),
+    Many(Vec<T>),
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct SamplingFields {
+    #[serde(alias = "max_new_tokens", alias = "max_completion_tokens")]
+    max_tokens: Option<usize>,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    top_k: Option<i64>,
+    min_p: Option<f32>,
+    n: Option<usize>,
+    stop: Option<OneOrMany<String>>,
+    stop_token_ids: Option<Vec<u32>>,
+    seed: Option<u64>,
+    frequency_penalty: Option<f32>,
+    presence_penalty: Option<f32>,
+    repetition_penalty: Option<f32>,
+    logit_bias: Option<HashMap<String, f32>>,
+    ignore_eos: bool,
+    skip_special_tokens: Option<bool>,
+    // Structured output.
+    response_format: Option<Value>,
+    regex: Option<String>,
+    ebnf: Option<String>,
+    json_schema: Option<Value>,
+}
+
+impl SamplingFields {
+    /// Whether the request sets its own constraint on the reply.
+    fn constrains_output(&self) -> bool {
+        self.regex.is_some()
+            || self.ebnf.is_some()
+            || self.json_schema.is_some()
+            || self
+                .response_format
+                .as_ref()
+                .is_some_and(|format| !matches!(format["type"].as_str(), None | Some("text")))
+    }
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct StreamOptions {
+    include_usage: bool,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct ChatRequest {
+    messages: Vec<Value>,
+    stream: bool,
+    stream_options: StreamOptions,
+    tools: Option<Value>,
+    tool_choice: Option<Value>,
+    parallel_tool_calls: Option<bool>,
+    chat_template_kwargs: Option<Map<String, Value>>,
+    logprobs: bool,
+    top_logprobs: Option<usize>,
+    #[serde(flatten)]
+    sampling: SamplingFields,
+}
+
+/// The ways `/v1/completions` allows a prompt to be written.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Prompt {
+    Text(String),
+    Tokens(Vec<u32>),
+    Texts(Vec<String>),
+    TokenLists(Vec<Vec<u32>>),
+}
+
+#[derive(Deserialize)]
+struct CompletionRequest {
+    prompt: Prompt,
+    #[serde(default)]
+    stream: bool,
+    #[serde(default)]
+    stream_options: StreamOptions,
+    #[serde(default)]
+    echo: bool,
+    #[serde(default)]
+    logprobs: Option<usize>,
+    #[serde(flatten)]
+    sampling: SamplingFields,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct NativeRequest {
+    text: Option<String>,
+    input_ids: Option<Vec<u32>>,
+    stream: bool,
+    sampling_params: SamplingFields,
+}
+
+fn new_seed() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64)
+}
+
+impl App {
+    fn next_id(&self, prefix: &str) -> String {
+        format!("{prefix}-{:016x}", self.next_id.fetch_add(1, Relaxed))
+    }
+
+    fn context_limit(&self) -> usize {
+        let config = self.server.engine.config();
+        config.ctx_size.min(config.cache_tokens)
+    }
+
+    /// Turn the API's sampling fields into engine parameters.
+    fn params(
+        &self,
+        fields: &SamplingFields,
+        prompt_len: usize,
+    ) -> Result<GenerateParams, ApiError> {
+        let defaults = self.server.defaults;
+        let temperature = fields.temperature.unwrap_or(defaults.temperature);
+        let top_p = fields.top_p.unwrap_or(defaults.top_p);
+        if !(0.0..=2.0).contains(&temperature) {
+            return Err(ApiError::invalid("temperature must be between 0 and 2"));
+        }
+        if !(top_p > 0.0 && top_p <= 1.0) {
+            return Err(ApiError::invalid(
+                "top_p must be greater than 0 and at most 1",
+            ));
+        }
+        let limit = self.context_limit();
+        if prompt_len >= limit {
+            return Err(ApiError {
+                status: StatusCode::BAD_REQUEST,
+                message: format!(
+                    "the prompt is {prompt_len} tokens, but this model's context limit is {limit}"
+                ),
+                kind: "invalid_request_error",
+                code: Some("context_length_exceeded"),
+            });
+        }
+        let room = limit - prompt_len;
+        let max_tokens = match fields.max_tokens {
+            Some(0) => return Err(ApiError::invalid("max_tokens must be at least 1")),
+            Some(n) => n.min(room),
+            None => room,
+        };
+
+        let mut logit_bias = Vec::new();
+        for (token, bias) in fields.logit_bias.iter().flatten() {
+            let id = token.parse().map_err(|_| {
+                ApiError::invalid(format!("logit_bias key '{token}' isn't a token id"))
+            })?;
+            logit_bias.push((id, *bias));
+        }
+        if let Some(n) = fields.n
+            && !(1..=MAX_CHOICES).contains(&n)
+        {
+            return Err(ApiError::invalid(format!(
+                "n must be between 1 and {MAX_CHOICES}"
+            )));
+        }
+        let mut stop_tokens = self.server.stop_tokens.clone();
+        for &id in fields.stop_token_ids.iter().flatten() {
+            if id as usize >= self.server.vocab_size {
+                return Err(ApiError::invalid(format!(
+                    "stop token {id} is outside the vocabulary"
+                )));
+            }
+            stop_tokens.insert(id);
+        }
+        let stop_strings: Vec<String> = match &fields.stop {
+            None => Vec::new(),
+            Some(OneOrMany::One(stop)) => vec![stop.clone()],
+            Some(OneOrMany::Many(stops)) => stops.clone(),
+        };
+        let stop_strings = stop_strings.into_iter().filter(|s| !s.is_empty()).collect();
+
+        Ok(GenerateParams {
+            max_tokens,
+            sampling: SamplingParams {
+                temperature,
+                top_k: match fields.top_k {
+                    Some(k) => k.max(0) as usize,
+                    None => defaults.top_k,
+                },
+                top_p,
+                min_p: fields.min_p.unwrap_or(0.0),
+                repeat_penalty: fields.repetition_penalty.unwrap_or(defaults.repeat_penalty),
+                frequency_penalty: fields.frequency_penalty.unwrap_or(0.0),
+                presence_penalty: fields.presence_penalty.unwrap_or(0.0),
+                logit_bias,
+                seed: fields.seed.unwrap_or_else(new_seed),
+            },
+            stop_tokens,
+            stop_strings,
+            ignore_eos: fields.ignore_eos,
+            skip_special_tokens: fields.skip_special_tokens.unwrap_or(true),
+            strip_leading_space: false,
+            logprobs: None,
+            grammar: self.grammar(fields)?,
+            grammar_triggers: Vec::new(),
+            keep_tokens: Vec::new(),
+        })
+    }
+
+    /// Compile the structured-output constraint a request asks for, if any.
+    fn grammar(&self, fields: &SamplingFields) -> Result<Option<Arc<Grammar>>, ApiError> {
+        let mut specs = Vec::new();
+        if let Some(pattern) = &fields.regex {
+            specs.push(format!("regex:{pattern}"));
+        }
+        if let Some(ebnf) = &fields.ebnf {
+            specs.push(format!("ebnf:{ebnf}"));
+        }
+        if let Some(schema) = &fields.json_schema {
+            let schema = match schema {
+                // SGLang's native API passes the schema as a string.
+                Value::String(text) => serde_json::from_str(text)
+                    .map_err(|err| ApiError::invalid(format!("invalid json_schema: {err}")))?,
+                other => other.clone(),
+            };
+            specs.push(format!("schema:{schema}"));
+        }
+        if let Some(format) = &fields.response_format {
+            match format["type"].as_str() {
+                None | Some("text") => {}
+                Some("json_object") => specs.push("json".to_string()),
+                Some("json_schema") => {
+                    let schema = &format["json_schema"]["schema"];
+                    if schema.is_null() {
+                        return Err(ApiError::invalid(
+                            "response_format needs json_schema.schema",
+                        ));
+                    }
+                    specs.push(format!("schema:{schema}"));
+                }
+                Some(other) => {
+                    return Err(ApiError::invalid(format!(
+                        "unknown response_format '{other}'"
+                    )));
+                }
+            }
+        }
+        if specs.len() > 1 {
+            return Err(ApiError::invalid(
+                "regex, ebnf, json_schema and response_format can't be combined",
+            ));
+        }
+        let Some(spec) = specs.pop() else {
+            return Ok(None);
+        };
+        self.compiled(spec, self.vocabulary.clone()).map(Some)
+    }
+
+    /// Compile a grammar, unless it's been done already.
+    fn compiled(
+        &self,
+        spec: String,
+        vocabulary: Arc<Vocabulary>,
+    ) -> Result<Arc<Grammar>, ApiError> {
+        if let Some(grammar) = self.grammars.lock().unwrap().get(&spec) {
+            return Ok(grammar.clone());
+        }
+        let grammar = Grammar::compile(&spec, vocabulary)
+            .map_err(|err| ApiError::invalid(format!("invalid grammar: {err:#}")))?;
+        let grammar = Arc::new(grammar);
+        let mut grammars = self.grammars.lock().unwrap();
+        if grammars.len() >= 256 {
+            grammars.clear();
+        }
+        grammars.insert(spec, grammar.clone());
+        Ok(grammar)
+    }
+
+    /// The vocabulary for grammars of tool calls written in `format`.
+    fn tool_vocabulary(&self, format: ToolFormat) -> Arc<Vocabulary> {
+        let tokenizer = &self.server.tokenizer;
+        let markers = format.marker_tokens(tokenizer);
+        if markers.is_empty() {
+            return self.vocabulary.clone();
+        }
+        self.marker_vocabulary
+            .get_or_init(|| {
+                let size = self.server.vocab_size;
+                Arc::new(Vocabulary::with_markers(tokenizer, size, &markers))
+            })
+            .clone()
+    }
+
+    /// A new id for a tool call. These need to be different from those in a client's earlier
+    /// conversations, including ones from before the server last started.
+    fn call_id(&self, format: ToolFormat) -> String {
+        let count = self.next_id.fetch_add(1, Relaxed);
+        format.call_id(crate::sampler::draw_key(new_seed(), count as usize))
+    }
+
+    /// Start `n` generations of the same prompt, with different random seeds.
+    fn start(
+        &self,
+        tokens: &[u32],
+        params: &GenerateParams,
+        n: usize,
+    ) -> Vec<UnboundedReceiver<Event>> {
+        (0..n)
+            .map(|i| {
+                let mut params = params.clone();
+                params.sampling.seed = params.sampling.seed.wrapping_add(i as u64);
+                self.server.engine.submit(Request {
+                    tokens: tokens.to_vec(),
+                    params,
+                })
+            })
+            .collect()
+    }
+
+    fn token_text(&self, id: u32) -> String {
+        String::from_utf8_lossy(&self.server.tokenizer.token_bytes(id)).into_owned()
+    }
+
+    fn token_bytes(&self, id: u32) -> Vec<u8> {
+        self.server.tokenizer.token_bytes(id)
+    }
+
+    /// Logprobs in the format of the chat API.
+    fn chat_logprobs(&self, logprobs: &[TokenLogprob]) -> Value {
+        let entry = |id: u32, logprob: f32| json!({ "token": self.token_text(id), "logprob": logprob, "bytes": self.token_bytes(id) });
+        let content: Vec<Value> = logprobs
+            .iter()
+            .map(|l| {
+                let mut value = entry(l.token, l.logprob);
+                let top: Vec<Value> = l.top.iter().map(|&(id, p)| entry(id, p)).collect();
+                value["top_logprobs"] = top.into();
+                value
+            })
+            .collect();
+        json!({ "content": content })
+    }
+
+    /// Logprobs in the format of the older completions API.
+    fn completion_logprobs(&self, logprobs: &[TokenLogprob]) -> Value {
+        let tokens: Vec<String> = logprobs.iter().map(|l| self.token_text(l.token)).collect();
+        let token_logprobs: Vec<f32> = logprobs.iter().map(|l| l.logprob).collect();
+        let top: Vec<Value> = logprobs
+            .iter()
+            .map(|l| {
+                let map: Map<String, Value> = l
+                    .top
+                    .iter()
+                    .map(|&(id, p)| (self.token_text(id), p.into()))
+                    .collect();
+                Value::Object(map)
+            })
+            .collect();
+        json!({ "tokens": tokens, "token_logprobs": token_logprobs, "top_logprobs": top })
+    }
+}
+
+/// Run a piece of CPU-heavy request preparation (rendering, tokenizing, compiling a grammar),
+/// letting the async runtime move other connections off this thread in the meantime.
+fn prepare<T>(work: impl FnOnce() -> Result<T, ApiError>) -> Result<T, ApiError> {
+    tokio::task::block_in_place(work)
+}
+
+fn finish_reason(reason: FinishReason) -> &'static str {
+    match reason {
+        FinishReason::Stop => "stop",
+        FinishReason::Length => "length",
+    }
+}
+
+/// The reason a chat reply ended. Ending normally after calling tools has its own name.
+fn chat_finish_reason(reason: FinishReason, tool_calls: usize) -> &'static str {
+    match (reason, tool_calls) {
+        (FinishReason::Stop, 1..) => "tool_calls",
+        _ => finish_reason(reason),
+    }
+}
+
+fn usage_json(usage: &Usage) -> Value {
+    json!({
+        "prompt_tokens": usage.prompt_tokens,
+        "completion_tokens": usage.completion_tokens,
+        "total_tokens": usage.prompt_tokens + usage.completion_tokens,
+        "prompt_tokens_details": { "cached_tokens": usage.cached_tokens },
+    })
+}
+
+/// Combine the events of several generations, each tagged with its choice index.
+fn merge(receivers: Vec<(usize, UnboundedReceiver<Event>)>) -> BoxStream<'static, (usize, Event)> {
+    let streams = receivers.into_iter().map(|(index, receiver)| {
+        stream::unfold(receiver, |mut receiver| async move {
+            receiver.recv().await.map(|event| (event, receiver))
+        })
+        .map(move |event| (index, event))
+        .boxed()
+    });
+    stream::select_all(streams).boxed()
+}
+
+/// One choice's result, for non-streaming responses.
+#[derive(Default)]
+struct Collected {
+    text: String,
+    logprobs: Vec<TokenLogprob>,
+    finish: Option<FinishReason>,
+}
+
+/// Wait for every generation to finish.
+async fn collect(
+    receivers: Vec<(usize, UnboundedReceiver<Event>)>,
+    prompts: usize,
+) -> Result<(Vec<Collected>, Usage), ApiError> {
+    let count = receivers
+        .iter()
+        .map(|(index, _)| index + 1)
+        .max()
+        .unwrap_or(0);
+    let mut results: Vec<Collected> = (0..count).map(|_| Collected::default()).collect();
+    let mut usage = UsageTotal::new(prompts);
+    let mut events = merge(receivers);
+    while let Some((index, event)) = events.next().await {
+        match event {
+            Event::Text { text, logprobs } => {
+                results[index].text.push_str(&text);
+                results[index].logprobs.extend(logprobs);
+            }
+            Event::Done { reason, usage: u } => {
+                results[index].finish = Some(reason);
+                usage.add(index, &u);
+            }
+            Event::Error(message) => return Err(ApiError::invalid(message)),
+        }
+    }
+    Ok((results, usage.total))
+}
+
+/// Adds up usage across choices. Each prompt's tokens count once, however many choices it has.
+struct UsageTotal {
+    total: Usage,
+    choices_per_prompt: usize,
+}
+
+impl UsageTotal {
+    fn new(choices_per_prompt: usize) -> Self {
+        Self {
+            total: Usage::default(),
+            choices_per_prompt: choices_per_prompt.max(1),
+        }
+    }
+
+    fn add(&mut self, index: usize, usage: &Usage) {
+        self.total.completion_tokens += usage.completion_tokens;
+        if index.is_multiple_of(self.choices_per_prompt) {
+            self.total.prompt_tokens += usage.prompt_tokens;
+            self.total.cached_tokens += usage.cached_tokens;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Streaming
+// ---------------------------------------------------------------------------------------------
+
+fn sse(value: &Value) -> Result<Bytes, Infallible> {
+    Ok(Bytes::from(format!("data: {value}\n\n")))
+}
+
+fn sse_response(
+    stream: impl Stream<Item = Result<Bytes, Infallible>> + Send + 'static,
+) -> Response {
+    Response::builder()
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from_stream(stream))
+        .expect("the headers are valid")
+}
+
+/// Which of the OpenAI APIs a stream is for.
+#[derive(Clone)]
+struct ChunkFormat {
+    is_chat: bool,
+    id: String,
+    created: u64,
+    model: String,
+}
+
+impl ChunkFormat {
+    fn chunk(&self, choices: Value) -> Value {
+        json!({
+            "id": self.id,
+            "object": if self.is_chat { "chat.completion.chunk" } else { "text_completion" },
+            "created": self.created,
+            "model": self.model,
+            "choices": choices,
+        })
+    }
+
+    fn delta(&self, index: usize, text: &str, logprobs: Value) -> Value {
+        if self.is_chat {
+            self.chunk(json!([{
+                "index": index,
+                "delta": { "content": text },
+                "logprobs": logprobs,
+                "finish_reason": null,
+            }]))
+        } else {
+            self.chunk(json!([{
+                "index": index,
+                "text": text,
+                "logprobs": logprobs,
+                "finish_reason": null,
+            }]))
+        }
+    }
+
+    /// Part of a tool call, as an entry for the delta's `tool_calls`.
+    fn call_delta(&self, index: usize, call: Value, logprobs: Value) -> Value {
+        self.chunk(json!([{
+            "index": index,
+            "delta": { "tool_calls": [call] },
+            "logprobs": logprobs,
+            "finish_reason": null,
+        }]))
+    }
+
+    fn end(&self, index: usize, reason: &str) -> Value {
+        if self.is_chat {
+            self.chunk(json!([{
+                "index": index,
+                "delta": {},
+                "logprobs": null,
+                "finish_reason": reason,
+            }]))
+        } else {
+            self.chunk(json!([{
+                "index": index,
+                "text": "",
+                "logprobs": null,
+                "finish_reason": reason,
+            }]))
+        }
+    }
+}
+
+/// Reads one choice's tool calls as it streams.
+struct CallReader {
+    parser: ToolParser,
+    format: ToolFormat,
+    /// Logprobs for text that hasn't been sent on yet.
+    logprobs: Vec<TokenLogprob>,
+}
+
+impl CallReader {
+    /// Turn what the parser found into stream chunks.
+    fn send(
+        &mut self,
+        outputs: Vec<ToolOutput>,
+        index: usize,
+        app: &App,
+        format: &ChunkFormat,
+        want_logprobs: bool,
+        out: &mut Vec<Result<Bytes, Infallible>>,
+    ) {
+        for output in outputs {
+            // Tokens don't line up with the pieces, so logprobs go with the next one out.
+            let logprobs = match want_logprobs {
+                true => app.chat_logprobs(&std::mem::take(&mut self.logprobs)),
+                false => Value::Null,
+            };
+            let chunk = match output {
+                ToolOutput::Content(text) => format.delta(index, &text, logprobs),
+                ToolOutput::Call { index: call, name } => format.call_delta(
+                    index,
+                    json!({
+                        "index": call,
+                        "id": app.call_id(self.format),
+                        "type": "function",
+                        "function": { "name": name, "arguments": "" },
+                    }),
+                    logprobs,
+                ),
+                ToolOutput::Arguments { index: call, text } => format.call_delta(
+                    index,
+                    json!({ "index": call, "function": { "arguments": text } }),
+                    logprobs,
+                ),
+            };
+            out.push(sse(&chunk));
+        }
+    }
+}
+
+struct StreamJob {
+    app: Arc<App>,
+    format: ChunkFormat,
+    receivers: Vec<(usize, UnboundedReceiver<Event>)>,
+    include_usage: bool,
+    want_logprobs: bool,
+    choices_per_prompt: usize,
+    /// Text to send first on each choice (`echo`).
+    prefixes: Vec<String>,
+    /// How to read tool calls out of each choice, if they should be.
+    tool_reading: Option<ToolReading>,
+}
+
+fn stream_events(job: StreamJob) -> impl Stream<Item = Result<Bytes, Infallible>> + Send + 'static {
+    let StreamJob {
+        app,
+        format,
+        receivers,
+        include_usage,
+        want_logprobs,
+        choices_per_prompt,
+        prefixes,
+        tool_reading,
+    } = job;
+    let mut remaining = receivers.len();
+    let mut usage = UsageTotal::new(choices_per_prompt);
+    let mut readers: Vec<CallReader> = tool_reading
+        .iter()
+        .flat_map(|reading| {
+            receivers.iter().map(|_| CallReader {
+                parser: reading.parser(),
+                format: reading.format,
+                logprobs: Vec::new(),
+            })
+        })
+        .collect();
+
+    // Chat streams open by announcing the role.
+    let opening: Vec<Result<Bytes, Infallible>> = if format.is_chat {
+        receivers
+            .iter()
+            .map(|(index, _)| {
+                sse(&format.chunk(json!([{
+                    "index": index,
+                    "delta": { "role": "assistant", "content": "" },
+                    "logprobs": null,
+                    "finish_reason": null,
+                }])))
+            })
+            .collect()
+    } else {
+        prefixes
+            .iter()
+            .enumerate()
+            .filter(|(_, text)| !text.is_empty())
+            .map(|(index, text)| sse(&format.delta(index, text, Value::Null)))
+            .collect()
+    };
+
+    let events = merge(receivers).flat_map(move |(index, event)| {
+        let mut out = Vec::new();
+        match event {
+            Event::Text { text, logprobs } => {
+                if let Some(reader) = readers.get_mut(index) {
+                    reader.logprobs.extend(logprobs);
+                    let outputs = reader.parser.push(&text);
+                    reader.send(outputs, index, &app, &format, want_logprobs, &mut out);
+                } else {
+                    let logprobs = match (want_logprobs, format.is_chat) {
+                        (false, _) => Value::Null,
+                        (true, true) => app.chat_logprobs(&logprobs),
+                        (true, false) => app.completion_logprobs(&logprobs),
+                    };
+                    out.push(sse(&format.delta(index, &text, logprobs)));
+                }
+            }
+            Event::Done { reason, usage: u } => {
+                usage.add(index, &u);
+                let reason = match readers.get_mut(index) {
+                    Some(reader) => {
+                        let outputs = reader.parser.finish();
+                        reader.send(outputs, index, &app, &format, want_logprobs, &mut out);
+                        chat_finish_reason(reason, reader.parser.calls())
+                    }
+                    None => finish_reason(reason),
+                };
+                out.push(sse(&format.end(index, reason)));
+                remaining -= 1;
+                if remaining == 0 && include_usage {
+                    let mut chunk = format.chunk(json!([]));
+                    chunk["usage"] = usage_json(&usage.total);
+                    out.push(sse(&chunk));
+                }
+            }
+            Event::Error(message) => {
+                out.push(sse(&ApiError::invalid(message).body()));
+            }
+        }
+        stream::iter(out)
+    });
+
+    stream::iter(opening)
+        .chain(events)
+        .chain(stream::once(async {
+            Ok(Bytes::from_static(b"data: [DONE]\n\n"))
+        }))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Endpoints
+// ---------------------------------------------------------------------------------------------
+
+async fn chat_completions(State(app): State<Arc<App>>, body: Bytes) -> Result<Response, ApiError> {
+    let request: ChatRequest = parse_body(&body)?;
+    let template = app.server.template.as_ref().ok_or_else(|| {
+        ApiError::invalid("this model has no chat template; use /v1/completions instead")
+    })?;
+    if request.messages.is_empty() {
+        return Err(ApiError::invalid("messages must not be empty"));
+    }
+    let n = request.sampling.n.unwrap_or(1);
+    // Some templates only understand plain strings, so a text-only list of parts is joined.
+    let mut messages: Vec<Value> = request.messages.iter().map(flatten_content).collect();
+    tools::prepare_messages(&mut messages).map_err(ApiError::invalid)?;
+    let plan = tools::plan(ToolOptions {
+        tools: request.tools.as_ref(),
+        tool_choice: request.tool_choice.as_ref(),
+        parallel_tool_calls: request.parallel_tool_calls.unwrap_or(true),
+        format: app.server.tool_format,
+        output_constrained: request.sampling.constrains_output(),
+    })
+    .map_err(ApiError::invalid)?;
+    let tool_reading = plan.parser.clone();
+    let (tokens, mut params) = prepare(|| {
+        let text = template
+            .render(
+                &Value::Array(messages),
+                plan.shown.as_ref(),
+                request.chat_template_kwargs.as_ref(),
+                true,
+            )
+            .map_err(|err| ApiError::invalid(format!("{err:#}")))?;
+        let tokens = chat::encode_rendered(&app.server.tokenizer, &text);
+        let mut params = app.params(&request.sampling, tokens.len())?;
+        if let (Some(grammar), Some(reading)) = (&plan.grammar, &tool_reading) {
+            let spec = format!(
+                "calls:{}",
+                serde_json::to_string(grammar).expect("it's plain data")
+            );
+            let vocabulary = app.tool_vocabulary(reading.format);
+            params.grammar = Some(app.compiled(spec, vocabulary)?);
+            params.grammar_triggers = plan.triggers.clone();
+        }
+        if let Some(reading) = &tool_reading {
+            params.keep_tokens = reading.format.marker_tokens(&app.server.tokenizer);
+        }
+        Ok((tokens, params))
+    })?;
+    params.strip_leading_space = true;
+    if request.logprobs {
+        params.logprobs = Some(request.top_logprobs.unwrap_or(0));
+    }
+    let receivers: Vec<_> = app
+        .start(&tokens, &params, n)
+        .into_iter()
+        .enumerate()
+        .collect();
+
+    let format = ChunkFormat {
+        is_chat: true,
+        id: app.next_id("chatcmpl"),
+        created: unix_time(),
+        model: app.server.model_name.clone(),
+    };
+    if request.stream {
+        return Ok(sse_response(stream_events(StreamJob {
+            app: app.clone(),
+            format,
+            receivers,
+            include_usage: request.stream_options.include_usage,
+            want_logprobs: request.logprobs,
+            choices_per_prompt: n,
+            prefixes: Vec::new(),
+            tool_reading,
+        })));
+    }
+
+    let (results, usage) = collect(receivers, n).await?;
+    let choices: Vec<Value> = results
+        .iter()
+        .enumerate()
+        .map(|(index, result)| {
+            let (message, calls) = assistant_message(&app, &result.text, tool_reading.as_ref());
+            json!({
+                "index": index,
+                "message": message,
+                "logprobs": if request.logprobs { app.chat_logprobs(&result.logprobs) } else { Value::Null },
+                "finish_reason": result.finish.map(|reason| chat_finish_reason(reason, calls)),
+            })
+        })
+        .collect();
+    Ok(json_response(
+        StatusCode::OK,
+        &json!({
+            "id": format.id,
+            "object": "chat.completion",
+            "created": format.created,
+            "model": format.model,
+            "choices": choices,
+            "usage": usage_json(&usage),
+        }),
+    ))
+}
+
+/// A finished reply as a message, and how many tool calls it has.
+fn assistant_message(app: &App, text: &str, reading: Option<&ToolReading>) -> (Value, usize) {
+    let Some(reading) = reading else {
+        return (json!({ "role": "assistant", "content": text }), 0);
+    };
+    let mut parser = reading.parser();
+    let mut outputs = parser.push(text);
+    outputs.extend(parser.finish());
+
+    let mut content = String::new();
+    let mut calls: Vec<Value> = Vec::new();
+    for output in outputs {
+        match output {
+            ToolOutput::Content(text) => content.push_str(&text),
+            ToolOutput::Call { name, .. } => calls.push(json!({
+                "id": app.call_id(reading.format),
+                "type": "function",
+                "function": { "name": name, "arguments": "" },
+            })),
+            ToolOutput::Arguments { index, text } => {
+                let arguments = &mut calls[index]["function"]["arguments"];
+                let so_far = arguments.as_str().expect("set above").to_string();
+                *arguments = (so_far + &text).into();
+            }
+        }
+    }
+    let count = calls.len();
+    if calls.is_empty() {
+        return (json!({ "role": "assistant", "content": content }), 0);
+    }
+    let content = (!content.is_empty()).then_some(content);
+    let message = json!({ "role": "assistant", "content": content, "tool_calls": calls });
+    (message, count)
+}
+
+/// Replace a `content` list of `{"type": "text", "text": ...}` parts with one string.
+fn flatten_content(message: &Value) -> Value {
+    let mut message = message.clone();
+    if let Some(parts) = message["content"].as_array()
+        && parts.iter().all(|p| p["type"] == "text")
+    {
+        let text: String = parts.iter().filter_map(|p| p["text"].as_str()).collect();
+        message["content"] = text.into();
+    }
+    message
+}
+
+async fn completions(State(app): State<Arc<App>>, body: Bytes) -> Result<Response, ApiError> {
+    let request: CompletionRequest = parse_body(&body)?;
+    let tokenizer = &app.server.tokenizer;
+    let n = request.sampling.n.unwrap_or(1);
+    let encode = |text: &str| tokenizer.encode(text, true);
+    let (prompts, texts): (Vec<Vec<u32>>, Vec<String>) = prepare(|| {
+        Ok(match &request.prompt {
+            Prompt::Text(text) => (vec![encode(text)], vec![text.clone()]),
+            Prompt::Texts(texts) => (texts.iter().map(|t| encode(t)).collect(), texts.clone()),
+            Prompt::Tokens(tokens) => (vec![tokens.clone()], vec![tokenizer.decode(tokens)]),
+            Prompt::TokenLists(lists) => (
+                lists.clone(),
+                lists.iter().map(|t| tokenizer.decode(t)).collect(),
+            ),
+        })
+    })?;
+    if prompts.iter().any(Vec::is_empty) {
+        return Err(ApiError::invalid("the prompt is empty"));
+    }
+
+    let mut receivers = Vec::new();
+    let mut prefixes = Vec::new();
+    for (p, tokens) in prompts.iter().enumerate() {
+        let mut params = prepare(|| app.params(&request.sampling, tokens.len()))?;
+        params.logprobs = request.logprobs;
+        for (i, receiver) in app.start(tokens, &params, n).into_iter().enumerate() {
+            receivers.push((p * n + i, receiver));
+            prefixes.push(if request.echo {
+                texts[p].clone()
+            } else {
+                String::new()
+            });
+        }
+    }
+
+    let format = ChunkFormat {
+        is_chat: false,
+        id: app.next_id("cmpl"),
+        created: unix_time(),
+        model: app.server.model_name.clone(),
+    };
+    let want_logprobs = request.logprobs.is_some();
+    if request.stream {
+        return Ok(sse_response(stream_events(StreamJob {
+            app: app.clone(),
+            format,
+            receivers,
+            include_usage: request.stream_options.include_usage,
+            want_logprobs,
+            choices_per_prompt: n,
+            prefixes,
+            tool_reading: None,
+        })));
+    }
+
+    let (results, usage) = collect(receivers, n).await?;
+    let choices: Vec<Value> = results
+        .iter()
+        .enumerate()
+        .map(|(index, result)| {
+            json!({
+                "index": index,
+                "text": format!("{}{}", prefixes[index], result.text),
+                "logprobs": if want_logprobs { app.completion_logprobs(&result.logprobs) } else { Value::Null },
+                "finish_reason": result.finish.map(finish_reason),
+            })
+        })
+        .collect();
+    Ok(json_response(
+        StatusCode::OK,
+        &json!({
+            "id": format.id,
+            "object": "text_completion",
+            "created": format.created,
+            "model": format.model,
+            "choices": choices,
+            "usage": usage_json(&usage),
+        }),
+    ))
+}
+
+/// SGLang's native API.
+async fn generate(State(app): State<Arc<App>>, body: Bytes) -> Result<Response, ApiError> {
+    let request: NativeRequest = parse_body(&body)?;
+    let tokens = match (&request.input_ids, &request.text) {
+        (Some(ids), _) => ids.clone(),
+        (None, Some(text)) => prepare(|| Ok(app.server.tokenizer.encode(text, true)))?,
+        (None, None) => return Err(ApiError::invalid("either text or input_ids is required")),
+    };
+    if tokens.is_empty() {
+        return Err(ApiError::invalid("the prompt is empty"));
+    }
+    if request.sampling_params.n.unwrap_or(1) != 1 {
+        return Err(ApiError::invalid("/generate only supports n = 1 so far"));
+    }
+    let mut fields = request.sampling_params;
+    // SGLang's defaults for this endpoint, rather than the OpenAI ones.
+    fields.max_tokens = fields.max_tokens.or(Some(128));
+    fields.temperature = fields.temperature.or(Some(1.0));
+    let params = prepare(|| app.params(&fields, tokens.len()))?;
+    let id = app.next_id("gen");
+    let start = Instant::now();
+    let mut receiver = app
+        .start(&tokens, &params, 1)
+        .pop()
+        .expect("one was started");
+
+    let meta = move |usage: &Usage, reason: Option<FinishReason>, id: &str| {
+        json!({
+            "id": id,
+            "finish_reason": reason.map(|r| json!({ "type": finish_reason(r) })),
+            "prompt_tokens": usage.prompt_tokens,
+            "completion_tokens": usage.completion_tokens,
+            "cached_tokens": usage.cached_tokens,
+            "e2e_latency": start.elapsed().as_secs_f64(),
+        })
+    };
+
+    if request.stream {
+        let stream = stream::unfold((receiver, String::new()), move |(mut receiver, mut text)| {
+            let (id, meta) = (id.clone(), meta);
+            async move {
+                let event = receiver.recv().await?;
+                let chunk = match event {
+                    Event::Text { text: piece, .. } => {
+                        text.push_str(&piece);
+                        sse(&json!({ "text": text, "meta_info": meta(&Usage::default(), None, &id) }))
+                    }
+                    Event::Done { reason, usage } => {
+                        sse(&json!({ "text": text, "meta_info": meta(&usage, Some(reason), &id) }))
+                    }
+                    Event::Error(message) => sse(&ApiError::invalid(message).body()),
+                };
+                Some((chunk, (receiver, text)))
+            }
+        })
+        .chain(stream::once(async {
+            Ok(Bytes::from_static(b"data: [DONE]\n\n"))
+        }));
+        return Ok(sse_response(stream));
+    }
+
+    let mut text = String::new();
+    while let Some(event) = receiver.recv().await {
+        match event {
+            Event::Text { text: piece, .. } => text.push_str(&piece),
+            Event::Done { reason, usage } => {
+                return Ok(json_response(
+                    StatusCode::OK,
+                    &json!({ "text": text, "meta_info": meta(&usage, Some(reason), &id) }),
+                ));
+            }
+            Event::Error(message) => return Err(ApiError::invalid(message)),
+        }
+    }
+    Err(ApiError::internal("the engine stopped unexpectedly"))
+}
+
+async fn models(State(app): State<Arc<App>>) -> Response {
+    json_response(
+        StatusCode::OK,
+        &json!({
+            "object": "list",
+            "data": [{
+                "id": app.server.model_name,
+                "object": "model",
+                "created": app.created,
+                "owned_by": "tinyllm",
+                "max_model_len": app.context_limit(),
+            }],
+        }),
+    )
+}
+
+async fn model_info(State(app): State<Arc<App>>) -> Response {
+    json_response(
+        StatusCode::OK,
+        &json!({ "model_path": app.server.model_name, "is_generation": true }),
+    )
+}
+
+async fn server_info(State(app): State<Arc<App>>) -> Response {
+    let config = app.server.engine.config();
+    json_response(
+        StatusCode::OK,
+        &json!({
+            "threads": config.threads,
+            "max_running_requests": config.max_parallel,
+            "max_batch_tokens": config.max_batch,
+            "cache_tokens": config.cache_tokens,
+            "context_length": app.context_limit(),
+        }),
+    )
+}
+
+async fn flush_cache(State(app): State<Arc<App>>) -> Response {
+    app.server.engine.flush_cache();
+    (StatusCode::OK, "Cache flushed.\n").into_response()
+}
+
+/// Counters in Prometheus's text format.
+async fn metrics(State(app): State<Arc<App>>) -> Response {
+    let stats = app.server.engine.stats();
+    let lines = [
+        (
+            "counter",
+            "requests_total",
+            "Requests received",
+            stats.requests.load(Relaxed),
+        ),
+        (
+            "counter",
+            "prompt_tokens_total",
+            "Prompt tokens received",
+            stats.prompt_tokens.load(Relaxed),
+        ),
+        (
+            "counter",
+            "cached_prompt_tokens_total",
+            "Prompt tokens served from the prefix cache",
+            stats.cached_prompt_tokens.load(Relaxed),
+        ),
+        (
+            "counter",
+            "generated_tokens_total",
+            "Tokens generated",
+            stats.generated_tokens.load(Relaxed),
+        ),
+        (
+            "counter",
+            "steps_total",
+            "Batches run through the model",
+            stats.steps.load(Relaxed),
+        ),
+        (
+            "counter",
+            "batch_tokens_total",
+            "Tokens run through the model",
+            stats.rows.load(Relaxed),
+        ),
+        (
+            "counter",
+            "retractions_total",
+            "Requests put back in the queue to free KV cache",
+            stats.retractions.load(Relaxed),
+        ),
+        (
+            "gauge",
+            "running_requests",
+            "Requests in progress",
+            stats.running.load(Relaxed),
+        ),
+        (
+            "gauge",
+            "queued_requests",
+            "Requests waiting to start",
+            stats.waiting.load(Relaxed),
+        ),
+        (
+            "gauge",
+            "cache_used_tokens",
+            "Tokens held by the prefix cache",
+            stats.cache_used.load(Relaxed),
+        ),
+        (
+            "gauge",
+            "cache_capacity_tokens",
+            "Size of the KV cache in tokens",
+            stats.cache_capacity.load(Relaxed),
+        ),
+    ];
+    let mut out = format!(
+        "# HELP tinyllm_step_seconds_total Time spent running batches\n# TYPE tinyllm_step_seconds_total counter\ntinyllm_step_seconds_total {}\n",
+        stats.step_micros.load(Relaxed) as f64 / 1e6
+    );
+    for (kind, name, help, value) in lines {
+        out.push_str(&format!(
+            "# HELP tinyllm_{name} {help}\n# TYPE tinyllm_{name} {kind}\ntinyllm_{name} {value}\n"
+        ));
+    }
+    (StatusCode::OK, out).into_response()
+}

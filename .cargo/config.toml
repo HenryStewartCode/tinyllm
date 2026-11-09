@@ -1,0 +1,3 @@
+# Let the compiler use every SIMD instruction this CPU has (AVX2/AVX-512 on x86, full NEON on ARM).
+[build]
+rustflags = ["-C", "target-cpu=native"]
