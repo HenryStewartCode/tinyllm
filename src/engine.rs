@@ -66,6 +66,37 @@ pub struct GenerateParams {
     pub grammar_triggers: Vec<GrammarTrigger>,
     /// Special tokens to write out even with `skip_special_tokens` on.
     pub keep_tokens: Vec<u32>,
+    /// If the reply may think out loud before it answers, how to tell when it is.
+    pub thinking: Option<Thinking>,
+}
+
+/// How a reply thinks out loud before it answers (see [`crate::reasoning`]). While it thinks,
+/// its grammar and the triggers for it wait, so that only the answer is held to them.
+#[derive(Clone, Debug)]
+pub struct Thinking {
+    /// The prompt left a block of thinking open, so the reply starts inside it.
+    pub open: bool,
+    /// The token that opens a block, so that a reply can open one itself.
+    pub start_token: Option<u32>,
+    /// What closes the block.
+    pub end: String,
+    /// The token that closes it, for a budget to force.
+    pub end_token: Option<u32>,
+    /// A newline token, to put a forced end on a line of its own.
+    pub newline_token: Option<u32>,
+    /// The most tokens to spend thinking, after which the block is closed for the model.
+    pub budget: Option<usize>,
+}
+
+/// Where a reply is, as far as thinking goes.
+enum Phase {
+    /// Answering, or never going to think: the grammar applies.
+    Answering,
+    /// Nothing generated yet, and the first token may open a block of thinking.
+    MayThink,
+    /// In a block of thinking. `recent` is the end of it, as much as the end marker could be
+    /// spread across.
+    Thinking { recent: Vec<u8>, spent: usize },
 }
 
 /// Text in a reply that sets off its grammar.
@@ -90,6 +121,24 @@ impl Default for GenerateParams {
             grammar: None,
             grammar_triggers: Vec::new(),
             keep_tokens: Vec::new(),
+            thinking: None,
+        }
+    }
+}
+
+impl GenerateParams {
+    /// How the grammar starts: either right away, or watching for what sets it off.
+    fn start_grammar(
+        &self,
+        strip_leading_space: bool,
+    ) -> (Option<Constraint>, Option<TriggerWatch>) {
+        match &self.grammar {
+            Some(_) if !self.grammar_triggers.is_empty() => (None, Some(TriggerWatch::new())),
+            Some(grammar) => {
+                let stop_tokens = self.stop_tokens.iter().copied().collect();
+                (Some(grammar.start(strip_leading_space, stop_tokens)), None)
+            }
+            None => (None, None),
         }
     }
 }
@@ -247,6 +296,7 @@ struct Sequence {
     constraint: Option<Constraint>,
     /// Looks out for what sets off the grammar, until it starts.
     watch: Option<TriggerWatch>,
+    phase: Phase,
     allowed: Option<Arc<TokenSet>>,
     text: TextStream,
     pending_logprobs: Vec<TokenLogprob>,
@@ -267,6 +317,52 @@ impl Sequence {
             prompt_tokens: self.prompt_len,
             completion_tokens: self.generated,
             cached_tokens: self.cached_tokens.unwrap_or(0),
+        }
+    }
+
+    /// The token the thinking budget forces next, if it's been used up.
+    fn forced(&self) -> Option<u32> {
+        let Phase::Thinking { recent, spent } = &self.phase else {
+            return None;
+        };
+        let thinking = self.params.thinking.as_ref()?;
+        let end = thinking.end_token?;
+        if *spent < thinking.budget? {
+            return None;
+        }
+        match thinking.newline_token {
+            Some(newline) if recent.last() != Some(&b'\n') => Some(newline),
+            _ => Some(end),
+        }
+    }
+
+    /// Whether choosing the next token needs every token's score, rather than a shortlist.
+    fn needs_all_logits(&self) -> bool {
+        self.constraint.is_some() || self.params.logprobs.is_some() || self.forced().is_some()
+    }
+
+    /// The tokens that may come next, if they're limited.
+    fn allowed_tokens(&mut self, vocab_size: usize) -> Option<Arc<TokenSet>> {
+        if let Some(token) = self.forced() {
+            let mut only = TokenSet::new(vocab_size);
+            only.insert(token);
+            return Some(Arc::new(only));
+        }
+        let allowed = self.constraint.as_mut()?.allowed_tokens();
+        match (&self.phase, &self.params.thinking) {
+            // The answer has to follow the grammar, but it can think first.
+            (
+                Phase::MayThink,
+                Some(Thinking {
+                    start_token: Some(start),
+                    ..
+                }),
+            ) => {
+                let mut allowed = (*allowed).clone();
+                allowed.insert(*start);
+                Some(Arc::new(allowed))
+            }
+            _ => Some(allowed),
         }
     }
 }
@@ -374,13 +470,17 @@ impl Engine {
         } else {
             0
         };
-        let (constraint, watch) = match &params.grammar {
-            Some(_) if !params.grammar_triggers.is_empty() => (None, Some(TriggerWatch::new())),
-            Some(g) => (
-                Some(g.start(strip > 0, params.stop_tokens.iter().copied().collect())),
-                None,
-            ),
-            None => (None, None),
+        let phase = match &params.thinking {
+            Some(thinking) if thinking.open => Phase::Thinking {
+                recent: Vec::new(),
+                spent: 0,
+            },
+            Some(thinking) if thinking.start_token.is_some() => Phase::MayThink,
+            _ => Phase::Answering,
+        };
+        let (constraint, watch) = match phase {
+            Phase::Thinking { .. } => (None, None),
+            _ => params.start_grammar(strip > 0),
         };
         self.waiting.push_back(Sequence {
             tokens,
@@ -397,6 +497,7 @@ impl Engine {
             sampler: Sampler::new(params.sampling.clone(), self.vocab_size),
             constraint,
             watch,
+            phase,
             allowed: None,
             text: TextStream::new(params.stop_strings.clone(), strip),
             pending_logprobs: Vec::new(),
@@ -430,7 +531,7 @@ impl Engine {
                     seq.logits_row = Some(logits_rows);
                     logits_rows += 1;
                 }
-                let all_logits = seq.constraint.is_some() || seq.params.logprobs.is_some();
+                let all_logits = seq.needs_all_logits();
                 rows.push(Row {
                     token: seq.tokens[pos],
                     slots: &seq.slots[..=pos],
@@ -593,7 +694,7 @@ impl Engine {
         // Working out which tokens a grammar allows can touch shared state, so it happens here.
         for seq in &mut self.active {
             if seq.logits_row.is_some() {
-                seq.allowed = seq.constraint.as_mut().map(|c| c.allowed_tokens());
+                seq.allowed = seq.allowed_tokens(self.vocab_size);
             }
         }
         let views: Vec<Option<Logits>> = self
@@ -655,7 +756,46 @@ impl Engine {
             return Some(FinishReason::Stop);
         }
         seq.tokens.push(token);
-        if let Some(constraint) = &mut seq.constraint {
+        let mut answering = true;
+        let mut finished_thinking = false;
+        match &mut seq.phase {
+            Phase::MayThink => {
+                let start = seq.params.thinking.as_ref().and_then(|t| t.start_token);
+                if start == Some(token) {
+                    // The grammar waits until the thinking is done, and then starts afresh.
+                    seq.phase = Phase::Thinking {
+                        recent: Vec::new(),
+                        spent: 0,
+                    };
+                    seq.constraint = None;
+                    seq.watch = None;
+                    answering = false;
+                } else {
+                    seq.phase = Phase::Answering;
+                }
+            }
+            Phase::Thinking { recent, spent } => {
+                answering = false;
+                *spent += 1;
+                recent.extend_from_slice(&self.tokenizer.token_bytes(token));
+                let end = seq.params.thinking.as_ref().map_or("", |t| t.end.as_str());
+                let end = end.as_bytes();
+                if !end.is_empty() && recent.windows(end.len()).any(|w| w == end) {
+                    finished_thinking = true;
+                } else {
+                    let excess = recent.len().saturating_sub(end.len().max(2) - 1);
+                    recent.drain(..excess);
+                }
+            }
+            Phase::Answering => {}
+        }
+        if finished_thinking {
+            seq.phase = Phase::Answering;
+            (seq.constraint, seq.watch) = seq.params.start_grammar(false);
+        }
+        if !answering {
+            // Thinking isn't held to the grammar.
+        } else if let Some(constraint) = &mut seq.constraint {
             constraint.advance(token);
         } else if let Some(watch) = &mut seq.watch
             && let Some(written) = watch.push(

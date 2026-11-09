@@ -21,6 +21,8 @@ pub fn message(role: &str, content: &str) -> Value {
 
 pub struct ChatTemplate {
     env: Environment<'static>,
+    /// The source of the template conversations normally use.
+    source: String,
     has_tool_template: bool,
     bos_token: String,
     eos_token: String,
@@ -89,6 +91,11 @@ impl ChatTemplate {
         env.add_function("strftime_now", strftime_now);
         env.add_filter("tojson", tojson);
         let has_tool_template = templates.iter().any(|(name, _)| name == "tool_use");
+        let source = templates
+            .iter()
+            .find(|(name, _)| name == "default")
+            .map(|(_, source)| source.clone())
+            .unwrap_or_default();
         for (name, source) in templates {
             env.add_template_owned(name.clone(), source)
                 .with_context(|| format!("couldn't parse the chat template '{name}'"))?;
@@ -97,10 +104,16 @@ impl ChatTemplate {
             .context("the model has no default chat template")?;
         Ok(Self {
             env,
+            source,
             has_tool_template,
             bos_token,
             eos_token,
         })
+    }
+
+    /// The source of the template conversations normally use.
+    pub fn source(&self) -> &str {
+        &self.source
     }
 
     /// The notation this model writes tool calls in, if its template handles them.

@@ -24,6 +24,7 @@
 //! | [`pool`]        | fork-join thread pool for very short parallel sections             |
 //! | [`sampler`]     | temperature, top-k, top-p, min-p, penalties                        |
 //! | [`chat`]        | runs each model's Jinja chat template                              |
+//! | [`reasoning`]   | separates a reasoning model's thinking from its answer             |
 //! | [`tools`]       | tool calling: what to show the model, and reading its calls        |
 //! | [`tokenizer`]   | BPE tokenizer loaded from `tokenizer.json`                         |
 //! | [`config`]      | reads hyper-parameters from `config.json`                          |
@@ -39,6 +40,7 @@ pub mod grammar;
 pub mod model;
 pub mod ops;
 pub mod pool;
+pub mod reasoning;
 pub mod safetensors;
 pub mod sampler;
 pub mod server;

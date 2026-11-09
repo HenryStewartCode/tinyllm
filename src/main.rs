@@ -12,6 +12,7 @@ use tinyllm::chat::{self, ChatTemplate};
 use tinyllm::config::Config;
 use tinyllm::cuda::{self, CudaBackend};
 use tinyllm::engine::{self, EngineConfig, EngineHandle, Event, GenerateParams, Request};
+use tinyllm::reasoning::ReasoningFormat;
 use tinyllm::sampler::SamplingParams;
 use tinyllm::server::{self, SamplingDefaults, Server};
 use tinyllm::tokenizer::Tokenizer;
@@ -54,7 +55,21 @@ enum ToolParserArg {
     Llama3,
 }
 
-/// Run a Llama-family language model (Llama, Mistral, Qwen2, SmolLM, TinyLlama).
+/// How to separate a reasoning model's thinking from its answer.
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ReasoningParserArg {
+    /// Go by the model's chat template and vocabulary
+    Auto,
+    /// Leave the thinking in the answer
+    None,
+    /// <think> ... </think>
+    Qwen3,
+    /// The same as qwen3; the template opening the block is noticed either way
+    #[value(name = "deepseek-r1")]
+    DeepseekR1,
+}
+
+/// Run a Llama-family language model (Llama, Mistral, Qwen, SmolLM, Phi-3, Granite, Gemma).
 #[derive(Parser)]
 #[command(version)]
 struct Args {
@@ -150,6 +165,10 @@ struct Args {
     /// How --serve reads tool calls out of the model's replies
     #[arg(long, value_enum, default_value_t = ToolParserArg::Auto)]
     tool_call_parser: ToolParserArg,
+
+    /// How --serve separates a reasoning model's thinking (`reasoning_content`) from its answer
+    #[arg(long, value_enum, default_value_t = ReasoningParserArg::Auto)]
+    reasoning_parser: ReasoningParserArg,
 }
 
 fn main() -> Result<()> {
@@ -282,6 +301,21 @@ fn main() -> Result<()> {
             Some(format) => eprintln!("Reading tool calls in the {format:?} format"),
             None => eprintln!("This model has no format for tool calls"),
         }
+        let reasoning = match args.reasoning_parser {
+            ReasoningParserArg::Auto => template
+                .as_ref()
+                .and_then(|t| ReasoningFormat::detect(t.source(), &tokenizer)),
+            ReasoningParserArg::None => None,
+            ReasoningParserArg::Qwen3 | ReasoningParserArg::DeepseekR1 => {
+                Some(ReasoningFormat::think())
+            }
+        };
+        if let Some(format) = &reasoning {
+            eprintln!(
+                "Separating reasoning between {} and {}",
+                format.start, format.end
+            );
+        }
         return server::serve(
             Server {
                 engine,
@@ -292,6 +326,7 @@ fn main() -> Result<()> {
                 defaults: SamplingDefaults::load(&args.model),
                 vocab_size: config.vocab_size,
                 tool_format,
+                reasoning,
             },
             &format!("{}:{}", args.host, args.port),
         );
