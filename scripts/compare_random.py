@@ -18,6 +18,10 @@ cases = {
     "qwen3": ("qwen3", {}),
     "qwen3-window": ("qwen3", dict(use_sliding_window=True, sliding_window=9, max_window_layers=3)),
     "mistral-window": ("mistral", dict(sliding_window=9)),
+    # YaRN, with a short original context so that the prompts go well past it.
+    "qwen2-yarn": ("qwen2", dict(rope_scaling={"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 16})),
+    "llama-yarn-mscale": ("llama", dict(rope_scaling={"rope_type": "yarn", "factor": 8.0, "original_max_position_embeddings": 12,
+                                                      "beta_fast": 16, "beta_slow": 2, "mscale": 0.707, "mscale_all_dim": 1.0})),
     "phi3": ("phi3", dict(pad_token_id=0)),
     "phi3-window": ("phi3", dict(sliding_window=7)),
     "granite": ("granite", dict(embedding_multiplier=3.0, logits_scaling=2.0, residual_multiplier=0.4, attention_multiplier=0.1)),

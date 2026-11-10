@@ -121,6 +121,13 @@ struct RopeScaling {
     high_freq_factor: Option<f64>,
     original_max_position_embeddings: Option<f64>,
     partial_rotary_factor: Option<f64>,
+    // YaRN's settings.
+    beta_fast: Option<f64>,
+    beta_slow: Option<f64>,
+    mscale: Option<f64>,
+    mscale_all_dim: Option<f64>,
+    attention_factor: Option<f64>,
+    truncate: Option<bool>,
 }
 
 impl RopeScaling {
@@ -237,6 +244,9 @@ pub struct Architecture {
     pub experts: Option<Experts>,
     /// The RoPE speed of each element pair in a head: one list per kind of layer.
     pub rope_tables: Vec<Vec<f32>>,
+    /// What each table's rotations (its cosines and sines) are multiplied by: 1, except for
+    /// YaRN, which scales queries and keys up a little along with the context.
+    pub rope_scales: Vec<f32>,
     pub layers: Vec<LayerShape>,
 }
 
@@ -356,17 +366,21 @@ impl Config {
         };
 
         let mut rope_tables: Vec<Vec<f32>> = Vec::new();
+        let mut rope_scales: Vec<f32> = Vec::new();
         let mut layers = Vec::with_capacity(self.num_hidden_layers);
         for l in 0..self.num_hidden_layers {
             let kind = self.layer_type(l);
-            let table = match self.has_rope(l) {
+            let (table, scale) = match self.has_rope(l) {
                 true => self.rope_frequencies(&kind)?,
-                false => vec![0.0; self.head_dim() / 2],
+                false => (vec![0.0; self.head_dim() / 2], 1.0),
             };
-            let rope_table = match rope_tables.iter().position(|known| *known == table) {
+            let known = (rope_tables.iter().zip(&rope_scales))
+                .position(|(known, &known_scale)| *known == table && known_scale == scale);
+            let rope_table = match known {
                 Some(index) => index,
                 None => {
                     rope_tables.push(table);
+                    rope_scales.push(scale);
                     rope_tables.len() - 1
                 }
             };
@@ -397,6 +411,7 @@ impl Config {
             full_qk_norms: model_type == "olmoe",
             experts: self.experts()?,
             rope_tables,
+            rope_scales,
             layers,
         })
     }
@@ -499,7 +514,9 @@ impl Config {
 
     /// RoPE frequencies for a kind of layer: pair `i` of each head rotates by
     /// `pos * theta^(-2i / head_dim)` radians, optionally adjusted by the config's scaling.
-    fn rope_frequencies(&self, kind: &str) -> Result<Vec<f32>> {
+    /// The RoPE speed of each element pair in a head, for layers of `kind`, and what their
+    /// rotations are multiplied by.
+    fn rope_frequencies(&self, kind: &str) -> Result<(Vec<f32>, f32)> {
         let default_theta = match (self.model_type.as_str(), kind) {
             ("gemma3_text", "full_attention") => 1_000_000.0,
             _ => 10_000.0,
@@ -533,6 +550,7 @@ impl Config {
         let mut inv_freq: Vec<f64> = (0..head_dim / 2)
             .map(|i| 1.0 / theta.powf((2 * i) as f64 / head_dim as f64))
             .collect();
+        let mut scale = 1.0;
         if let Some(scaling) = scaling {
             let factor = scaling.factor.unwrap_or(1.0);
             match scaling.kind() {
@@ -554,10 +572,59 @@ impl Config {
                         }
                     }
                 }
+                "yarn" => {
+                    // YaRN (as transformers computes it): the fastest-turning pairs keep their
+                    // speed, the slowest are slowed down by `factor`, with a ramp between, and
+                    // queries and keys are scaled up a little to keep attention as sharp.
+                    let original = scaling
+                        .original_max_position_embeddings
+                        .unwrap_or(self.max_position_embeddings as f64);
+                    let factor = scaling
+                        .factor
+                        .unwrap_or(self.max_position_embeddings as f64 / original);
+                    let mscale = |scale: f64, m: f64| match scale <= 1.0 {
+                        true => 1.0,
+                        false => 0.1 * m * scale.ln() + 1.0,
+                    };
+                    scale = match (
+                        scaling.attention_factor,
+                        scaling.mscale,
+                        scaling.mscale_all_dim,
+                    ) {
+                        (Some(attention), _, _) => attention,
+                        (None, Some(m), Some(all)) if m != 0.0 && all != 0.0 => {
+                            mscale(factor, m) / mscale(factor, all)
+                        }
+                        _ => mscale(factor, 1.0),
+                    };
+                    let beta_fast = scaling.beta_fast.filter(|&b| b != 0.0).unwrap_or(32.0);
+                    let beta_slow = scaling.beta_slow.filter(|&b| b != 0.0).unwrap_or(1.0);
+                    let dim = head_dim as f64;
+                    let correction = |rotations: f64| {
+                        dim * (original / (rotations * 2.0 * std::f64::consts::PI)).ln()
+                            / (2.0 * theta.ln())
+                    };
+                    let (mut low, mut high) = (correction(beta_fast), correction(beta_slow));
+                    if scaling.truncate.unwrap_or(true) {
+                        (low, high) = (low.floor(), high.ceil());
+                    }
+                    let (low, mut high) = (low.max(0.0), high.min(dim - 1.0));
+                    if low == high {
+                        high += 0.001;
+                    }
+                    for (i, f) in inv_freq.iter_mut().enumerate() {
+                        let ramp = ((i as f64 - low) / (high - low)).clamp(0.0, 1.0);
+                        let keep = 1.0 - ramp;
+                        *f = (*f / factor) * (1.0 - keep) + *f * keep;
+                    }
+                }
                 other => bail!("rope_scaling type '{other}' is not supported"),
             }
         }
-        Ok(inv_freq.into_iter().map(|f| f as f32).collect())
+        Ok((
+            inv_freq.into_iter().map(|f| f as f32).collect(),
+            scale as f32,
+        ))
     }
 }
 

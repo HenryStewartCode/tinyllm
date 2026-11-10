@@ -515,6 +515,9 @@ Checked against Hugging Face `transformers` (float32) and `tokenizers`:
   without sliding windows), Mistral with a window, Phi-3, Granite, SmolLM3, Gemma, Gemma 2 (with
   soft-capping, and with 256-wide heads) and Gemma 3 (alternating sliding and global layers) match
   to within 4e-4 on the CPU and the GPU in 32 bits, and batching never changes a result. So do
+  models with YaRN's longer-context RoPE scaling (as Qwen's long-context configurations and
+  DeepSeek use it, including `mscale`), to within 2.5e-7, with prompts well past the original
+  context. So do
   mixtures of experts (Qwen3-MoE, Qwen2-MoE, Mixtral, OLMoE, Granite MoE: within 2.2e-7 on the
   CPU, and on the GPU in 16 bits as closely as `transformers`' own 16-bit mode).
 - **A real mixture of experts:** Granite 3.1 1B-A400M matches 32-bit `transformers` to within

@@ -1344,11 +1344,12 @@ impl CudaBackend {
                 }
                 let position = (row.slots.len() - 1) as f32;
                 for (table, frequencies) in self.architecture.rope_tables.iter().enumerate() {
+                    let scale = self.architecture.rope_scales[table];
                     let start = (table * batch + index) * half;
                     for (j, &freq) in frequencies.iter().enumerate() {
                         let angle = position * freq;
-                        step.cos[start + j] = angle.cos();
-                        step.sin[start + j] = angle.sin();
+                        step.cos[start + j] = angle.cos() * scale;
+                        step.sin[start + j] = angle.sin() * scale;
                     }
                 }
             }

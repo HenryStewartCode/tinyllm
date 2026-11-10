@@ -850,11 +850,12 @@ impl Model {
             }
             let pos = (row.slots.len() - 1) as f32;
             for (table, frequencies) in self.architecture.rope_tables.iter().enumerate() {
+                let scale = self.architecture.rope_scales[table];
                 let start = (table * batch + r) * half;
                 for (i, &freq) in frequencies.iter().enumerate() {
                     let angle = pos * freq;
-                    ws.cos[start + i] = angle.cos();
-                    ws.sin[start + i] = angle.sin();
+                    ws.cos[start + i] = angle.cos() * scale;
+                    ws.sin[start + i] = angle.sin() * scale;
                 }
             }
         }

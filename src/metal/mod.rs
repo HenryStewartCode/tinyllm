@@ -724,11 +724,12 @@ impl MetalBackend {
                 }
                 let position = (row.slots.len() - 1) as f32;
                 for (table, frequencies) in self.architecture.rope_tables.iter().enumerate() {
+                    let scale = self.architecture.rope_scales[table];
                     let start = (table * batch + index) * half;
                     for (j, &freq) in frequencies.iter().enumerate() {
                         let angle = position * freq;
-                        cos[start + j] = angle.cos();
-                        sin[start + j] = angle.sin();
+                        cos[start + j] = angle.cos() * scale;
+                        sin[start + j] = angle.sin() * scale;
                     }
                 }
             }
