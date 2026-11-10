@@ -1784,6 +1784,18 @@ async fn metrics(State(app): State<Arc<App>>) -> Response {
             stats.retractions.load(Relaxed),
         ),
         (
+            "counter",
+            "spec_drafted_tokens_total",
+            "Tokens guessed ahead by speculative decoding",
+            stats.drafted_tokens.load(Relaxed),
+        ),
+        (
+            "counter",
+            "spec_accepted_tokens_total",
+            "Guessed tokens that turned out right",
+            stats.accepted_tokens.load(Relaxed),
+        ),
+        (
             "gauge",
             "running_requests",
             "Requests in progress",

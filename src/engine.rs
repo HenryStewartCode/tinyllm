@@ -14,6 +14,7 @@ use crate::cache::{NodeId, PrefixCache};
 use crate::grammar::{Constraint, Grammar, TokenSet};
 use crate::model::{LogitUse, Row};
 use crate::sampler::{Sampler, SamplingParams};
+use crate::speculative::NgramIndex;
 use crate::tokenizer::Tokenizer;
 use std::collections::{HashSet, VecDeque};
 use std::panic::{self, AssertUnwindSafe};
@@ -45,6 +46,18 @@ pub struct EngineConfig {
     pub cache_tokens: usize,
     /// The longest a single sequence can get.
     pub ctx_size: usize,
+    /// Guess tokens ahead and check them together (see [`crate::speculative`]), if set.
+    pub speculative: Option<Speculative>,
+}
+
+/// Settings for speculative decoding.
+#[derive(Clone, Copy, Debug)]
+pub struct Speculative {
+    /// The most tokens to guess ahead for one sequence.
+    pub draft_tokens: usize,
+    /// The most guessed tokens to check in one step, over all sequences. Once a batch is big
+    /// enough, checking guesses that turn out wrong costs real time.
+    pub max_draft_rows: usize,
 }
 
 #[derive(Clone)]
@@ -209,6 +222,9 @@ pub struct Stats {
     pub cache_used: AtomicU64,
     pub cache_capacity: AtomicU64,
     pub retractions: AtomicU64,
+    /// Tokens guessed ahead by speculative decoding, and how many of those turned out right.
+    pub drafted_tokens: AtomicU64,
+    pub accepted_tokens: AtomicU64,
 }
 
 enum Command {
@@ -306,6 +322,12 @@ struct Sequence {
     /// Looks out for what sets off the grammar, until it starts.
     watch: Option<TriggerWatch>,
     phase: Phase,
+    /// For guessing ahead from the sequence's own text.
+    ngrams: Option<NgramIndex>,
+    /// How many of the last `tokens` are guesses, still to be checked.
+    draft: usize,
+    /// How many of the guesses turned out right, once they've been checked.
+    accepted: usize,
     allowed: Option<Arc<TokenSet>>,
     text: TextStream,
     pending_logprobs: Vec<TokenLogprob>,
@@ -315,6 +337,31 @@ struct Sequence {
 impl Sequence {
     fn pending(&self) -> usize {
         self.tokens.len() - self.slots.len()
+    }
+
+    /// Whether the sequence is generating: everything but its newest token and any guesses after
+    /// it has been through the model.
+    fn is_decoding(&self) -> bool {
+        self.pending() <= 1 + self.draft
+    }
+
+    /// Whether guessing ahead could work for this sequence: nothing about its next token depends
+    /// on more than its scores.
+    fn can_speculate(&self) -> bool {
+        self.prompt_committed
+            && self.constraint.is_none()
+            && self.watch.is_none()
+            && self.params.logprobs.is_none()
+            && !self.params.embed
+            && match &self.phase {
+                Phase::Answering => true,
+                Phase::Thinking { .. } => self
+                    .params
+                    .thinking
+                    .as_ref()
+                    .is_none_or(|t| t.budget.is_none()),
+                Phase::MayThink => false,
+            }
     }
 
     fn is_prefilling(&self) -> bool {
@@ -507,6 +554,9 @@ impl Engine {
             constraint,
             watch,
             phase,
+            ngrams: None,
+            draft: 0,
+            accepted: 0,
             allowed: None,
             text: TextStream::new(params.stop_strings.clone(), strip),
             pending_logprobs: Vec::new(),
@@ -524,6 +574,7 @@ impl Engine {
         if self.active.is_empty() {
             return;
         }
+        self.propose();
         if !self.plan_rows() {
             return;
         }
@@ -534,13 +585,16 @@ impl Engine {
         for seq in &mut self.active {
             seq.logits_row = None;
             let end = seq.slots.len();
+            // Scores for the newest real token, and after each guess.
+            let first_scored = seq.tokens.len() - 1 - seq.draft;
             for pos in end - seq.take..end {
-                let want_logits = pos + 1 == seq.tokens.len();
-                if want_logits {
+                let want_logits = pos >= first_scored;
+                if want_logits && seq.logits_row.is_none() {
                     seq.logits_row = Some(logits_rows);
-                    logits_rows += 1;
                 }
+                logits_rows += want_logits as usize;
                 let all_logits = seq.needs_all_logits();
+                let generated = seq.generated + pos.saturating_sub(first_scored);
                 rows.push(Row {
                     token: seq.tokens[pos],
                     slots: &seq.slots[..=pos],
@@ -548,7 +602,7 @@ impl Engine {
                     sampling: match (seq.params.embed, all_logits) {
                         (true, _) => LogitUse::Hidden,
                         (false, true) => LogitUse::All,
-                        (false, false) => seq.sampler.logit_use(seq.generated),
+                        (false, false) => seq.sampler.logit_use(generated),
                     },
                 });
             }
@@ -633,7 +687,12 @@ impl Engine {
     /// Returns false if there's nothing to run.
     fn plan_rows(&mut self) -> bool {
         loop {
-            let generating = self.active.iter().filter(|s| s.pending() == 1).count();
+            let generating: usize = self
+                .active
+                .iter()
+                .filter(|s| s.is_decoding())
+                .map(Sequence::pending)
+                .sum();
             let budget = self
                 .config
                 .max_batch
@@ -645,7 +704,7 @@ impl Engine {
             let page_size = self.cache.page_size();
             for seq in &mut self.active {
                 let pending = seq.pending();
-                seq.take = if pending <= 1 {
+                seq.take = if seq.is_decoding() {
                     pending
                 } else {
                     let take = pending.min(prefill_left);
@@ -684,6 +743,14 @@ impl Engine {
                 let Some(mut seq) = self.active.pop() else {
                     return false;
                 };
+                if seq.draft > 0 {
+                    // Try again without the guesses, which may be what didn't fit.
+                    let real = seq.tokens.len() - seq.draft;
+                    seq.tokens.truncate(real);
+                    seq.draft = 0;
+                    self.active.push(seq);
+                    continue;
+                }
                 let _ = seq.events.send(Event::Error(
                     "the KV cache is too small for this request".to_string(),
                 ));
@@ -691,6 +758,9 @@ impl Engine {
                 return false;
             }
             let mut seq = self.active.pop().expect("more than one is active");
+            let real = seq.tokens.len() - seq.draft;
+            seq.tokens.truncate(real);
+            seq.draft = 0;
             self.retire(&mut seq);
             seq.slots.clear();
             seq.prompt_committed = false;
@@ -707,20 +777,39 @@ impl Engine {
                 seq.allowed = seq.allowed_tokens(self.vocab_size);
             }
         }
-        let views: Vec<Option<Logits>> = self
+        let views: Vec<Vec<Logits>> = self
             .active
             .iter()
-            .map(|seq| match seq.params.embed {
-                true => None,
-                false => seq.logits_row.map(|row| self.backend.logits(row)),
+            .map(|seq| match (seq.params.embed, seq.logits_row) {
+                (false, Some(first)) => (first..first + 1 + seq.draft)
+                    .map(|row| self.backend.logits(row))
+                    .collect(),
+                _ => Vec::new(),
             })
             .collect();
         let pool = self.backend.pool();
         pool.for_chunks(&mut self.active, 1, 2, |i, seq| {
             let seq = &mut seq[0];
-            let Some(logits) = views[i] else {
+            let Some(&logits) = views[i].first() else {
                 return;
             };
+            if seq.draft > 0 {
+                // Sample each position as if the guesses before it were right, and keep the
+                // guesses for as long as they're what came out.
+                let real = seq.tokens.len() - seq.draft;
+                seq.accepted = 0;
+                for (offset, &logits) in views[i].iter().enumerate() {
+                    let history = &seq.tokens[..real + offset];
+                    let generated = seq.generated + offset;
+                    seq.sampled = seq.sampler.sample(logits, history, generated, None);
+                    if offset == seq.draft || seq.sampled != seq.tokens[real + offset] {
+                        break;
+                    }
+                    seq.accepted += 1;
+                }
+                seq.token_logprob = None;
+                return;
+            }
             let allowed = seq.allowed.as_deref();
             seq.sampled = seq
                 .sampler
@@ -744,14 +833,15 @@ impl Engine {
                     seq.prompt_committed = true;
                     Self::commit_into(&mut self.cache, seq);
                 }
-                finished = match seq.params.embed {
-                    true => {
+                finished = match (seq.params.embed, seq.draft) {
+                    (true, _) => {
                         let row = seq.logits_row.expect("checked above");
                         let hidden = self.backend.hidden(row).to_vec();
                         let _ = seq.events.send(Event::Embedding(hidden));
                         Some(FinishReason::Stop)
                     }
-                    false => self.accept_token(i),
+                    (false, 0) => self.accept_token(i),
+                    (false, _) => self.accept_guesses(i),
                 };
             }
             match finished {
@@ -762,6 +852,83 @@ impl Engine {
                 None => i += 1,
             }
         }
+    }
+
+    /// Guess what comes next for the sequences that are generating, and add the guesses to their
+    /// tokens to be checked in this step.
+    fn propose(&mut self) {
+        let Some(speculative) = self.config.speculative else {
+            return;
+        };
+        let decoding = self.active.iter().filter(|s| s.is_decoding()).count();
+        if decoding == 0 {
+            return;
+        }
+        let per_sequence = speculative
+            .draft_tokens
+            .min(speculative.max_draft_rows / decoding);
+        if per_sequence == 0 {
+            return;
+        }
+        let limit = self.config.ctx_size.min(self.config.cache_tokens);
+        for seq in &mut self.active {
+            if seq.draft > 0 || seq.pending() != 1 || !seq.can_speculate() {
+                continue;
+            }
+            // The newest token counts against the length already; guesses past the end of what
+            // the request allows would be wasted.
+            let room = (seq.params.max_tokens.saturating_sub(seq.generated + 1))
+                .min(limit.saturating_sub(seq.tokens.len() + 1));
+            let index = seq.ngrams.get_or_insert_with(NgramIndex::default);
+            index.update(&seq.tokens);
+            let guesses = index.propose(&seq.tokens, per_sequence.min(room)).to_vec();
+            seq.draft = guesses.len();
+            seq.tokens.extend(guesses);
+        }
+    }
+
+    /// Take the guesses that were right, then the token sampled after them, and forget the rest.
+    fn accept_guesses(&mut self, index: usize) -> Option<FinishReason> {
+        let seq = &mut self.active[index];
+        let real = seq.tokens.len() - seq.draft;
+        let accepted = seq.accepted;
+        let mut taken: Vec<u32> = seq.tokens[real..real + accepted].to_vec();
+        taken.push(seq.sampled);
+        self.stats
+            .drafted_tokens
+            .fetch_add(seq.draft as u64, Relaxed);
+        self.stats
+            .accepted_tokens
+            .fetch_add(accepted as u64, Relaxed);
+        seq.tokens.truncate(real);
+        seq.draft = 0;
+        seq.accepted = 0;
+        // The right guesses are through the model already; the rest leave their slots unused.
+        Self::truncate_slots(&mut self.cache, seq, real + accepted);
+        for token in taken {
+            self.active[index].sampled = token;
+            if let Some(reason) = self.accept_token(index) {
+                let seq = &mut self.active[index];
+                let keep = seq.tokens.len().min(seq.slots.len());
+                Self::truncate_slots(&mut self.cache, seq, keep);
+                return Some(reason);
+            }
+        }
+        None
+    }
+
+    /// Shorten a sequence's KV slots to `keep`, giving back pages that held only what's gone.
+    fn truncate_slots(cache: &mut PrefixCache, seq: &mut Sequence, keep: usize) {
+        if seq.slots.len() <= keep {
+            return;
+        }
+        let page_size = cache.page_size();
+        let mut position = keep.div_ceil(page_size) * page_size;
+        while position < seq.slots.len() {
+            cache.free_page(seq.slots[position] / page_size as u32);
+            position += page_size;
+        }
+        seq.slots.truncate(keep);
     }
 
     /// Add the sampled token to its sequence. Returns why the sequence ended, if it has.

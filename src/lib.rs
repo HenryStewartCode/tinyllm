@@ -23,6 +23,7 @@
 //! | [`ops`]         | numeric kernels                                                    |
 //! | [`pool`]        | fork-join thread pool for very short parallel sections             |
 //! | [`sampler`]     | temperature, top-k, top-p, min-p, penalties                        |
+//! | [`speculative`] | guessing tokens ahead and checking them together                   |
 //! | [`chat`]        | runs each model's Jinja chat template                              |
 //! | [`reasoning`]   | separates a reasoning model's thinking from its answer             |
 //! | [`tools`]       | tool calling: what to show the model, and reading its calls        |
@@ -44,5 +45,6 @@ pub mod reasoning;
 pub mod safetensors;
 pub mod sampler;
 pub mod server;
+pub mod speculative;
 pub mod tokenizer;
 pub mod tools;

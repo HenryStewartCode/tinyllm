@@ -163,6 +163,24 @@ curl http://127.0.0.1:8000/v1/embeddings -H 'Content-Type: application/json' \
   -d '{"input": ["The capital of China is Beijing.", "Gravity attracts bodies."]}'
 ```
 
+### Speculative decoding
+
+`--speculative-algorithm ngram` guesses up to `--speculative-num-draft-tokens` (6) tokens ahead by
+copying what followed the last few tokens the previous time they appeared, as SGLang's NGRAM
+algorithm does, and checks every guess in the same pass through the model. Each position is
+sampled as ordinary decoding would sample it (every random draw depends only on the seed and the
+position), so replies come out exactly the same, only sooner. On an RTX 2000 Ada, with prompts
+that ask for code edits and copied text as well as poems and lists:
+
+| | 1 request | 8 at once | 32 at once |
+|---|---|---|---|
+| Qwen2.5-0.5B, tok/s without / with | 162 / 259 (1.6×) | 1,000 / 1,389 (1.4×) | 1,517 / 2,202 (1.5×) |
+| Qwen3-0.6B (mostly free-form thinking) | 133 / 156 (1.2×) | 843 / 915 (1.1×) | 2,150 / 2,153 (1.0×) |
+
+All 20 replies were identical with and without guessing, in each case. Requests with grammars,
+logprobs or thinking budgets don't guess, and the number of guesses per step is capped so that
+large batches don't spend their time checking guesses.
+
 ### Tool calling
 
 Pass `tools` as you would to OpenAI. Calls come back in `tool_calls`, a piece at a time if you're
@@ -246,6 +264,8 @@ cargo run --release -- -m models/Qwen2.5-0.5B-Instruct --chat --system "You are 
 | `--ctx-size N` | model max | longest allowed conversation, in tokens |
 | `--threads N` | performance cores − 2 | CPU worker threads (on a GPU, all available, for choosing tokens) |
 | `--parallel N` | 32 CPU, 128 GPU | requests in progress at once |
+| `--speculative-algorithm A` | none | `ngram` to guess tokens ahead (see [Speculative decoding](#speculative-decoding)) |
+| `--speculative-num-draft-tokens N` | 6 | the most tokens to guess ahead per request |
 | `--batch-size N` | 64 CPU, 512 GPU | tokens run through the model per step |
 | `--cache-mb N` | see right | KV cache size. CPU: ¼ of RAM up to 8 GiB, committed as used. GPU: what's left after loading |
 | `--show-tokens` | off | print the prompt's token ids |
@@ -449,7 +469,7 @@ missing is breadth, and the last 10–20% of single-stream speed.
 | Quantized weights (bf16, int8, GGUF) | yes | **bf16 on GPU only**, f32 on the CPU |
 | Tool calling, with `tool_choice` and strict schemas | yes, with parsers for many model families | yes, for the families that run here: Qwen and Hermes, Mistral, Llama 3 |
 | Reasoning parsers, thinking budgets | yes, for many families | yes, for `<think>` models (Qwen3, SmolLM3, DeepSeek-R1 and others) |
-| Speculative decoding | yes | **no** |
+| Speculative decoding | yes: EAGLE, MTP, draft models, n-grams | n-grams only, with replies exactly as without it |
 | Architectures | many, including mixture-of-experts | dense Llama-style (Llama, Mistral, Qwen2/3, SmolLM2/3, Phi-3, Granite, Gemma 1–3); **no mixture-of-experts** |
 | Sliding-window attention, logit soft-capping | yes | yes |
 | Embedding models | yes | yes, with last-token pooling |
@@ -457,9 +477,9 @@ missing is breadth, and the last 10–20% of single-stream speed.
 | Multi-GPU, multi-node, router | yes | **no** |
 | The SGL frontend language (`gen`, `select`, `fork`) | yes | **no** |
 
-Biggest gaps first, the plan is: speculative decoding, quantized weights, mixture-of-experts
-models, overlapping CPU scheduling with GPU work, a Metal backend for Apple GPUs, then LoRA
-adapters.
+Biggest gaps first, the plan is: quantized weights, mixture-of-experts models, overlapping CPU
+scheduling with GPU work, a Metal backend for Apple GPUs, LoRA adapters, then draft-model
+speculative decoding.
 
 Other limitations: only BPE tokenizers are supported (not SentencePiece Unigram or WordPiece,
 though that covers the Llama family), embeddings only use last-token pooling, and sliding windows

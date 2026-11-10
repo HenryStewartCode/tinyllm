@@ -54,7 +54,6 @@ const NEGLIGIBLE_LOGIT_GAP: f32 = 32.0;
 pub struct Sampler {
     params: SamplingParams,
     vocab: usize,
-    rng_state: u64,
     candidates: Vec<(f32, u32)>,
     seen: Vec<u32>,
     /// A copy of the logits with penalties and biases applied, when there are any.
@@ -63,11 +62,9 @@ pub struct Sampler {
 
 impl Sampler {
     pub fn new(params: SamplingParams, vocab: usize) -> Self {
-        let rng_state = params.seed ^ 0x9E37_79B9_7F4A_7C15 | 1; // xorshift can't start at zero
         Self {
             params,
             vocab,
-            rng_state,
             candidates: Vec::new(),
             seen: Vec::new(),
             adjusted: Vec::new(),
@@ -165,7 +162,7 @@ impl Sampler {
                 .expect("the model always produces scores")
                 .1
         } else {
-            self.draw(&mut candidates)
+            self.draw(&mut candidates, generated)
         };
         self.candidates = candidates;
         token
@@ -290,7 +287,10 @@ impl Sampler {
         candidates.retain(|&(score, _)| score >= best - gap);
     }
 
-    fn draw(&mut self, candidates: &mut Vec<(f32, u32)>) -> u32 {
+    /// Draw token number `generated` of the reply from the candidates. The random number depends
+    /// only on the seed and `generated`, so checking a guessed token (speculative decoding) picks
+    /// what drawing it in the ordinary way would have.
+    fn draw(&mut self, candidates: &mut Vec<(f32, u32)>, generated: usize) -> u32 {
         let (temperature, top_k, top_p, min_p) = (
             self.params.temperature,
             self.params.top_k,
@@ -333,7 +333,7 @@ impl Sampler {
         }
 
         let total: f32 = candidates.iter().map(|(p, _)| p).sum();
-        let r = self.random_f32() * total;
+        let r = self.random_f32(generated) * total;
         let mut cumulative = 0.0;
         for &(p, id) in candidates.iter() {
             cumulative += p;
@@ -344,12 +344,10 @@ impl Sampler {
         candidates.last().unwrap().1
     }
 
-    /// Uniform in [0, 1), from a xorshift64* generator.
-    fn random_f32(&mut self) -> f32 {
-        self.rng_state ^= self.rng_state >> 12;
-        self.rng_state ^= self.rng_state << 25;
-        self.rng_state ^= self.rng_state >> 27;
-        let bits = self.rng_state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 40; // top 24 bits
+    /// Uniform in [0, 1), for drawing token number `generated` of the reply.
+    fn random_f32(&self, generated: usize) -> f32 {
+        // A different stream from the GPU's draws, which use the key for Gumbel noise.
+        let bits = draw_key(self.params.seed ^ 0x5DEE_CE66_D1CE_4E5B, generated) >> 40;
         bits as f32 / (1u32 << 24) as f32
     }
 }
@@ -607,8 +605,23 @@ mod tests {
         let mut s = sampler(1.0, 0, 1.0, 42);
         let logits = [0.0, (3.0f32).ln()]; // probabilities 0.25 and 0.75
         let ones = (0..10_000)
-            .filter(|_| s.sample(all(&logits), &[], 0, None) == 1)
+            .filter(|&i| s.sample(all(&logits), &[], i, None) == 1)
             .count();
         assert!((7_200..7_800).contains(&ones), "{ones}");
+    }
+
+    #[test]
+    fn a_draw_depends_only_on_the_seed_and_position() {
+        let logits: Vec<f32> = (0..50).map(|i| -(i as f32) * 0.1).collect();
+        let mut a = sampler(1.0, 0, 1.0, 7);
+        let mut b = sampler(1.0, 0, 1.0, 7);
+        let forward: Vec<u32> = (0..20)
+            .map(|i| a.sample(all(&logits), &[], i, None))
+            .collect();
+        let backward: Vec<u32> = (0..20)
+            .rev()
+            .map(|i| b.sample(all(&logits), &[], i, None))
+            .collect();
+        assert_eq!(forward, backward.into_iter().rev().collect::<Vec<_>>());
     }
 }

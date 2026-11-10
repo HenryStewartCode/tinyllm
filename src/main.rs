@@ -11,7 +11,9 @@ use tinyllm::backend::{Backend, CpuBackend, LoadedModel};
 use tinyllm::chat::{self, ChatTemplate};
 use tinyllm::config::Config;
 use tinyllm::cuda::{self, CudaBackend};
-use tinyllm::engine::{self, EngineConfig, EngineHandle, Event, GenerateParams, Request};
+use tinyllm::engine::{
+    self, EngineConfig, EngineHandle, Event, GenerateParams, Request, Speculative,
+};
 use tinyllm::reasoning::ReasoningFormat;
 use tinyllm::sampler::SamplingParams;
 use tinyllm::server::{self, SamplingDefaults, Server};
@@ -53,6 +55,15 @@ enum ToolParserArg {
     Mistral,
     /// {"name": ..., "parameters": ...}
     Llama3,
+}
+
+/// How to guess tokens ahead (speculative decoding).
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum SpeculativeArg {
+    /// Don't guess
+    None,
+    /// Copy what followed the last few tokens earlier in the text (SGLang's NGRAM)
+    Ngram,
 }
 
 /// How to separate a reasoning model's thinking from its answer.
@@ -169,6 +180,15 @@ struct Args {
     /// How --serve separates a reasoning model's thinking (`reasoning_content`) from its answer
     #[arg(long, value_enum, default_value_t = ReasoningParserArg::Auto)]
     reasoning_parser: ReasoningParserArg,
+
+    /// Guess tokens ahead and check them in one pass (speculative decoding). Replies come out
+    /// exactly the same, sooner when the guesses are right
+    #[arg(long, value_enum, default_value_t = SpeculativeArg::None)]
+    speculative_algorithm: SpeculativeArg,
+
+    /// The most tokens to guess ahead for one request
+    #[arg(long, default_value_t = 6)]
+    speculative_num_draft_tokens: usize,
 }
 
 fn main() -> Result<()> {
@@ -253,6 +273,14 @@ fn main() -> Result<()> {
         max_batch: batch_size,
         cache_tokens: backend.capacity(),
         ctx_size: args.ctx_size.unwrap_or(config.max_position_embeddings),
+        speculative: match args.speculative_algorithm {
+            SpeculativeArg::None => None,
+            SpeculativeArg::Ngram => Some(Speculative {
+                draft_tokens: args.speculative_num_draft_tokens,
+                // Past this many rows a batch stops being nearly free.
+                max_draft_rows: if on_gpu { 64 } else { 16 },
+            }),
+        },
     };
     let params = GenerateParams {
         max_tokens: args.max_tokens,
