@@ -6,6 +6,10 @@
 //! themselves (DeepSeek-R1, Qwen3's "thinking" models), some leave it to the model (Qwen3), and
 //! some close an empty one to turn thinking off (Qwen3 with `enable_thinking: false`). Rather
 //! than know each model, [`ReasoningFormat::opened_by`] looks at how the prompt ends.
+//!
+//! GPT-OSS writes its replies in OpenAI's "harmony" format instead: a series of messages, each
+//! `<|channel|>NAME<|message|>TEXT<|end|>`, where the `analysis` channel is its thinking and the
+//! `final` channel its answer.
 
 use crate::tokenizer::Tokenizer;
 
@@ -14,7 +18,19 @@ use crate::tokenizer::Tokenizer;
 pub struct ReasoningFormat {
     pub start: String,
     pub end: String,
+    /// Replies are harmony messages (GPT-OSS); `start` and `end` mark where thinking begins
+    /// and where the answer does.
+    pub harmony: bool,
 }
+
+/// The special tokens harmony messages are made of, which have to stay in the text to be read.
+const HARMONY_MARKERS: [&str; 5] = [
+    "<|start|>",
+    "<|channel|>",
+    "<|message|>",
+    "<|end|>",
+    "<|constrain|>",
+];
 
 impl ReasoningFormat {
     /// `<think>` ... `</think>`, which nearly every open reasoning model uses.
@@ -22,22 +38,39 @@ impl ReasoningFormat {
         Self {
             start: "<think>".to_string(),
             end: "</think>".to_string(),
+            harmony: false,
+        }
+    }
+
+    /// OpenAI's harmony format (GPT-OSS): the thinking is the `analysis` channel's messages,
+    /// and the answer starts with the `final` channel's.
+    pub fn harmony() -> Self {
+        Self {
+            start: "<|channel|>analysis<|message|>".to_string(),
+            end: "<|channel|>final<|message|>".to_string(),
+            harmony: true,
         }
     }
 
     /// The format a model thinks in, judging by its chat template and vocabulary: both need to
     /// know about the end marker.
     pub fn detect(template: &str, tokenizer: &Tokenizer) -> Option<Self> {
+        if tokenizer.token_id("<|channel|>").is_some() && template.contains("<|channel|>") {
+            return Some(Self::harmony());
+        }
         let format = Self::think();
         let known = tokenizer.token_id(&format.end).is_some() && template.contains(&format.end);
         known.then_some(format)
     }
 
     /// Whether a rendered prompt leaves a block of thinking open, so that the reply starts in it.
+    /// A harmony reply always starts by thinking (it can skip straight to its answer, which
+    /// counts as the thinking ending at once).
     pub fn opened_by(&self, prompt: &str) -> bool {
-        prompt
-            .rfind(&self.start)
-            .is_some_and(|at| !prompt[at..].contains(&self.end))
+        self.harmony
+            || prompt
+                .rfind(&self.start)
+                .is_some_and(|at| !prompt[at..].contains(&self.end))
     }
 
     /// The token that opens a block, if the marker is a single token.
@@ -48,6 +81,17 @@ impl ReasoningFormat {
     /// The token that closes a block, if the marker is a single token.
     pub fn end_token(&self, tokenizer: &Tokenizer) -> Option<u32> {
         tokenizer.token_id(&self.end)
+    }
+
+    /// Special tokens that have to be kept in the text of a reply for it to be read.
+    pub fn marker_tokens(&self, tokenizer: &Tokenizer) -> Vec<u32> {
+        match self.harmony {
+            true => HARMONY_MARKERS
+                .iter()
+                .filter_map(|marker| tokenizer.token_id(marker))
+                .collect(),
+            false => Vec::new(),
+        }
     }
 }
 
@@ -76,6 +120,19 @@ pub struct ReasoningParser {
     /// Text that can't be placed yet: it might be part of a marker, or whitespace that may or
     /// may not end up mattering.
     held: String,
+    /// For harmony replies, the kind of message being read, or `None` between messages.
+    message: Option<Channel>,
+}
+
+/// What a harmony message is, by its channel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Channel {
+    /// `analysis`: thinking.
+    Analysis,
+    /// `final`, or `commentary` with no recipient: the answer.
+    Answer,
+    /// Addressed to a tool, which isn't read as a call yet, so it's left out.
+    ToTool,
 }
 
 impl ReasoningParser {
@@ -88,16 +145,71 @@ impl ReasoningParser {
                 false => State::Start,
             },
             held: String::new(),
+            message: None,
         }
     }
 
     /// Whether the reply is in its block of thinking right now.
     pub fn is_reasoning(&self) -> bool {
-        matches!(self.state, State::Reasoning { .. })
+        match self.format.harmony {
+            true => self.message == Some(Channel::Analysis),
+            false => matches!(self.state, State::Reasoning { .. }),
+        }
+    }
+
+    /// Add more of a harmony reply: each message's text goes where its channel says.
+    fn push_harmony(&mut self, text: &str) -> Vec<Piece> {
+        const MESSAGE: &str = "<|message|>";
+        const END: &str = "<|end|>";
+        self.held.push_str(text);
+        let mut out = Vec::new();
+        loop {
+            match self.message {
+                // A header: `<|start|>assistant<|channel|>NAME to=RECIPIENT ...<|message|>`.
+                None => {
+                    let Some(at) = self.held.find(MESSAGE) else {
+                        return out;
+                    };
+                    let header: String = self.held.drain(..at + MESSAGE.len()).collect();
+                    let channel = header
+                        .split("<|channel|>")
+                        .nth(1)
+                        .and_then(|rest| rest.split(|c: char| c.is_whitespace() || c == '<').next())
+                        .unwrap_or("final");
+                    self.message = Some(match channel {
+                        "analysis" => Channel::Analysis,
+                        _ if header.contains(" to=") => Channel::ToTool,
+                        _ => Channel::Answer,
+                    });
+                }
+                Some(channel) => {
+                    let (text, ended) = match self.held.find(END) {
+                        Some(at) => {
+                            let text: String = self.held.drain(..at).collect();
+                            self.held.drain(..END.len());
+                            (text, true)
+                        }
+                        None => {
+                            let keep = crate::engine::partial_match_len(&self.held, END);
+                            let ready = self.held.len() - keep;
+                            (self.held.drain(..ready).collect(), false)
+                        }
+                    };
+                    emit_message(&mut out, channel, text);
+                    if !ended {
+                        return out;
+                    }
+                    self.message = None;
+                }
+            }
+        }
     }
 
     /// Add more of the reply, getting back whatever can be placed.
     pub fn push(&mut self, text: &str) -> Vec<Piece> {
+        if self.format.harmony {
+            return self.push_harmony(text);
+        }
         self.held.push_str(text);
         let mut out = Vec::new();
         loop {
@@ -154,6 +266,13 @@ impl ReasoningParser {
     /// The reply is over: place whatever was held back.
     pub fn finish(&mut self) -> Vec<Piece> {
         let text = std::mem::take(&mut self.held);
+        if self.format.harmony {
+            let mut out = Vec::new();
+            if let Some(channel) = self.message {
+                emit_message(&mut out, channel, text);
+            }
+            return out;
+        }
         match self.state {
             // Never got past the marker, or past text that looked like it might be one.
             State::Start if text.trim().is_empty() => Vec::new(),
@@ -172,6 +291,20 @@ impl ReasoningParser {
                 }
             }
         }
+    }
+}
+
+/// Send some of a harmony message on, where its channel says.
+fn emit_message(out: &mut Vec<Piece>, channel: Channel, text: String) {
+    if text.is_empty() {
+        return;
+    }
+    match (channel, out.last_mut()) {
+        (Channel::Analysis, Some(Piece::Reasoning(so_far))) => so_far.push_str(&text),
+        (Channel::Analysis, _) => out.push(Piece::Reasoning(text)),
+        (Channel::Answer, Some(Piece::Content(so_far))) => so_far.push_str(&text),
+        (Channel::Answer, _) => out.push(Piece::Content(text)),
+        (Channel::ToTool, _) => {}
     }
 }
 
@@ -311,5 +444,36 @@ mod tests {
         assert!(!format.opened_by("<|im_start|>assistant\n"));
         assert!(!format.opened_by("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
         assert!(format.opened_by("<think>old</think> more <think>\n"));
+    }
+
+    #[test]
+    fn harmony_messages_go_where_their_channels_say() {
+        let reply = "<|channel|>analysis<|message|>The user wants a capital.<|end|><|start|>\
+                     assistant<|channel|>final<|message|>Paris.";
+        let (reasoning, content) = split(&ReasoningFormat::harmony(), true, reply);
+        assert_eq!(reasoning, "The user wants a capital.");
+        assert_eq!(content, "Paris.");
+        // Cut up anywhere, it reads the same.
+        for cut in 1..reply.len() {
+            if !reply.is_char_boundary(cut) {
+                continue;
+            }
+            let mut parser = ReasoningParser::new(ReasoningFormat::harmony(), true);
+            let mut pieces = parser.push(&reply[..cut]);
+            pieces.extend(parser.push(&reply[cut..]));
+            pieces.extend(parser.finish());
+            let (mut r, mut c) = (String::new(), String::new());
+            for piece in pieces {
+                match piece {
+                    Piece::Reasoning(text) => r.push_str(&text),
+                    Piece::Content(text) => c.push_str(&text),
+                }
+            }
+            assert_eq!(
+                (r.as_str(), c.as_str()),
+                (reasoning.as_str(), content.as_str()),
+                "cut at {cut}"
+            );
+        }
     }
 }

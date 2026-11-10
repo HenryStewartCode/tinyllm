@@ -196,7 +196,7 @@ extern "C" __global__ void attention(const float *qkv, int stride, const float *
                                      const int *row_offset, const int *row_len, float *scratch,
                                      const unsigned *scratch_offset, float *out, int n_heads,
                                      int n_kv_heads, int head_dim, float scale, int window,
-                                     float softcap) {
+                                     float softcap, const float *sinks) {
     const int team = blockIdx.x, lane = threadIdx.x;
     const int row = team / n_heads, head = team % n_heads;
     const int all = row_len[row], n = min(all, window), kv_dim = n_kv_heads * head_dim;
@@ -218,6 +218,9 @@ extern "C" __global__ void attention(const float *qkv, int stride, const float *
         best = fmaxf(best, score);
     }
     best = warp_max(best);
+    // A head's sink (GPT-OSS) joins the softmax as one more score, with no value.
+    if (sinks)
+        best = fmaxf(best, sinks[head]);
 
     // Softmax, shifted by the max for numerical stability.
     float sum = 0;
@@ -226,7 +229,7 @@ extern "C" __global__ void attention(const float *qkv, int stride, const float *
         scores[i] = weight;
         sum += weight;
     }
-    const float inverse = 1.0f / warp_sum(sum);
+    const float inverse = 1.0f / (warp_sum(sum) + (sinks ? expf(sinks[head] - best) : 0.0f));
     __syncwarp(); // the next loop reads what other lanes just wrote
 
     // Blend their values by that relevance. Here the lanes hold consecutive elements of the
@@ -620,16 +623,20 @@ MOE_MATMUL(1)
 MOE_MATMUL(2)
 MOE_MATMUL(4)
 
-// One block per row: add up what its experts made of it, weighted, in order of expert, and add
-// that to the residual stream.
+// One block per row: add up what its experts made of it (plus each expert's down bias, if they
+// have them), weighted, in order of expert, and add that to the residual stream.
 extern "C" __global__ void moe_combine(const float *down, int dim, const int *slot_of,
-                                       const float *topk_weights, int top_k, float *x) {
+                                       const float *topk_weights, int top_k, float *x,
+                                       const int *topk_ids, const float *down_bias) {
     const int row = blockIdx.x;
     for (int c = threadIdx.x; c < dim; c += WARP) {
         float sum = 0.0f;
-        for (int k = 0; k < top_k; k++)
-            sum += topk_weights[row * top_k + k] *
-                   down[(size_t)slot_of[row * top_k + k] * dim + c];
+        for (int k = 0; k < top_k; k++) {
+            float value = down[(size_t)slot_of[row * top_k + k] * dim + c];
+            if (down_bias)
+                value += down_bias[(size_t)topk_ids[row * top_k + k] * dim + c];
+            sum += topk_weights[row * top_k + k] * value;
+        }
         x[(size_t)row * dim + c] += sum;
     }
 }
@@ -1017,7 +1024,7 @@ __device__ __forceinline__ void attention_tiles(const float *qkv, int stride,
                                                 const int *row_len, const int *team_sizes,
                                                 __nv_bfloat16 *out, int n_heads, int n_kv_heads,
                                                 int head_dim, float scale, int out_chunks,
-                                                int window, float softcap) {
+                                                int window, float softcap, const float *sinks) {
     extern __shared__ __align__(1024) unsigned char smem[];
     const int block = blockIdx.x, lane = threadIdx.x;
     const int first_row = block / n_kv_heads, kv_head = block % n_kv_heads;
@@ -1126,9 +1133,18 @@ __device__ __forceinline__ void attention_tiles(const float *qkv, int stride,
     }
 
     // Divide by the total weight and write out, rounded for the next multiplication.
+    // A head's sink (GPT-OSS) adds to the total weight as one more score, with no value.
     float inverse[TILE];
-    for (int t = 0; t < tile_rows; t++)
-        inverse[t] = 1.0f / warp_sum(lane_sum[t]);
+    for (int t = 0; t < tile_rows; t++) {
+        float sink = 0.0f;
+        if (sinks) {
+            const float score = sinks[kv_head * group + t % group];
+            const float exponent = softcap > 0.0f ? score - capped_reference[t]
+                                                  : score - reference[t] * scale;
+            sink = expf(fminf(exponent, LARGEST_ATTENTION_EXPONENT));
+        }
+        inverse[t] = 1.0f / (warp_sum(lane_sum[t]) + sink);
+    }
     for (int c = 0; c < CHUNKS; c++) {
         wmma::store_matrix_sync(scores, totals[c], TILE, wmma::mem_row_major);
         __syncwarp();
@@ -1150,10 +1166,10 @@ __device__ __forceinline__ void attention_tiles(const float *qkv, int stride,
         const float *qkv, int stride, const __nv_bfloat16 *k_pool, const __nv_bfloat16 *v_pool, \
         int kv_chunks, const unsigned *page_lists, const int *row_offset, const int *row_len,  \
         const int *team_sizes, __nv_bfloat16 *out, int n_heads, int n_kv_heads, int head_dim,  \
-        float scale, int out_chunks, int window, float softcap) {                              \
+        float scale, int out_chunks, int window, float softcap, const float *sinks) {          \
         attention_tiles<CHUNKS>(qkv, stride, k_pool, v_pool, kv_chunks, page_lists, row_offset, \
                                 row_len, team_sizes, out, n_heads, n_kv_heads, head_dim, scale, \
-                                out_chunks, window, softcap);                                  \
+                                out_chunks, window, softcap, sinks);                           \
     }
 ATTENTION_BF16(1)
 ATTENTION_BF16(2)
@@ -1409,3 +1425,133 @@ extern "C" __global__ void draw_tokens(const float *logits, int vocab, const flo
     if (threadIdx.x == 0)
         results[(size_t)row * 2 + 1] = best_token;
 }
+
+// ---------------------------------------------------------------------------------------------
+// GPT-OSS's experts
+// ---------------------------------------------------------------------------------------------
+// The activation, for the slots of a mixture of experts, with each expert's gate and up biases
+// added first: with g = min(gate, limit) and u = clamp(up, -limit, limit), (u + 1) * g *
+// sigmoid(alpha * g). One block per slot and SWIGLU_COLUMNS columns, as moe_swiglu.
+extern "C" __global__ void moe_clamped_glu(const float *gate_up, __nv_bfloat16 *out, int hidden,
+                                           int chunks, const int *num_groups, const float *bias,
+                                           const int *group_expert, float alpha, float limit) {
+    const int slot = blockIdx.x;
+    if (slot >= *num_groups * TILE)
+        return;
+    const int first = blockIdx.y * SWIGLU_COLUMNS, end = min(hidden, first + SWIGLU_COLUMNS);
+    const float *gate = gate_up + (size_t)slot * 2 * hidden, *up = gate + hidden;
+    const float *expert_bias = bias + (size_t)group_expert[slot / TILE] * 2 * hidden;
+    for (int i = first + threadIdx.x; i < end; i += WARP) {
+        const float g = fminf(gate[i] + expert_bias[i], limit);
+        const float u = fminf(fmaxf(up[i] + expert_bias[hidden + i], -limit), limit);
+        out[tile_index(slot, i, chunks)] = __float2bfloat16((u + 1.0f) * (g / (1.0f + expf(-alpha * g))));
+    }
+}
+
+// MXFP4 weights: 4-bit floats (2 exponent bits, 1 mantissa bit: 0, 0.5, 1, 1.5, 2, 3, 4, 6 and
+// their negatives) with a power-of-two scale for each 32 columns, stored as an exponent byte
+// biased by 127, `[m, cols / 32]`. The 4-bit codes are in the same lane order as 4-bit integers
+// (see matmul_q4), so a lane reads its 8 values of a tile as one word. Each value is exact in
+// bfloat16, made with integer operations, and each pair of chunks' sums is multiplied by its
+// group's scale as they're added up.
+
+// The bfloat16 bits of a 4-bit float.
+__device__ __forceinline__ unsigned fp4_bf16(unsigned code) {
+    const unsigned m = code & 7;
+    // 2^((m >> 1) - 1) * (1 + (m & 1) / 2) for m >= 2; 0 and 0.5 below that.
+    const unsigned magnitude = m >= 2 ? (m << 6) + 0x3F00u : m * 0x3F00u;
+    return magnitude | ((code & 8) << 12);
+}
+
+// The two 4-bit floats in the low byte of `byte` as a pair of bfloat16s, the low nibble first.
+__device__ __forceinline__ unsigned fp4_pair(unsigned byte) {
+    return fp4_bf16(byte & 15) | (fp4_bf16((byte >> 4) & 15) << 16);
+}
+
+#define FP4_GROUP_CHUNKS 2 // 32 columns share a scale
+
+template <int TX>
+__device__ __forceinline__ void matmul_tiles_fp4(const unsigned *w, const unsigned char *scales,
+                                                 int m, int chunks, const __nv_bfloat16 *x,
+                                                 int batch, float *out) {
+    const int warp = threadIdx.x / WARP, lane = threadIdx.x % WARP;
+    const int x_group = blockIdx.x * TX + warp / WARPS_ACROSS;
+    const int w_group = blockIdx.y * WARPS_ACROSS + warp % WARPS_ACROSS;
+    const int first_row = x_group * TILE, first_column = w_group * TILE;
+    if (first_row >= batch || first_column >= m)
+        return; // this warp only has padding to work on
+    const int g = lane / 4, t = lane % 4;
+    const unsigned *x_words =
+        reinterpret_cast<const unsigned *>(x + (size_t)x_group * chunks * TILE_ELEMENTS);
+    const unsigned *w_lanes = w + (size_t)w_group * chunks * WARP + lane;
+    const int groups = chunks / FP4_GROUP_CHUNKS;
+    float acc[2][4] = {{0.0f, 0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f, 0.0f}};
+    for (int c = 0; c < chunks; c += I8_LOADS) {
+        const int n = min(I8_LOADS, chunks - c);
+        unsigned words[I8_LOADS];
+        unsigned a[I8_LOADS][4];
+#pragma unroll
+        for (int i = 0; i < I8_LOADS; i++) {
+            if (i < n) {
+                words[i] = w_lanes[(size_t)(c + i) * WARP];
+                const unsigned *tile = x_words + (size_t)(c + i) * (TILE_ELEMENTS / 2);
+                a[i][0] = tile[g * 8 + t];
+                a[i][1] = tile[(g + 8) * 8 + t];
+                a[i][2] = tile[g * 8 + t + 4];
+                a[i][3] = tile[(g + 8) * 8 + t + 4];
+            }
+        }
+#pragma unroll
+        for (int p = 0; p < I8_LOADS / FP4_GROUP_CHUNKS; p++) {
+            if (p * FP4_GROUP_CHUNKS >= n)
+                break;
+            float part[2][4] = {{0.0f, 0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f, 0.0f}};
+#pragma unroll
+            for (int q = 0; q < FP4_GROUP_CHUNKS; q++) {
+                const int i = p * FP4_GROUP_CHUNKS + q;
+                const unsigned word = words[i];
+                mma_bf16(part[0], a[i], fp4_pair(word), fp4_pair(word >> 8));
+                mma_bf16(part[1], a[i], fp4_pair(word >> 16), fp4_pair(word >> 24));
+            }
+            // This lane's output rows are 8h + 2t and 8h + 2t + 1 of the warp's 16.
+            const int group = (c + p * FP4_GROUP_CHUNKS) / FP4_GROUP_CHUNKS;
+            for (int h = 0; h < 2; h++) {
+                for (int j = 0; j < 2; j++) {
+                    const int row = min(first_column + h * 8 + 2 * t + j, m - 1);
+                    const unsigned e = scales[(size_t)row * groups + group];
+                    const float scale = e == 0 ? __uint_as_float(1u << 22) : __uint_as_float(e << 23);
+                    acc[h][j] += part[h][j] * scale;
+                    acc[h][j + 2] += part[h][j + 2] * scale;
+                }
+            }
+        }
+    }
+    for (int h = 0; h < 2; h++) {
+        for (int j = 0; j < 4; j++) {
+            const int row = first_row + g + (j / 2) * 8;
+            const int column = first_column + h * 8 + 2 * t + j % 2;
+            if (column < m)
+                out[(size_t)row * m + column] = acc[h][j];
+        }
+    }
+}
+
+// moe_matmul_fp4_TX: as moe_matmul_TX, with MXFP4 weights, each expert's `expert_words` words
+// and `expert_scales` scale bytes apart.
+#define MOE_MATMUL_FP4(TX)                                                                     \
+    extern "C" __global__ void moe_matmul_fp4_##TX(                                            \
+        const unsigned *w, unsigned long long expert_words, const unsigned char *scales,       \
+        unsigned long long expert_scales, const int *group_expert, const int *num_groups,      \
+        int m, int chunks, const __nv_bfloat16 *x, float *out) {                               \
+        const int warp = threadIdx.x / WARP;                                                   \
+        const int x_group = blockIdx.x * TX + warp / WARPS_ACROSS;                             \
+        const int groups = *num_groups;                                                        \
+        if (x_group >= groups)                                                                 \
+            return;                                                                            \
+        const int expert = group_expert[x_group];                                              \
+        matmul_tiles_fp4<TX>(w + expert * expert_words, scales + expert * expert_scales, m,    \
+                             chunks, x, groups * TILE, out);                                   \
+    }
+MOE_MATMUL_FP4(1)
+MOE_MATMUL_FP4(2)
+MOE_MATMUL_FP4(4)

@@ -37,10 +37,12 @@ cases = {
     "olmoe": ("olmoe", dict(num_experts=8, num_experts_per_tok=3)),
     "qwen2_moe": ("qwen2_moe", dict(moe_intermediate_size=96, shared_expert_intermediate_size=192, num_experts=8, num_experts_per_tok=2)),
     "granitemoe": ("granitemoe", dict(num_local_experts=8, num_experts_per_tok=2, embedding_multiplier=2.0, residual_multiplier=0.5, attention_multiplier=0.1, logits_scaling=2.0)),
+    # Attention sinks, alternating windows, YaRN, biases everywhere and a clamped activation.
+    "gpt_oss": ("gpt_oss", dict(head_dim=32, num_local_experts=8, num_experts_per_tok=2, sliding_window=9)),
 }
 # The GPU doesn't run these yet, or only in 16 bits.
 CPU_ONLY = {"qwen2_moe"}
-BF16_ONLY = {"qwen3_moe", "mixtral", "olmoe", "granitemoe"}
+BF16_ONLY = {"qwen3_moe", "mixtral", "olmoe", "granitemoe", "gpt_oss"}
 torch.manual_seed(5)
 rng = np.random.default_rng(5)
 lengths = [3, 17, 40, 70]

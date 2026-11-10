@@ -204,6 +204,11 @@ pub fn stop_tokens(dir: &Path, config_eos: Vec<u32>, tokenizer: &Tokenizer) -> H
         "<end_of_turn>",
         "<|end|>",
     ];
+    // In OpenAI's harmony format (GPT-OSS), <|end|> ends one message of a reply, not the reply.
+    let harmony = tokenizer.token_id("<|channel|>").is_some();
+    let markers = markers
+        .into_iter()
+        .filter(|&m| !(harmony && m == "<|end|>"));
     for name in eos_name.into_iter().chain(markers) {
         if let Some(id) = tokenizer
             .token_id(name)

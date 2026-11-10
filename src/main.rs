@@ -89,6 +89,9 @@ enum ReasoningParserArg {
     /// The same as qwen3; the template opening the block is noticed either way
     #[value(name = "deepseek-r1")]
     DeepseekR1,
+    /// OpenAI's harmony messages: the analysis channel is the thinking (GPT-OSS)
+    #[value(name = "gpt-oss")]
+    GptOss,
 }
 
 /// Run a Llama-family language model (Llama, Mistral, Qwen, SmolLM, Phi-3, Granite, Gemma).
@@ -403,12 +406,17 @@ fn main() -> Result<()> {
             ReasoningParserArg::Qwen3 | ReasoningParserArg::DeepseekR1 => {
                 Some(ReasoningFormat::think())
             }
+            ReasoningParserArg::GptOss => Some(ReasoningFormat::harmony()),
         };
-        if let Some(format) = &reasoning {
-            eprintln!(
+        match &reasoning {
+            Some(format) if format.harmony => {
+                eprintln!("Separating reasoning by harmony channel (analysis, then final)")
+            }
+            Some(format) => eprintln!(
                 "Separating reasoning between {} and {}",
                 format.start, format.end
-            );
+            ),
+            None => {}
         }
         return server::serve(
             Server {

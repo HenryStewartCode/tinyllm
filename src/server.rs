@@ -1199,6 +1199,11 @@ fn prepare_chat(app: &App, request: &ChatRequest) -> Result<ChatPrompt, ApiError
             params.keep_tokens = reading.format.marker_tokens(&app.server.tokenizer);
         }
         params.thinking = app.thinking(&text, request.thinking_budget);
+        if let Some(format) = &app.server.reasoning {
+            params
+                .keep_tokens
+                .extend(format.marker_tokens(&app.server.tokenizer));
+        }
         Ok((tokens, params))
     })?;
     params.strip_leading_space = true;

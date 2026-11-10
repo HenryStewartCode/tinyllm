@@ -125,6 +125,8 @@ struct Layer {
     rope_table: usize,
     /// How many tokens it can see.
     window: usize,
+    /// Each head's attention sink, or null.
+    sinks: Pointer,
 }
 
 enum FeedForward {
@@ -140,9 +142,20 @@ enum FeedForward {
 struct Experts {
     router: Matrix,
     /// Each expert's gate_proj and up_proj stacked, `[2 * hidden, dim]`.
-    gate_up: Pointer,
+    gate_up: ExpertWeights,
     /// Each expert's down_proj, `[dim, hidden]`.
-    down: Pointer,
+    down: ExpertWeights,
+    /// Each expert's biases for those, `[2 * hidden]` and `[dim]`, if they have them (GPT-OSS).
+    gate_up_bias: Pointer,
+    down_bias: Pointer,
+}
+
+/// Every expert's matrix for one projection, one after another: 16-bit tiles, or MXFP4 in the
+/// 4-bit lane order with `scales` (an exponent byte for each 32 columns of each row).
+#[derive(Clone, Copy)]
+struct ExpertWeights {
+    data: Pointer,
+    scales: Pointer,
 }
 
 /// Working memory for mixtures of experts.
@@ -191,6 +204,10 @@ struct Kernels {
     matmul_q4_4: Kernel,
     lora_shrink: Kernel,
     lora_expand: Kernel,
+    moe_clamped_glu: Kernel,
+    moe_matmul_fp4_1: Kernel,
+    moe_matmul_fp4_2: Kernel,
+    moe_matmul_fp4_4: Kernel,
     swiglu_bf16: Kernel,
     geglu_bf16: Kernel,
     rope_store_bf16: Kernel,
@@ -241,6 +258,10 @@ impl Kernels {
             matmul_q4_4: gpu.kernel(module, "matmul_q4_4")?,
             lora_shrink: gpu.kernel(module, "lora_shrink")?,
             lora_expand: gpu.kernel(module, "lora_expand")?,
+            moe_clamped_glu: gpu.kernel(module, "moe_clamped_glu")?,
+            moe_matmul_fp4_1: gpu.kernel(module, "moe_matmul_fp4_1")?,
+            moe_matmul_fp4_2: gpu.kernel(module, "moe_matmul_fp4_2")?,
+            moe_matmul_fp4_4: gpu.kernel(module, "moe_matmul_fp4_4")?,
             moe_route: gpu.kernel(module, "moe_route")?,
             moe_sort: gpu.kernel(module, "moe_sort")?,
             moe_gather: gpu.kernel(module, "moe_gather")?,
@@ -614,6 +635,15 @@ impl CudaBackend {
                 v_pool: Pointer::NULL,
                 rope_table: shape.rope_table,
                 window: shape.window.unwrap_or(i32::MAX as usize),
+                sinks: match architecture.attention_sinks {
+                    true => {
+                        let values = st.load(&format!("{attn}.sinks"), &[n_heads])?;
+                        let device = gpu.alloc(n_heads)?;
+                        gpu.write_now(device, &values)?;
+                        device
+                    }
+                    false => Pointer::NULL,
+                },
             });
         }
 
@@ -863,6 +893,7 @@ impl CudaBackend {
                     Arg::Int(q_dim.div_ceil(TILE)),
                     Arg::Int(layer.window),
                     Arg::Float(softcap),
+                    Arg::Ptr(layer.sinks),
                 ],
             );
         }
@@ -886,6 +917,7 @@ impl CudaBackend {
                 Arg::Float(scale),
                 Arg::Int(layer.window),
                 Arg::Float(softcap),
+                Arg::Ptr(layer.sinks),
             ],
         )
     }
@@ -1123,21 +1155,28 @@ impl CudaBackend {
             ],
         )?;
         self.moe_matmul(experts.gate_up, 2 * hidden, dim, slots, moe.x, moe.gate_up)?;
-        let gated = match self.architecture.activation {
-            Activation::Silu => self.kernels.moe_swiglu,
-            Activation::Gelu => self.kernels.moe_geglu,
-        };
-        self.gpu.launch(
-            gated,
-            [slots, hidden.div_ceil(SWIGLU_COLUMNS)],
-            &[
-                Arg::Ptr(moe.gate_up),
-                Arg::Ptr(moe.gated),
-                Arg::Int(hidden),
-                Arg::Int(hidden / TILE),
-                Arg::Ptr(moe.num_groups),
-            ],
-        )?;
+        let common = [
+            Arg::Ptr(moe.gate_up),
+            Arg::Ptr(moe.gated),
+            Arg::Int(hidden),
+            Arg::Int(hidden / TILE),
+            Arg::Ptr(moe.num_groups),
+        ];
+        let grid = [slots, hidden.div_ceil(SWIGLU_COLUMNS)];
+        match (spec.glu, self.architecture.activation) {
+            (Some(glu), _) => {
+                let mut args = common.to_vec();
+                args.extend([
+                    Arg::Ptr(experts.gate_up_bias),
+                    Arg::Ptr(moe.group_expert),
+                    Arg::Float(glu.alpha),
+                    Arg::Float(glu.limit),
+                ]);
+                self.gpu.launch(self.kernels.moe_clamped_glu, grid, &args)?;
+            }
+            (None, Activation::Silu) => self.gpu.launch(self.kernels.moe_swiglu, grid, &common)?,
+            (None, Activation::Gelu) => self.gpu.launch(self.kernels.moe_geglu, grid, &common)?,
+        }
         self.moe_matmul(experts.down, dim, hidden, slots, moe.gated, moe.down)?;
         self.gpu.launch(
             self.kernels.moe_combine,
@@ -1149,6 +1188,8 @@ impl CudaBackend {
                 Arg::Ptr(moe.topk_weights),
                 Arg::Int(top_k),
                 Arg::Ptr(self.x),
+                Arg::Ptr(moe.topk_ids),
+                Arg::Ptr(experts.down_bias),
             ],
         )
     }
@@ -1157,7 +1198,7 @@ impl CudaBackend {
     /// `[m, cols]` weights one after another from `w`.
     fn moe_matmul(
         &self,
-        w: Pointer,
+        w: ExpertWeights,
         m: usize,
         cols: usize,
         slots: usize,
@@ -1169,6 +1210,31 @@ impl CudaBackend {
             .as_ref()
             .expect("allocated for a mixture of experts");
         let groups = slots / TILE;
+        if w.scales != Pointer::NULL {
+            let (kernel, tx) = match groups {
+                1 => (self.kernels.moe_matmul_fp4_1, 1),
+                2 => (self.kernels.moe_matmul_fp4_2, 2),
+                _ => (self.kernels.moe_matmul_fp4_4, 4),
+            };
+            return self.gpu.launch_blocks(
+                kernel,
+                [groups.div_ceil(tx), m.div_ceil(TILE * WARPS_ACROSS)],
+                32 * WARPS_ACROSS * tx,
+                &[
+                    Arg::Ptr(w.data),
+                    Arg::Int(m * cols / 8),
+                    Arg::Ptr(w.scales),
+                    Arg::Int(m * cols / 32),
+                    Arg::Ptr(moe.group_expert),
+                    Arg::Ptr(moe.num_groups),
+                    Arg::Int(m),
+                    Arg::Int(cols / TILE),
+                    Arg::Ptr(x),
+                    Arg::Ptr(out),
+                ],
+            );
+        }
+        let w = w.data;
         let (kernel, tx) = match groups {
             1 => (self.kernels.moe_matmul_1, 1),
             2 => (self.kernels.moe_matmul_2, 2),
@@ -2176,6 +2242,9 @@ fn upload_experts(
         ExpertNaming::Qwen => format!("{p}.mlp.gate"),
         ExpertNaming::Mixtral => format!("{p}.block_sparse_moe.gate"),
         ExpertNaming::Granite => format!("{p}.block_sparse_moe.router.layer"),
+        ExpertNaming::GptOss => {
+            return upload_gpt_oss_experts(gpu, st, num_params, p, spec, dim, batch_rows);
+        }
     };
     let router = upload_stacked(
         gpu,
@@ -2200,6 +2269,7 @@ fn upload_experts(
     let mut gate_up: Vec<u16> = Vec::with_capacity(spec.count * 2 * h * dim);
     let mut down: Vec<u16> = Vec::with_capacity(spec.count * dim * h);
     match spec.naming {
+        ExpertNaming::GptOss => unreachable!("handled above"),
         ExpertNaming::Granite => {
             let input_name = format!("{p}.block_sparse_moe.input_linear.weight");
             let output_name = format!("{p}.block_sparse_moe.output_linear.weight");
@@ -2242,8 +2312,152 @@ fn upload_experts(
     };
     Ok(Experts {
         router,
-        gate_up: upload(&gate_up)?,
-        down: upload(&down)?,
+        gate_up: ExpertWeights {
+            data: upload(&gate_up)?,
+            scales: Pointer::NULL,
+        },
+        down: ExpertWeights {
+            data: upload(&down)?,
+            scales: Pointer::NULL,
+        },
+        gate_up_bias: Pointer::NULL,
+        down_bias: Pointer::NULL,
+    })
+}
+
+/// GPT-OSS's experts (see [`crate::model`]): MXFP4 weights stay 4-bit, in the lane order of 4-bit
+/// weights with their scale bytes; plain ones (as `transformers` saves a model it built) become
+/// 16-bit tiles. Gate rows, which alternate with up rows, are moved in front of them, along with
+/// their biases.
+fn upload_gpt_oss_experts(
+    gpu: &Gpu,
+    st: &SafeTensors,
+    num_params: &mut usize,
+    p: &str,
+    spec: &ConfigExperts,
+    dim: usize,
+    batch_rows: usize,
+) -> Result<Experts> {
+    let (count, h) = (spec.count, spec.hidden);
+    let router = upload_stacked(
+        gpu,
+        st,
+        Precision::Bf16,
+        num_params,
+        &[(format!("{p}.mlp.router"), count)],
+        dim,
+        batch_rows,
+        1.0,
+        None,
+    )?;
+    let gate_up_name = format!("{p}.mlp.experts.gate_up_proj");
+    let down_name = format!("{p}.mlp.experts.down_proj");
+    // Where each row of gate_up comes from: the even rows (gates), then the odd ones (ups).
+    let order: Vec<usize> = (0..h)
+        .map(|i| 2 * i)
+        .chain((0..h).map(|i| 2 * i + 1))
+        .collect();
+    let stored_bias = st.load(&format!("{gate_up_name}_bias"), &[count, 2 * h])?;
+    let gate_up_bias: Vec<f32> = (0..count)
+        .flat_map(|e| {
+            order
+                .iter()
+                .map(|&r| stored_bias[e * 2 * h + r])
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let down_bias = st.load(&format!("{down_name}_bias"), &[count, dim])?;
+    let upload_f32 = |values: &[f32]| -> Result<Pointer> {
+        let device = gpu.alloc(values.len())?;
+        gpu.write_now(device, values)?;
+        Ok(device)
+    };
+    let upload_bytes = |values: &[u8]| -> Result<Pointer> {
+        let device = gpu.alloc(values.len().div_ceil(4))?;
+        gpu.write_now(device, values)?;
+        Ok(device)
+    };
+    let (gate_up, down) = match st.load_mxfp4(&gate_up_name, count, 2 * h, dim)? {
+        Some((blocks, scales)) => {
+            ensure!(
+                dim.is_multiple_of(32) && h.is_multiple_of(32),
+                "MXFP4 experts need sizes that are multiples of 32"
+            );
+            let (down_blocks, down_scales) = st
+                .load_mxfp4(&down_name, count, dim, h)?
+                .context("down_proj needs to be MXFP4 as well")?;
+            let pack = |blocks: &[u8],
+                        scales: &[u8],
+                        rows: usize,
+                        cols: usize,
+                        order: Option<&[usize]>| {
+                let (row_bytes, row_scales) = (cols / 2, cols / 32);
+                let mut words = Vec::with_capacity(count * rows * cols / 2);
+                let mut all_scales = Vec::with_capacity(count * rows * row_scales);
+                let mut codes = vec![0u8; rows * cols];
+                for e in 0..count {
+                    for r in 0..rows {
+                        let from = e * rows + order.map_or(r, |order| order[r]);
+                        let bytes = &blocks[from * row_bytes..][..row_bytes];
+                        for (i, &byte) in bytes.iter().enumerate() {
+                            codes[r * cols + 2 * i] = byte & 15;
+                            codes[r * cols + 2 * i + 1] = byte >> 4;
+                        }
+                        all_scales.extend_from_slice(&scales[from * row_scales..][..row_scales]);
+                    }
+                    words.extend(pack_int4(&codes, rows, cols));
+                }
+                Ok::<_, anyhow::Error>(ExpertWeights {
+                    data: upload_bytes(&words)?,
+                    scales: upload_bytes(&all_scales)?,
+                })
+            };
+            (
+                pack(&blocks, &scales, 2 * h, dim, Some(&order))?,
+                pack(&down_blocks, &down_scales, dim, h, None)?,
+            )
+        }
+        None => {
+            // Plain matrices are [experts, in, out].
+            let full = st.load(&gate_up_name, &[count, dim, 2 * h])?;
+            let full_down = st.load(&down_name, &[count, h, dim])?;
+            let (mut gate_up, mut down) = (Vec::new(), Vec::new());
+            for e in 0..count {
+                let rows: Vec<u16> = (order.iter())
+                    .flat_map(|&r| (0..dim).map(move |c| (r, c)))
+                    .map(|(r, c)| f32_to_bf16(full[(e * dim + c) * 2 * h + r]))
+                    .collect();
+                gate_up.extend(to_tiles(&rows, 2 * h, dim));
+                let rows: Vec<u16> = (0..dim)
+                    .flat_map(|r| (0..h).map(move |c| (r, c)))
+                    .map(|(r, c)| f32_to_bf16(full_down[(e * h + c) * dim + r]))
+                    .collect();
+                down.extend(to_tiles(&rows, dim, h));
+            }
+            let upload16 = |values: &[u16]| -> Result<Pointer> {
+                let device = gpu.alloc(values.len().div_ceil(2))?;
+                gpu.write_now(device, values)?;
+                Ok(device)
+            };
+            (
+                ExpertWeights {
+                    data: upload16(&gate_up)?,
+                    scales: Pointer::NULL,
+                },
+                ExpertWeights {
+                    data: upload16(&down)?,
+                    scales: Pointer::NULL,
+                },
+            )
+        }
+    };
+    *num_params += count * (3 * h * dim + 2 * h + dim);
+    Ok(Experts {
+        router,
+        gate_up,
+        down,
+        gate_up_bias: upload_f32(&gate_up_bias)?,
+        down_bias: upload_f32(&down_bias)?,
     })
 }
 
@@ -2330,7 +2544,11 @@ impl Backend for CudaBackend {
             (Precision::Bf16, None) => "16-bit",
             (Precision::F32, None) => "32-bit",
         };
-        format!("{} (CUDA, {weights} weights)", self.gpu_name)
+        let mxfp4 = self.layers.iter().any(|layer| {
+            matches!(&layer.feed_forward, FeedForward::Sparse(experts) if experts.gate_up.scales != Pointer::NULL)
+        });
+        let experts = if mxfp4 { ", MXFP4 experts" } else { "" };
+        format!("{} (CUDA, {weights} weights{experts})", self.gpu_name)
     }
 
     fn forward(&mut self, rows: &[Row]) {

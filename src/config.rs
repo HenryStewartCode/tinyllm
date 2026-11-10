@@ -23,6 +23,7 @@ const SUPPORTED_MODEL_TYPES: &[&str] = &[
     "mixtral",
     "olmoe",
     "granitemoe",
+    "gpt_oss",
 ];
 
 #[derive(Debug, Clone, Deserialize)]
@@ -90,6 +91,9 @@ pub struct Config {
     decoder_sparse_step: Option<usize>,
     mlp_only_layers: Option<Vec<usize>>,
     clip_qkv: Option<f32>,
+    // GPT-OSS's activation.
+    swiglu_alpha: Option<f32>,
+    swiglu_limit: Option<f32>,
 
     // Granite.
     attention_multiplier: Option<f32>,
@@ -192,11 +196,23 @@ pub enum ExpertNaming {
     /// `block_sparse_moe.router.layer`, and every expert in one `input_linear` and one
     /// `output_linear` (Granite MoE).
     Granite,
+    /// `mlp.router`, and every expert's gate and up projections in one `gate_up_proj` (their
+    /// rows alternating) and down projections in one `down_proj`, all with biases, and either
+    /// as plain matrices `[experts, in, out]` or packed in MXFP4 (GPT-OSS).
+    GptOss,
+}
+
+/// GPT-OSS's activation: with `g = min(gate, limit)` and `u` the up projection clamped to
+/// `[-limit, limit]`, `(u + 1) * g * sigmoid(alpha * g)`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ClampedGlu {
+    pub alpha: f32,
+    pub limit: f32,
 }
 
 /// A mixture-of-experts MLP: a router scores the experts for each token, and the token goes
 /// through its best few, whose outputs are added up weighted by their scores.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Experts {
     pub count: usize,
     /// How many each token goes through.
@@ -208,6 +224,8 @@ pub struct Experts {
     /// The width of an expert every token goes through, gated by its own score (Qwen2 MoE).
     pub shared_hidden: Option<usize>,
     pub naming: ExpertNaming,
+    /// The experts' activation, if it isn't the model's usual one.
+    pub glu: Option<ClampedGlu>,
 }
 
 /// What makes a family of models different from the plain Llama layout. Both backends build
@@ -240,6 +258,9 @@ pub struct Architecture {
     pub head_norms: bool,
     /// OLMoE normalizes all the queries, and all the keys, of a token together.
     pub full_qk_norms: bool,
+    /// Each head has a learned score (`self_attn.sinks`) that joins its attention scores in the
+    /// softmax without adding any value, so attention can go nowhere (GPT-OSS).
+    pub attention_sinks: bool,
     /// The mixture of experts in the layers marked `sparse`, if the model has one.
     pub experts: Option<Experts>,
     /// The RoPE speed of each element pair in a head: one list per kind of layer.
@@ -298,6 +319,8 @@ impl Config {
                 Some("awq" | "gptq") => {
                     crate::safetensors::Int4Format::from_config(quantization)?;
                 }
+                // GPT-OSS's experts, which the loaders recognize by their tensors.
+                Some("mxfp4") => {}
                 method => bail!(
                     "{} quantization isn't supported yet (FP8 checkpoints with 128x128 blocks, and \
                      4-bit AWQ and GPTQ ones, are)",
@@ -409,6 +432,7 @@ impl Config {
             norms_after_blocks: matches!(model_type, "gemma2" | "gemma3_text"),
             head_norms: matches!(model_type, "qwen3" | "gemma3_text" | "qwen3_moe"),
             full_qk_norms: model_type == "olmoe",
+            attention_sinks: model_type == "gpt_oss",
             experts: self.experts()?,
             rope_tables,
             rope_scales,
@@ -423,6 +447,7 @@ impl Config {
             "qwen3_moe" | "qwen2_moe" | "olmoe" => ExpertNaming::Qwen,
             "mixtral" => ExpertNaming::Mixtral,
             "granitemoe" => ExpertNaming::Granite,
+            "gpt_oss" => ExpertNaming::GptOss,
             _ => return Ok(None),
         };
         let count = self
@@ -442,10 +467,10 @@ impl Config {
                     .context("moe_intermediate_size is missing")?,
                 _ => self.intermediate_size,
             },
-            // Mixtral and Granite take the softmax of just the chosen experts' scores, which
-            // comes to the same thing.
+            // Mixtral, Granite and GPT-OSS take the softmax of just the chosen experts' scores,
+            // which comes to the same thing.
             renormalize: match model_type {
-                "mixtral" | "granitemoe" => true,
+                "mixtral" | "granitemoe" | "gpt_oss" => true,
                 _ => self.norm_topk_prob.unwrap_or(false),
             },
             shared_hidden: match model_type {
@@ -453,6 +478,10 @@ impl Config {
                 _ => None,
             },
             naming,
+            glu: (model_type == "gpt_oss").then(|| ClampedGlu {
+                alpha: self.swiglu_alpha.unwrap_or(1.702),
+                limit: self.swiglu_limit.unwrap_or(7.0),
+            }),
         }))
     }
 
@@ -467,7 +496,7 @@ impl Config {
                     .is_some_and(|d| d.contains(&l));
                 !dense && (l + 1).is_multiple_of(step)
             }
-            "mixtral" | "olmoe" | "granitemoe" => true,
+            "mixtral" | "olmoe" | "granitemoe" | "gpt_oss" => true,
             _ => false,
         }
     }
@@ -486,6 +515,8 @@ impl Config {
             }
             "smollm3" => self.use_sliding_window.unwrap_or(false) && !self.has_rope(l),
             "gemma3_text" => !(l + 1).is_multiple_of(self.sliding_window_pattern.unwrap_or(6)),
+            // Alternating, starting with a window.
+            "gpt_oss" => l.is_multiple_of(2),
             _ => false,
         };
         match sliding {
@@ -498,6 +529,7 @@ impl Config {
         match (self.model_type.as_str(), self.sliding_window) {
             // Mistral and Qwen and Gemma 3 have a default, where others have none.
             ("mistral" | "qwen2" | "qwen3" | "smollm3" | "gemma3_text", None) => Some(4096),
+            ("gpt_oss", None) => Some(128),
             (_, setting) => setting.flatten(),
         }
     }

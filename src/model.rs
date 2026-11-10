@@ -20,7 +20,7 @@
 //! which is exact; others become f32 when they're loaded. Every kernel does plain f32 math.
 
 use crate::cache::KvPool;
-use crate::config::{Activation, Architecture, Config, ExpertNaming, Experts};
+use crate::config::{Activation, Architecture, ClampedGlu, Config, ExpertNaming, Experts};
 use crate::lora::{LoraAdapter, Module};
 use crate::ops::{
     Matrix, add_bias, add_rows, add_scaled, dot, gated_gelu, matmul, rmsnorm, rmsnorm_heads, rope,
@@ -120,6 +120,19 @@ impl Linear {
             bias: None,
         }
     }
+}
+
+/// GPT-OSS's activation over a batch: `gate = (u + 1) * g * sigmoid(alpha * g)`, with
+/// `g = min(gate, limit)` and `u = clamp(up, -limit, limit)`.
+fn clamped_glu(pool: &Pool, gate: &mut [f32], up: &[f32], dim: usize, glu: ClampedGlu) {
+    pool.for_chunks(gate, dim, 256, |r, gate| {
+        let up = &up[r * dim..(r + 1) * dim];
+        for (g, &u) in gate.iter_mut().zip(up) {
+            let x = g.min(glu.limit);
+            let u = u.clamp(-glu.limit, glu.limit);
+            *g = (u + 1.0) * (x / (1.0 + (-glu.alpha * x).exp()));
+        }
+    });
 }
 
 /// A gated MLP: `down(act(gate(x)) * up(x))`.
@@ -245,6 +258,13 @@ fn load_experts(
                 .collect();
             (format!("{p}.block_sparse_moe.router.layer"), experts)
         }
+        ExpertNaming::GptOss => {
+            anyhow::ensure!(residual == 1.0, "GPT-OSS experts don't scale their outputs");
+            (
+                format!("{p}.mlp.router"),
+                load_gpt_oss_experts(st, p, spec, dim)?,
+            )
+        }
     };
     let shared = match spec.shared_hidden {
         Some(hidden) => Some(Box::new((
@@ -262,6 +282,90 @@ fn load_experts(
         experts,
         shared,
     })
+}
+
+/// GPT-OSS's experts: `gate_up_proj` holds each expert's gate and up projections with their rows
+/// alternating, and `down_proj` its down projection, all with biases. They're either plain
+/// matrices, `[experts, in, out]`, or packed in MXFP4 as `[experts, out, in]`, which become
+/// bfloat16 (exactly).
+fn load_gpt_oss_experts(st: &SafeTensors, p: &str, spec: &Experts, dim: usize) -> Result<Vec<Mlp>> {
+    let (count, h) = (spec.count, spec.hidden);
+    let gate_up = format!("{p}.mlp.experts.gate_up_proj");
+    let down = format!("{p}.mlp.experts.down_proj");
+    let gate_up_bias = st.load(&format!("{gate_up}_bias"), &[count, 2 * h])?;
+    let down_bias = st.load(&format!("{down}_bias"), &[count, dim])?;
+    // Each expert's matrices as [out, in].
+    let (gate_up_half, down_half, gate_up_full, down_full) =
+        match st.load_mxfp4_bf16(&gate_up, count, 2 * h, dim)? {
+            Some(packed) => {
+                let down = st
+                    .load_mxfp4_bf16(&down, count, dim, h)?
+                    .context("down_proj needs to be MXFP4 as well")?;
+                (packed, down, Vec::new(), Vec::new())
+            }
+            None => {
+                let transpose = |values: Vec<f32>, rows: usize, cols: usize| -> Vec<f32> {
+                    let mut out = vec![0.0; values.len()];
+                    for e in 0..count {
+                        let (from, to) = (&values[e * rows * cols..], &mut out[e * rows * cols..]);
+                        for r in 0..rows {
+                            for c in 0..cols {
+                                to[c * rows + r] = from[r * cols + c];
+                            }
+                        }
+                    }
+                    out
+                };
+                let full_gate_up = st.load(&gate_up, &[count, dim, 2 * h])?;
+                let full_down = st.load(&down, &[count, h, dim])?;
+                (
+                    Vec::new(),
+                    Vec::new(),
+                    transpose(full_gate_up, dim, 2 * h),
+                    transpose(full_down, h, dim),
+                )
+            }
+        };
+    let half = !gate_up_half.is_empty();
+    Ok((0..count)
+        .map(|e| {
+            // Gate rows are the even ones, up rows the odd ones.
+            let alternate = |parity: usize| -> Linear {
+                let rows = (0..h).map(|i| e * 2 * h + 2 * i + parity);
+                let bias = rows.clone().map(|r| gate_up_bias[r]).collect();
+                let weight = match half {
+                    true => {
+                        let values: Vec<u16> = rows
+                            .flat_map(|r| gate_up_half[r * dim..(r + 1) * dim].iter().copied())
+                            .collect();
+                        Matrix::from_rows_bf16(&values, h, dim)
+                    }
+                    false => {
+                        let values: Vec<f32> = rows
+                            .flat_map(|r| gate_up_full[r * dim..(r + 1) * dim].iter().copied())
+                            .collect();
+                        Matrix::from_rows(&values, h, dim)
+                    }
+                };
+                Linear {
+                    weight,
+                    bias: Some(bias),
+                }
+            };
+            let block = e * dim * h..(e + 1) * dim * h;
+            Mlp {
+                gate_proj: alternate(0),
+                up_proj: alternate(1),
+                down_proj: Linear {
+                    weight: match half {
+                        true => Matrix::from_rows_bf16(&down_half[block], dim, h),
+                        false => Matrix::from_rows(&down_full[block], dim, h),
+                    },
+                    bias: Some(down_bias[e * dim..(e + 1) * dim].to_vec()),
+                },
+            }
+        })
+        .collect())
 }
 
 /// The experts a token goes through, in order of expert, with their weights: the softmax of the
@@ -290,6 +394,8 @@ struct Layer {
     v_proj: Linear,
     /// Normalize each head of the queries and of the keys, if the model does that.
     head_norms: Option<(Vec<f32>, Vec<f32>)>,
+    /// Each head's attention sink, if the model has them.
+    sinks: Option<Vec<f32>>,
     o_proj: Linear,
     /// Normalizes what attention adds to the residual stream, if the model does that.
     norm_after_attn: Option<Vec<f32>>,
@@ -552,7 +658,12 @@ impl Model {
                     None,
                 )
             };
+            let sinks = match architecture.attention_sinks {
+                true => Some(st.load(&format!("{attn}.sinks"), &[n_heads])?),
+                false => None,
+            };
             Ok(Layer {
+                sinks,
                 attn_norm: load_norm(&format!("{p}.input_layernorm.weight"), dim)?,
                 q_proj,
                 k_proj,
@@ -793,9 +904,11 @@ impl Model {
             .forward(pool, &mut moe.gate, &mut moe.scratch, &moe.input);
         mlp.up_proj
             .forward(pool, &mut moe.up, &mut moe.scratch, &moe.input);
-        match self.architecture.activation {
-            Activation::Silu => swiglu(pool, &mut moe.gate, &moe.up, hidden),
-            Activation::Gelu => gated_gelu(pool, &mut moe.gate, &moe.up, hidden),
+        let glu = self.architecture.experts.and_then(|spec| spec.glu);
+        match (glu, self.architecture.activation) {
+            (Some(glu), _) => clamped_glu(pool, &mut moe.gate, &moe.up, hidden, glu),
+            (None, Activation::Silu) => swiglu(pool, &mut moe.gate, &moe.up, hidden),
+            (None, Activation::Gelu) => gated_gelu(pool, &mut moe.gate, &moe.up, hidden),
         }
         mlp.down_proj
             .forward(pool, &mut moe.output, &mut moe.scratch, &moe.gate);
@@ -905,6 +1018,7 @@ impl Model {
                 rows,
                 (&kv.k[l], &kv.v[l]),
                 layer.window,
+                layer.sinks.as_deref(),
             );
             layer
                 .o_proj
@@ -1037,6 +1151,7 @@ impl Model {
     ///
     /// With grouped-query attention, `n_heads / n_kv_heads` query heads share each key/value
     /// head, which keeps the cache small.
+    #[allow(clippy::too_many_arguments)]
     fn attention(
         &self,
         pool: &Pool,
@@ -1045,6 +1160,7 @@ impl Model {
         rows: &[Row],
         (k_pool, v_pool): (&[f32], &[f32]),
         window: Option<usize>,
+        sinks: Option<&[f32]>,
     ) {
         let (n_heads, head_dim) = (self.n_heads, self.head_dim);
         let kv_dim = self.n_kv_heads * head_dim;
@@ -1067,7 +1183,20 @@ impl Model {
                         *score = soft_cap(*score, cap);
                     }
                 }
-                softmax(scores);
+                match sinks {
+                    None => softmax(scores),
+                    Some(sinks) => {
+                        // The sink joins the softmax, and takes its share of the weight.
+                        let sink = sinks[head];
+                        let max = scores.iter().copied().fold(sink, f32::max);
+                        let mut total = (sink - max).exp();
+                        for score in scores.iter_mut() {
+                            *score = (*score - max).exp();
+                            total += *score;
+                        }
+                        scores.iter_mut().for_each(|score| *score /= total);
+                    }
+                }
                 // Blend their values by that relevance.
                 out.fill(0.0);
                 for (&weight, &slot) in scores.iter().zip(slots) {

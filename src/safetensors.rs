@@ -443,6 +443,51 @@ impl SafeTensors {
         })
     }
 
+    /// Experts' weights packed in MXFP4, as GPT-OSS stores them: `{name}_blocks`, `[experts,
+    /// rows, cols / 32, 16]` bytes of 4-bit floats (two to a byte, the first in the low nibble),
+    /// and `{name}_scales`, `[experts, rows, cols / 32]`, a power of two for each 32 as an
+    /// exponent biased by 127. The two as stored, or `None` if the weights aren't stored this way.
+    pub fn load_mxfp4(
+        &self,
+        name: &str,
+        experts: usize,
+        rows: usize,
+        cols: usize,
+    ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        let (blocks, scales) = (format!("{name}_blocks"), format!("{name}_scales"));
+        if !self.tensors.contains_key(&blocks) {
+            return Ok(None);
+        }
+        ensure!(cols.is_multiple_of(32), "{name}: MXFP4 rows come in 32s");
+        let (packed, _) = self.read(&blocks, &[experts, rows, cols / 32, 16])?;
+        let (exponents, _) = self.read(&scales, &[experts, rows, cols / 32])?;
+        Ok(Some((packed, exponents)))
+    }
+
+    /// MXFP4 experts' weights (see [`SafeTensors::load_mxfp4`]) as bfloat16, `[experts, rows,
+    /// cols]`, which holds them exactly.
+    pub fn load_mxfp4_bf16(
+        &self,
+        name: &str,
+        experts: usize,
+        rows: usize,
+        cols: usize,
+    ) -> Result<Option<Vec<u16>>> {
+        let Some((packed, exponents)) = self.load_mxfp4(name, experts, rows, cols)? else {
+            return Ok(None);
+        };
+        let mut values = Vec::with_capacity(experts * rows * cols);
+        for (block, &exponent) in packed.as_chunks::<16>().0.iter().zip(&exponents) {
+            let scale = power_of_two(exponent);
+            for &byte in block {
+                for code in [byte & 15, byte >> 4] {
+                    values.push(f32_to_bf16(FP4_VALUES[code as usize] * scale));
+                }
+            }
+        }
+        Ok(Some(values))
+    }
+
     /// The raw bytes of a tensor, after checking its shape.
     fn read(&self, name: &str, shape: &[usize]) -> Result<(Vec<u8>, &str)> {
         let entry = self
@@ -456,6 +501,7 @@ impl SafeTensors {
             info.shape
         );
         let elem_size = match info.dtype.as_str() {
+            "U8" | "I8" => 1,
             "F32" | "I32" => 4,
             "F16" | "BF16" => 2,
             "F8_E4M3" => 1,
@@ -522,6 +568,20 @@ fn halves(bytes: &[u8]) -> impl Iterator<Item = u16> + '_ {
         .0
         .iter()
         .map(|&b| u16::from_le_bytes(b))
+}
+
+/// The values of 4-bit floats (2 exponent bits, 1 mantissa bit, as in MXFP4), by their bits.
+pub const FP4_VALUES: [f32; 16] = [
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+];
+
+/// 2^(exponent - 127), as MXFP4 stores its scales.
+pub fn power_of_two(exponent: u8) -> f32 {
+    match exponent {
+        0 => f32::from_bits(1 << 22), // 2^-127, below normal
+        255 => f32::NAN,
+        e => f32::from_bits((e as u32) << 23),
+    }
 }
 
 /// The block size of 8-bit float weights' scales.
