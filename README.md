@@ -2,10 +2,11 @@
 
 A small LLM serving engine in Rust, built on the same ideas as
 [SGLang](https://github.com/sgl-project/sglang): continuous batching, a radix-tree prefix cache
-and fast structured output, behind an OpenAI-compatible API. It runs Llama-family models
-(SmolLM2, Qwen2.5, Llama 2/3, Mistral, TinyLlama) straight from Hugging Face checkpoints, on
+and fast structured output, behind OpenAI-, Anthropic- and Ollama-compatible APIs. It runs
+Llama-style models (Llama 2/3, Qwen2.5, Qwen3, Mistral, SmolLM2/3, Phi-3, Granite, Gemma 1–3,
+TinyLlama), reasoning models, and embedding models straight from Hugging Face checkpoints, on
 NVIDIA GPUs or on the CPU, with no ML framework underneath. Everything from weight loading and
-tokenization to the GPU and SIMD kernels and the HTTP server is here, in about 14,000 lines
+tokenization to the GPU and SIMD kernels and the HTTP server is here, in about 18,000 lines
 including tests. See [How it compares with SGLang](#how-it-compares-with-sglang) for what's still
 missing.
 
@@ -37,8 +38,14 @@ cargo run --release -- -m models/SmolLM2-135M-Instruct --chat
 | `HuggingFaceTB/SmolLM2-135M-Instruct` | 270 MB | ~140 tok/s | tiny and fast, not very smart. Verified. |
 | `Qwen/Qwen2.5-0.5B-Instruct` | 990 MB | ~50 tok/s | noticeably better answers. Verified. |
 | `meta-llama/Llama-3.2-1B-Instruct` | 2.5 GB | ~18 tok/s | gated (see below). Verified. |
+| `Qwen/Qwen3-0.6B` | 1.5 GB | ~37 tok/s | a reasoning model: thinks before it answers. Verified. |
+| `ibm-granite/granite-3.3-2b-instruct` | 5 GB | | Verified. |
+| `HuggingFaceTB/SmolLM3-3B` | 6 GB | | reasoning model. Verified. |
+| `microsoft/Phi-3-mini-4k-instruct` | 7.6 GB | | Verified. |
+| `Qwen/Qwen3-Embedding-0.6B` | 1.2 GB | | an embedding model, for `/v1/embeddings`. Verified. |
 | `HuggingFaceTB/SmolLM2-360M-Instruct`, `SmolLM2-1.7B-Instruct` | 720 MB, 3.4 GB | | same architecture as the 135M |
 | `TinyLlama/TinyLlama-1.1B-Chat-v1.0` | 2.2 GB | | Llama 2 style tokenizer |
+| `google/gemma-3-1b-it`, `gemma-2-2b-it` | 2 GB, 5 GB | | gated. Checked with random weights only. |
 
 "Verified" means checked against Hugging Face's reference implementation (see
 [Correctness](#correctness)); the others use the same architecture and tokenizer code but
@@ -104,22 +111,57 @@ curl http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/jso
 
 | Endpoint | |
 |---|---|
-| `POST /v1/chat/completions` | Runs the model's own chat template. Streaming, `n`, logprobs, tool calls. |
+| `POST /v1/chat/completions` | Runs the model's own chat template. Streaming, `n`, logprobs, tool calls, `reasoning_content`. |
 | `POST /v1/completions` | Text or token prompts, one or many. Streaming, `n`, logprobs, `echo`. |
+| `POST /v1/embeddings` | Text or token inputs, `dimensions`, `encoding_format: "base64"`. |
+| `POST /v1/messages` | Anthropic's Messages API: content blocks, `tool_use`, extended thinking, streaming events. Also `/v1/messages/count_tokens`. |
+| `POST /api/chat`, `/api/generate`, `/api/embed` | Ollama's API, streaming one JSON object per line. Also `/api/tags`, `/api/show`, `/api/ps`, `/api/version`, `/api/embeddings`. |
 | `GET /v1/models` | |
 | `POST /generate` | SGLang's native API: `text` or `input_ids`, `sampling_params`, `stream`. |
+| `POST /tokenize`, `/detokenize` | Token ids for text and back (also under `/v1`). |
 | `GET /metrics` | Throughput, queue length and cache use, in Prometheus format. |
-| `GET /health`, `/get_model_info`, `/get_server_info` | |
+| `GET /health`, `/health_generate`, `/get_model_info`, `/get_server_info` | `/health_generate` checks that a token can actually be generated. |
 | `POST /flush_cache` | Drop everything in the prefix cache that isn't in use. |
 
 Requests can set `max_tokens` (or `max_completion_tokens`), `temperature`, `top_p`, `top_k`,
 `min_p`, `stop`, `stop_token_ids`, `seed`, `frequency_penalty`, `presence_penalty`,
 `repetition_penalty`, `logit_bias`, `logprobs`, `top_logprobs`, `ignore_eos`,
 `skip_special_tokens`, `stream_options.include_usage`, `response_format`, `regex`, `ebnf`,
-`json_schema`, `chat_template_kwargs`, `tools`, `tool_choice` and `parallel_tool_calls`. Sampling
-settings left out come from the model's `generation_config.json`.
+`json_schema`, `chat_template_kwargs`, `tools`, `tool_choice`, `parallel_tool_calls`,
+`separate_reasoning` and `thinking_budget`. Sampling settings left out come from the model's
+`generation_config.json`. Replies say which stop string ended them, if one did, in
+`matched_stop`.
 `usage.prompt_tokens_details.cached_tokens` reports how much of the prompt came from the prefix
 cache.
+
+### Reasoning models
+
+Models such as Qwen3, SmolLM3 and DeepSeek-R1 think between `<think>` and `</think>` before they
+answer. As with SGLang's reasoning parsers, the thinking comes back as `reasoning_content`, in
+streamed deltas too, and tool calls are only looked for in the answer. Structured output and
+forced tool calls apply to the answer, after the thinking.
+
+| | |
+|---|---|
+| `chat_template_kwargs: {"enable_thinking": false}` | Skip the thinking, for templates that offer that (Qwen3). |
+| `thinking_budget: N` | Think for at most N tokens, after which the end of the thinking is forced. |
+| `separate_reasoning: false` | Leave the thinking in `content`. |
+
+Whether a model thinks is worked out from its chat template and vocabulary; `--reasoning-parser`
+(`qwen3`, `deepseek-r1`, `none`) overrides that. A template that opens the block itself, or closes
+an empty one to turn thinking off, is noticed from how the prompt ends. The Anthropic API's
+`thinking` blocks and Ollama's `thinking` field come from the same place.
+
+### Embeddings
+
+Embedding models built like decoders, such as Qwen3-Embedding, gte-Qwen2 and e5-mistral, use the
+final hidden state of the last token, scaled to length 1. `/v1/embeddings` runs the inputs as one
+batch; `dimensions` cuts the vectors short first, for models trained to allow that.
+
+```bash
+curl http://127.0.0.1:8000/v1/embeddings -H 'Content-Type: application/json' \
+  -d '{"input": ["The capital of China is Beijing.", "Gravity attracts bodies."]}'
+```
 
 ### Tool calling
 
@@ -189,6 +231,8 @@ cargo run --release -- -m models/Qwen2.5-0.5B-Instruct --chat --system "You are 
 | `-c, --chat` | off | use the model's chat template; interactive without `--prompt` |
 | `--serve` | off | run the HTTP server |
 | `--host`, `--port` | 127.0.0.1, 8000 | where `--serve` listens |
+| `--reasoning-parser P` | auto | `auto`, `none`, `qwen3` or `deepseek-r1`: how `--serve` finds a reasoning model's thinking |
+| `--tool-call-parser P` | auto | how `--serve` reads tool calls (see [Tool calling](#tool-calling)) |
 | `--device D` | auto | `auto`, `cuda` or `cpu` |
 | `--precision P` | bf16 | on a GPU, `bf16` (16-bit weights) or `f32` |
 | `--system TEXT` | template's own | system prompt for `--chat` |
@@ -330,7 +374,18 @@ Checked against Hugging Face `transformers` (float32) and `tokenizers`:
   logits at every position of three prompts (plain text, a chat prompt, code) match to within
   5e-4, with each prompt run as a single batch using deliberately scattered KV slots. The most
   likely next token agrees at every position, and 48-token greedy generations are identical token
-  for token.
+  for token. The same holds for Qwen3-0.6B, Granite-3.3-2B, SmolLM3-3B and Phi-3-mini-4k (largest
+  difference 4e-4, 32-token greedy generations identical on the CPU and GPU).
+- **Every architecture:** random-weight models built by `transformers` for Llama, Qwen3 (with and
+  without sliding windows), Mistral with a window, Phi-3, Granite, SmolLM3, Gemma, Gemma 2 (with
+  soft-capping, and with 256-wide heads) and Gemma 3 (alternating sliding and global layers) match
+  to within 4e-4 on the CPU and the GPU in 32 bits, and batching never changes a result.
+- **Embeddings:** Qwen3-Embedding-0.6B gives vectors with cosine similarity 1.000000 to
+  `transformers`' in 32 bits (largest difference 3e-7), on the CPU and GPU, and at least 0.99996 in
+  16 bits.
+- **Reasoning and the other APIs:** `scripts/reasoning_test.py`, `anthropic_test.py` and
+  `ollama_test.py` check thinking, budgets, structured output and tool calls after thinking, and
+  the Anthropic and Ollama APIs end to end, on Qwen3-0.6B.
 - **Batching:** logits are bit-identical (millions compared, none different) whether a sequence
   runs alone or batched with others. Through the server, seeded samples are identical too,
   including when an undersized KV cache forces requests to be retracted and resumed.
@@ -347,9 +402,12 @@ Checked against Hugging Face `transformers` (float32) and `tokenizers`:
 - **Tokenizer:** identical token ids for 25 tricky strings (unicode, emoji, CJK, code, numbers,
   whitespace runs, special tokens), with and without special tokens, for five tokenizer styles:
   SmolLM2, Qwen2.5, Llama 3.2, TinyLlama (SentencePiece-style with byte fallback) and Mistral
-  v0.3 (Metaspace). Decoding matches too.
-- **Chat templates:** token-identical to `apply_chat_template` for SmolLM2, Qwen2.5, Llama 3.2 and
-  Mistral v0.3, across single- and multi-turn conversations with and without tools, including
+  v0.3 (Metaspace). Decoding matches too. Qwen3, Granite, SmolLM3 and Phi-3 match on 26 more,
+  checked against the `tokenizers` library reading `tokenizer.json` (`transformers` 5 rebuilds
+  SmolLM2's tokenizer without its digit splitting, and differs from the file on one of them).
+- **Chat templates:** token-identical to `apply_chat_template` for SmolLM2, Qwen2.5, Qwen3,
+  Llama 3.2, Granite, SmolLM3, Phi-3 and Mistral v0.3, across single- and multi-turn conversations
+  with and without tools, including
   earlier calls and their results as API clients send them. TinyLlama's
   rendered text is identical, but we add the `<s>` its training format expects and which its
   template leaves out, and `transformers` tokenizes the text after `</s>` slightly differently.
@@ -365,7 +423,8 @@ Checked against Hugging Face `transformers` (float32) and `tokenizers`:
   with random weights and the real tokenizer.
 - **API:** exercised with the official `openai` Python client.
 
-`cargo test` runs the unit tests.
+`cargo test` runs the unit tests. The scripts behind these checks are in
+[`scripts/`](scripts/README.md), driving the library through the `harness` example.
 
 ## How it compares with SGLang
 
@@ -376,6 +435,8 @@ missing is breadth, and the last 10–20% of single-stream speed.
 | | SGLang | tinyllm |
 |---|---|---|
 | OpenAI-compatible API, native `/generate`, streaming | yes | yes |
+| Anthropic and Ollama APIs | yes | yes |
+| `/tokenize`, `/detokenize`, `/health_generate` | yes | yes |
 | Continuous batching | yes | yes |
 | Prefix caching with a radix tree, eviction, retraction | yes | yes |
 | Longest-prefix-aware scheduling | yes | waits for in-flight prompts; otherwise first come, first served |
@@ -387,16 +448,19 @@ missing is breadth, and the last 10–20% of single-stream speed.
 | Reusable compiled batches (CUDA graphs) | yes | yes, for batches of up to 64 |
 | Quantized weights (bf16, int8, GGUF) | yes | **bf16 on GPU only**, f32 on the CPU |
 | Tool calling, with `tool_choice` and strict schemas | yes, with parsers for many model families | yes, for the families that run here: Qwen and Hermes, Mistral, Llama 3 |
-| Reasoning parsers | yes | **no** |
+| Reasoning parsers, thinking budgets | yes, for many families | yes, for `<think>` models (Qwen3, SmolLM3, DeepSeek-R1 and others) |
 | Speculative decoding | yes | **no** |
-| Architectures | many | Llama-style (Llama, Mistral, Qwen2, SmolLM) |
-| Vision, embeddings, rerank | yes | **no** |
+| Architectures | many, including mixture-of-experts | dense Llama-style (Llama, Mistral, Qwen2/3, SmolLM2/3, Phi-3, Granite, Gemma 1–3); **no mixture-of-experts** |
+| Sliding-window attention, logit soft-capping | yes | yes |
+| Embedding models | yes | yes, with last-token pooling |
+| Vision, rerank, reward models | yes | **no** |
 | Multi-GPU, multi-node, router | yes | **no** |
 | The SGL frontend language (`gen`, `select`, `fork`) | yes | **no** |
 
-Biggest gaps first, the plan is: more architectures (Qwen3, Gemma), a Metal backend for Apple
-GPUs, single-stream GPU speed, then speculative decoding.
+Biggest gaps first, the plan is: speculative decoding, quantized weights, mixture-of-experts
+models, overlapping CPU scheduling with GPU work, a Metal backend for Apple GPUs, then LoRA
+adapters.
 
 Other limitations: only BPE tokenizers are supported (not SentencePiece Unigram or WordPiece,
-though that covers the Llama family), and there's no sliding-window attention, which only matters
-for Mistral 7B v0.1 beyond 4,096 tokens.
+though that covers the Llama family), embeddings only use last-token pooling, and sliding windows
+limit what attention sees but don't yet save KV cache memory.
