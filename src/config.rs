@@ -285,8 +285,12 @@ impl Config {
                         "FP8 checkpoints need 128x128 weight blocks, not {block}"
                     );
                 }
+                Some("awq" | "gptq") => {
+                    crate::safetensors::Int4Format::from_config(quantization)?;
+                }
                 method => bail!(
-                    "{} quantization isn't supported yet (FP8 checkpoints with 128x128 blocks are)",
+                    "{} quantization isn't supported yet (FP8 checkpoints with 128x128 blocks, and \
+                     4-bit AWQ and GPTQ ones, are)",
                     method.unwrap_or("this kind of")
                 ),
             }

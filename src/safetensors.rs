@@ -4,6 +4,11 @@
 //! tensor name to `{dtype, shape, data_offsets: [begin, end]}`, then the raw tensor bytes
 //! (offsets count from the end of the header). Large models are split across several files
 //! that are listed in `model.safetensors.index.json`.
+//!
+//! Weights quantized to 4 bits (AWQ or GPTQ checkpoints) are stored as several tensors in place
+//! of `{layer}.weight`. Asking for that weight unpacks them, so the rest of tinyllm can treat them
+//! like any other; [`SafeTensors::load_int4`] gives them still packed, for kernels that keep them
+//! that way.
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
@@ -29,7 +34,98 @@ struct Entry {
 pub struct SafeTensors {
     files: Vec<PathBuf>,
     tensors: HashMap<String, Entry>,
+    /// How 4-bit weights are packed, if the checkpoint has them.
+    int4: Option<Int4Format>,
 }
+
+/// How a checkpoint packs its 4-bit weights, from `quantization_config` in `config.json`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Int4Format {
+    pub packing: Packing,
+    /// How many inputs share each scale and zero point, or `None` for a whole row.
+    pub group_size: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Packing {
+    /// AutoAWQ's "gemm" layout: `qweight` is `[in, out / 8]`, eight outputs to a 32-bit word in
+    /// the order 0, 2, 4, 6, 1, 3, 5, 7; zero points are packed the same way.
+    Awq,
+    /// GPTQ: `qweight` is `[in / 8, out]`, eight inputs to a word in order; zero points are packed
+    /// along the outputs, and in the original format stored one less than they are.
+    Gptq { zero_offset: u8 },
+}
+
+impl Int4Format {
+    /// The format described by a `quantization_config`, if it's 4-bit AWQ or GPTQ.
+    pub fn from_config(config: &serde_json::Value) -> Result<Option<Self>> {
+        let packing = match config["quant_method"].as_str() {
+            Some("awq") => {
+                let version = config["version"].as_str().unwrap_or("gemm");
+                ensure!(
+                    version.eq_ignore_ascii_case("gemm"),
+                    "AWQ checkpoints in the {version} layout aren't supported (gemm ones are)"
+                );
+                ensure!(
+                    config["zero_point"].as_bool().unwrap_or(true),
+                    "AWQ checkpoints without zero points aren't supported"
+                );
+                Packing::Awq
+            }
+            Some("gptq") => {
+                let format = config["checkpoint_format"].as_str().unwrap_or("gptq");
+                let zero_offset = match format {
+                    "gptq" => 1,
+                    "gptq_v2" => 0,
+                    other => bail!("GPTQ checkpoints in the {other} format aren't supported"),
+                };
+                Packing::Gptq { zero_offset }
+            }
+            _ => return Ok(None),
+        };
+        let bits = config["bits"].as_u64().unwrap_or(4);
+        ensure!(
+            bits == 4,
+            "{bits}-bit AWQ and GPTQ checkpoints aren't supported (4-bit ones are)"
+        );
+        let group_size = match config["group_size"].as_i64().unwrap_or(128) {
+            -1 => None,
+            size if size > 0 && size % 8 == 0 => Some(size as usize),
+            size => bail!("a quantization group size of {size} isn't supported"),
+        };
+        Ok(Some(Self {
+            packing,
+            group_size,
+        }))
+    }
+}
+
+/// A 4-bit weight matrix, unpacked: `values` (0 to 15) for each `[out, in]`, and for each output
+/// and group of `group` inputs a zero point and scale, `[out, in / group]`:
+/// weight = (value - zero) * scale.
+pub struct Int4Matrix {
+    pub values: Vec<u8>,
+    pub zeros: Vec<u8>,
+    pub scales: Vec<f32>,
+    pub group: usize,
+}
+
+impl Int4Matrix {
+    /// The weights as 32-bit floats, which hold them exactly.
+    pub fn dequantize(&self, rows: usize, cols: usize) -> Vec<f32> {
+        let groups = cols.div_ceil(self.group);
+        (0..rows * cols)
+            .map(|i| {
+                let (row, column) = (i / cols, i % cols);
+                let g = row * groups + column / self.group;
+                (self.values[i] as f32 - self.zeros[g] as f32) * self.scales[g]
+            })
+            .collect()
+    }
+}
+
+/// Where AWQ puts output `c` of each group of eight in a word (as the nibble's index).
+const AWQ_SLOT: [usize; 8] = [0, 4, 1, 5, 2, 6, 3, 7];
 
 impl SafeTensors {
     /// Index `model.safetensors`, or every shard named in `model.safetensors.index.json`.
@@ -80,23 +176,184 @@ impl SafeTensors {
                 })
                 .collect();
         }
-        Ok(Self { files, tensors })
+        // How 4-bit weights are packed comes from the model's configuration.
+        let int4 = match std::fs::read_to_string(dir.join("config.json")) {
+            Ok(text) => {
+                let config: serde_json::Value = serde_json::from_str(&text)?;
+                match config.get("quantization_config") {
+                    Some(quantization) => Int4Format::from_config(quantization)?,
+                    None => None,
+                }
+            }
+            Err(_) => None,
+        };
+        Ok(Self {
+            files,
+            tensors,
+            int4,
+        })
     }
 
     pub fn contains(&self, name: &str) -> bool {
-        self.tensors.contains_key(name)
+        self.tensors.contains_key(name) || self.int4_prefix(name).is_some()
     }
 
-    /// How tensor `name` is stored: `"BF16"`, `"F16"`, `"F32"`...
+    /// How tensor `name` is stored: `"BF16"`, `"F16"`, `"F32"`..., or `"INT4"` for a weight
+    /// quantized to 4 bits.
     pub fn dtype(&self, name: &str) -> Option<&str> {
-        self.tensors
-            .get(name)
-            .map(|entry| entry.info.dtype.as_str())
+        match self.int4_prefix(name) {
+            Some(_) => Some("INT4"),
+            None => self
+                .tensors
+                .get(name)
+                .map(|entry| entry.info.dtype.as_str()),
+        }
+    }
+
+    /// For a weight stored as 4-bit values (`{layer}.weight` in a quantized checkpoint), the
+    /// `{layer}` its packed tensors are named after.
+    fn int4_prefix<'a>(&self, name: &'a str) -> Option<&'a str> {
+        self.int4?;
+        let prefix = name.strip_suffix(".weight")?;
+        let packed = !self.tensors.contains_key(name)
+            && self.tensors.contains_key(&format!("{prefix}.qweight"));
+        packed.then_some(prefix)
+    }
+
+    /// A `[rows, cols]` weight stored as 4-bit values, unpacked but not multiplied out, or `None`
+    /// if it's stored some other way. Its zero points and scales come in groups of `group`
+    /// columns, which for GPTQ with the columns reordered ("act order") isn't possible, so that's
+    /// an error here (though [`SafeTensors::load`] can still read the weight).
+    pub fn load_int4(&self, name: &str, shape: &[usize]) -> Result<Option<Int4Matrix>> {
+        match self.int4_parts(name, shape)? {
+            None => Ok(None),
+            Some((matrix, None)) => Ok(Some(matrix)),
+            Some((_, Some(_))) => bail!("{name}: GPTQ with reordered columns (act order)"),
+        }
+    }
+
+    /// The unpacked parts of a 4-bit weight, and for GPTQ with reordered columns, the group of
+    /// each column (when `matrix.zeros` and `scales` are indexed by that rather than by
+    /// `column / group`).
+    #[allow(clippy::type_complexity)]
+    fn int4_parts(
+        &self,
+        name: &str,
+        shape: &[usize],
+    ) -> Result<Option<(Int4Matrix, Option<Vec<usize>>)>> {
+        let (Some(prefix), Some(format)) = (self.int4_prefix(name), self.int4) else {
+            return Ok(None);
+        };
+        ensure!(shape.len() == 2, "{name}: 4-bit weights only for matrices");
+        let (rows, cols) = (shape[0], shape[1]);
+        ensure!(
+            rows.is_multiple_of(8) && cols.is_multiple_of(8),
+            "{name}: 4-bit weights need sizes that are multiples of 8"
+        );
+        let group = format.group_size.unwrap_or(cols);
+        let groups = cols.div_ceil(group);
+        let words = |suffix: &str, shape: &[usize]| -> Result<Vec<u32>> {
+            let name = format!("{prefix}.{suffix}");
+            let (bytes, dtype) = self.read(&name, shape)?;
+            ensure!(
+                dtype == "I32",
+                "{name} should be 32-bit integers, not {dtype}"
+            );
+            Ok(bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|&b| u32::from_le_bytes(b))
+                .collect())
+        };
+        let nibble = |word: u32, index: usize| ((word >> (4 * index)) & 15) as u8;
+        // Scales are `[groups, out]` in both formats.
+        let stored_scales = self.load(&format!("{prefix}.scales"), &[groups, rows])?;
+        let mut scales = vec![0.0f32; rows * groups];
+        let mut zeros = vec![0u8; rows * groups];
+        let mut values = vec![0u8; rows * cols];
+        let packed_zeros = words("qzeros", &[groups, rows / 8])?;
+        let mut column_groups = None;
+        match format.packing {
+            Packing::Awq => {
+                // Eight rows at a time, so the values are written in order along each row.
+                let packed = words("qweight", &[cols, rows / 8])?;
+                in_parallel(&mut values, 8 * cols, |w, eight| {
+                    for column in 0..cols {
+                        let word = packed[column * (rows / 8) + w];
+                        for (k, &slot) in AWQ_SLOT.iter().enumerate() {
+                            eight[k * cols + column] = nibble(word, slot);
+                        }
+                    }
+                });
+                for g in 0..groups {
+                    for row in 0..rows {
+                        let word = packed_zeros[g * (rows / 8) + row / 8];
+                        zeros[row * groups + g] = nibble(word, AWQ_SLOT[row % 8]);
+                        scales[row * groups + g] = stored_scales[g * rows + row];
+                    }
+                }
+            }
+            Packing::Gptq { zero_offset } => {
+                let packed = words("qweight", &[cols / 8, rows])?;
+                in_parallel(&mut values, cols, |row, out| {
+                    for (w, eight) in out.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+                        let word = packed[w * rows + row];
+                        for (k, value) in eight.iter_mut().enumerate() {
+                            *value = nibble(word, k);
+                        }
+                    }
+                });
+                for g in 0..groups {
+                    for row in 0..rows {
+                        let word = packed_zeros[g * (rows / 8) + row / 8];
+                        zeros[row * groups + g] = nibble(word, row % 8) + zero_offset;
+                        scales[row * groups + g] = stored_scales[g * rows + row];
+                    }
+                }
+                let g_idx = format!("{prefix}.g_idx");
+                if self.tensors.contains_key(&g_idx) {
+                    let order: Vec<usize> = words("g_idx", &[cols])?
+                        .into_iter()
+                        .map(|g| g as usize)
+                        .collect();
+                    ensure!(
+                        order.iter().all(|&g| g < groups),
+                        "{g_idx} names a group that doesn't exist"
+                    );
+                    if order.iter().enumerate().any(|(c, &g)| g != c / group) {
+                        column_groups = Some(order);
+                    }
+                }
+            }
+        }
+        let matrix = Int4Matrix {
+            values,
+            zeros,
+            scales,
+            group,
+        };
+        Ok(Some((matrix, column_groups)))
     }
 
     /// Read tensor `name`, check that it has the expected `shape`, and convert it to f32. Weights
     /// stored as 8-bit floats come out multiplied by their block scales.
     pub fn load(&self, name: &str, shape: &[usize]) -> Result<Vec<f32>> {
+        if let Some((matrix, column_groups)) = self.int4_parts(name, shape)? {
+            let Some(column_groups) = column_groups else {
+                return Ok(matrix.dequantize(shape[0], shape[1]));
+            };
+            // GPTQ with reordered columns: each column's group comes from the list.
+            let (rows, cols) = (shape[0], shape[1]);
+            let groups = cols.div_ceil(matrix.group);
+            return Ok((0..rows * cols)
+                .map(|i| {
+                    let (row, column) = (i / cols, i % cols);
+                    let g = row * groups + column_groups[column];
+                    (matrix.values[i] as f32 - matrix.zeros[g] as f32) * matrix.scales[g]
+                })
+                .collect());
+        }
         if let Some((bytes, scales)) = self.load_fp8(name, shape)? {
             let (rows, cols) = (shape[0], shape[1]);
             let column_blocks = cols.div_ceil(FP8_BLOCK);
@@ -146,7 +403,7 @@ impl SafeTensors {
     /// Read tensor `name` as bfloat16. Tensors stored that way come through exactly; others are
     /// rounded.
     pub fn load_bf16(&self, name: &str, shape: &[usize]) -> Result<Vec<u16>> {
-        if self.dtype(name) == Some("F8_E4M3") {
+        if matches!(self.dtype(name), Some("F8_E4M3" | "INT4")) {
             return Ok(self
                 .load(name, shape)?
                 .into_iter()
@@ -182,7 +439,7 @@ impl SafeTensors {
             info.shape
         );
         let elem_size = match info.dtype.as_str() {
-            "F32" => 4,
+            "F32" | "I32" => 4,
             "F16" | "BF16" => 2,
             "F8_E4M3" => 1,
             other => bail!("tensor {name}: unsupported dtype {other}"),
@@ -201,6 +458,23 @@ impl SafeTensors {
             .with_context(|| format!("reading tensor {name}"))?;
         Ok((bytes, info.dtype.as_str()))
     }
+}
+
+/// Run `f(index, piece)` on each `piece_len` piece of `values`, on all the CPU's threads.
+fn in_parallel(values: &mut [u8], piece_len: usize, f: impl Fn(usize, &mut [u8]) + Sync) {
+    let pieces = values.len() / piece_len;
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let per_thread = pieces.div_ceil(threads).max(1);
+    let f = &f;
+    std::thread::scope(|scope| {
+        for (part, chunk) in values.chunks_mut(per_thread * piece_len).enumerate() {
+            scope.spawn(move || {
+                for (i, piece) in chunk.chunks_exact_mut(piece_len).enumerate() {
+                    f(part * per_thread + i, piece);
+                }
+            });
+        }
+    });
 }
 
 fn find_files(dir: &Path) -> Result<Vec<PathBuf>> {
@@ -233,7 +507,6 @@ fn halves(bytes: &[u8]) -> impl Iterator<Item = u16> + '_ {
         .map(|&b| u16::from_le_bytes(b))
 }
 
-/// Round to the nearest bfloat16, ties to even.
 /// The block size of 8-bit float weights' scales.
 pub const FP8_BLOCK: usize = 128;
 
@@ -252,6 +525,7 @@ pub fn e4m3_to_f32(byte: u8) -> f32 {
     }
 }
 
+/// Round to the nearest bfloat16, ties to even.
 pub fn f32_to_bf16(x: f32) -> u16 {
     let bits = x.to_bits();
     if x.is_nan() {
@@ -266,16 +540,18 @@ pub fn bf16_to_f32(x: u16) -> f32 {
     f32::from_bits((x as u32) << 16)
 }
 
-/// IEEE half precision: 1 sign bit, 5 exponent bits (bias 15), 10 mantissa bits.
+/// IEEE half precision: 1 sign bit, 5 exponent bits (bias 15), 10 mantissa bits. Every value is
+/// exact in f32, so this just moves the bits (only numbers below normal need arithmetic).
 pub fn f16_to_f32(x: u16) -> f32 {
-    let sign = if x & 0x8000 != 0 { -1.0 } else { 1.0 };
-    let exp = ((x >> 10) & 0x1f) as i32;
-    let mantissa = (x & 0x3ff) as f32;
+    let sign = ((x & 0x8000) as u32) << 16;
+    let exp = ((x >> 10) & 0x1f) as u32;
+    let mantissa = (x & 0x3ff) as u32;
     match exp {
-        0 => sign * mantissa * 2f32.powi(-24), // zero and subnormals
-        31 if mantissa == 0.0 => sign * f32::INFINITY,
-        31 => f32::NAN,
-        _ => sign * (1.0 + mantissa / 1024.0) * 2f32.powi(exp - 15),
+        // Zero and numbers below normal: mantissa * 2^-24, exact.
+        0 => f32::from_bits(sign | (mantissa as f32 * (1.0 / 16_777_216.0)).to_bits()),
+        // Infinities and NaNs keep their mantissa bits, moved up.
+        31 => f32::from_bits(sign | 0x7f80_0000 | (mantissa << 13)),
+        _ => f32::from_bits(sign | ((exp + 127 - 15) << 23) | (mantissa << 13)),
     }
 }
 
@@ -318,6 +594,9 @@ mod tests {
         assert_eq!(f16_to_f32(0x0001), 2f32.powi(-24));
         assert_eq!(f16_to_f32(0x3555), 0.33325195);
         assert_eq!(f16_to_f32(0xfc00), f32::NEG_INFINITY);
+        assert_eq!(f16_to_f32(0x8000).to_bits(), (-0.0f32).to_bits());
+        assert!(f16_to_f32(0x7e00).is_nan());
+        assert_eq!(f16_to_f32(0x83ff), -1023.0 * 2f32.powi(-24));
         assert_eq!(bf16_to_f32(0x3f80), 1.0);
         assert_eq!(bf16_to_f32(0xc040), -3.0);
     }

@@ -16,6 +16,7 @@ cargo build --release --example harness      # target/release/examples/harness
 |---|---|
 | `compare_random.py HARNESS WORKDIR [case...]` | Every supported architecture, with small random-weight models built by `transformers`: logits on the CPU and GPU against Hugging Face, and bit-identical results whether batched or alone. Needs the SmolLM2 tokenizer at the path at the top. |
 | `compare_checkpoint.py HARNESS MODEL_DIR` | A real checkpoint: logits at every position and greedy generations, CPU and GPU, against Hugging Face in 32 and 16 bits. |
+| `compare_int4.py HARNESS INT4_DIR WORKDIR` | A 4-bit AWQ or GPTQ checkpoint: unpacks its weights independently of tinyllm, runs `transformers` on them in 32 bits, and compares logits and greedy generations on the CPU and GPU. |
 | `compare_devices.py HARNESS MODEL_DIR [DEVICE [REFERENCE]]` | One backend against another (by default the Apple GPU against the CPU) on a real checkpoint: logits at every position and greedy generations. Needs only `numpy`. |
 | `compare_model.py`, `compare_bf16.py` | Older versions of the same, holding both references on the GPU. |
 | `compare_text.py HARNESS MODEL_DIR` | Tokenizer (ids and decoding of tricky strings) and chat template (text and ids) against `transformers`. |

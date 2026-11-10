@@ -771,6 +771,119 @@ MATMUL_Q8(matmul_f8, 1, true)
 MATMUL_Q8(matmul_f8, 2, true)
 MATMUL_Q8(matmul_f8, 4, true)
 
+// ---------------------------------------------------------------------------------------------
+// 4-bit weights
+// ---------------------------------------------------------------------------------------------
+// AWQ and GPTQ checkpoints: each weight is a 4-bit value v with a zero point z and scale s for
+// its row and group of 128 columns, and weight = (v - z) * s. The values are stored in the same
+// lane order as 8-bit weights, two to a byte, so a lane reads its 8 values of a 16x16 tile as one
+// 32-bit word: nibbles 0-3 for its row in the first half, 4-7 for the second. v - z is a small
+// integer, so it's exact in bfloat16, and it's made with integer operations: the bits of 128 + v
+// are 0x4300 | v, and subtracting 128 + z leaves v - z. As with 8-bit weights, each group's sums
+// are multiplied by its scale as they're added up.
+
+// Two 4-bit values from the low byte of `byte`, as bfloat16 bits of 128 + v.
+__device__ __forceinline__ unsigned offset_pair(unsigned byte) {
+    return (byte & 0xF) | ((byte & 0xF0) << 12) | 0x43004300u;
+}
+
+__device__ __forceinline__ unsigned minus_zero(unsigned pair, unsigned zero_pair) {
+    __nv_bfloat162 difference = __hsub2(*reinterpret_cast<__nv_bfloat162 *>(&pair),
+                                        *reinterpret_cast<__nv_bfloat162 *>(&zero_pair));
+    return *reinterpret_cast<unsigned *>(&difference);
+}
+
+template <int TX>
+__device__ __forceinline__ void matmul_tiles_q4(const unsigned *w, const float *scales,
+                                                const unsigned char *zeros, int m, int chunks,
+                                                const __nv_bfloat16 *x, int batch, float *out,
+                                                const float *bias, int accumulate) {
+    const int warp = threadIdx.x / WARP, lane = threadIdx.x % WARP;
+    const int x_group = blockIdx.x * TX + warp / WARPS_ACROSS;
+    const int w_group = blockIdx.y * WARPS_ACROSS + warp % WARPS_ACROSS;
+    const int first_row = x_group * TILE, first_column = w_group * TILE;
+    if (first_row >= batch || first_column >= m)
+        return; // this warp only has padding to work on
+    const int g = lane / 4, t = lane % 4;
+
+    const unsigned *x_words =
+        reinterpret_cast<const unsigned *>(x + (size_t)x_group * chunks * TILE_ELEMENTS);
+    const unsigned *w_lanes = w + (size_t)w_group * chunks * WARP + lane;
+    const int groups = (chunks + I8_LOADS - 1) / I8_LOADS;
+    // The weight rows this lane unpacks: g of each half.
+    const int unpack_rows[2] = {min(first_column + g, m - 1), min(first_column + 8 + g, m - 1)};
+    float acc[2][4] = {{0.0f, 0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f, 0.0f}};
+    for (int c = 0; c < chunks; c += I8_LOADS) {
+        const int n = min(I8_LOADS, chunks - c);
+        const int group = c / I8_LOADS;
+        unsigned zero_pairs[2];
+        for (int h = 0; h < 2; h++) {
+            const unsigned z = 0x4300u | zeros[(size_t)unpack_rows[h] * groups + group];
+            zero_pairs[h] = z | (z << 16);
+        }
+        float part[2][4] = {{0.0f, 0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f, 0.0f}};
+        unsigned words[I8_LOADS];
+        unsigned a[I8_LOADS][4];
+#pragma unroll
+        for (int i = 0; i < I8_LOADS; i++) {
+            if (i < n) {
+                words[i] = w_lanes[(size_t)(c + i) * WARP];
+                const unsigned *tile = x_words + (size_t)(c + i) * (TILE_ELEMENTS / 2);
+                a[i][0] = tile[g * 8 + t];
+                a[i][1] = tile[(g + 8) * 8 + t];
+                a[i][2] = tile[g * 8 + t + 4];
+                a[i][3] = tile[(g + 8) * 8 + t + 4];
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < I8_LOADS; i++) {
+            if (i < n) {
+                const unsigned word = words[i];
+                mma_bf16(part[0], a[i], minus_zero(offset_pair(word), zero_pairs[0]),
+                         minus_zero(offset_pair(word >> 8), zero_pairs[0]));
+                mma_bf16(part[1], a[i], minus_zero(offset_pair(word >> 16), zero_pairs[1]),
+                         minus_zero(offset_pair(word >> 24), zero_pairs[1]));
+            }
+        }
+        // This lane's output rows are 8h + 2t and 8h + 2t + 1 of the warp's 16.
+        for (int h = 0; h < 2; h++) {
+            for (int j = 0; j < 2; j++) {
+                const int row = min(first_column + h * 8 + 2 * t + j, m - 1);
+                const float scale = scales[(size_t)row * groups + group];
+                acc[h][j] += part[h][j] * scale;
+                acc[h][j + 2] += part[h][j + 2] * scale;
+            }
+        }
+    }
+
+    for (int h = 0; h < 2; h++) {
+        for (int j = 0; j < 4; j++) {
+            const int row = first_row + g + (j / 2) * 8;
+            const int column = first_column + h * 8 + 2 * t + j % 2;
+            if (column >= m)
+                continue;
+            float value = acc[h][j];
+            if (bias)
+                value += bias[column];
+            float *at = out + (size_t)row * m + column;
+            *at = accumulate ? *at + value : value;
+        }
+    }
+}
+
+// matmul_q4_TX: out[b][m] = dot(w[m], x[b]) (+ bias[m]), added to what's there if `accumulate`,
+// with 4-bit weights in the lane order above, and `scales` and `zeros: [m, groups of 128]`.
+#define MATMUL_Q4(TX)                                                                          \
+    extern "C" __global__ void matmul_q4_##TX(const unsigned *w, const float *scales,          \
+                                              const unsigned char *zeros, int m, int chunks,  \
+                                              const __nv_bfloat16 *x, int batch, float *out,  \
+                                              const float *bias, int accumulate) {            \
+        matmul_tiles_q4<TX>(w, scales, zeros, m, chunks, x, batch, out, bias, accumulate);     \
+    }
+MATMUL_Q4(1)
+MATMUL_Q4(2)
+MATMUL_Q4(4)
+
 // One block per row, as rope_store, with the keys and values stored 16-bit in the tile layout:
 // the KV pools are `[slots, kv_dim]` matrices, so a page of 16 slots is one group of tiles.
 extern "C" __global__ void rope_store_bf16(float *qkv, int stride, const float *cos_table,

@@ -101,6 +101,9 @@ struct Matrix {
     scales: Pointer,
     /// 8-bit weights are floats (e4m3) rather than integers.
     fp8: bool,
+    /// For 4-bit weights, the zero point of each group of 128 in each row, as bytes: weight =
+    /// (value - zero) * scale. Null otherwise.
+    zeros: Pointer,
 }
 
 struct Layer {
@@ -182,6 +185,9 @@ struct Kernels {
     matmul_f8_1: Kernel,
     matmul_f8_2: Kernel,
     matmul_f8_4: Kernel,
+    matmul_q4_1: Kernel,
+    matmul_q4_2: Kernel,
+    matmul_q4_4: Kernel,
     swiglu_bf16: Kernel,
     geglu_bf16: Kernel,
     rope_store_bf16: Kernel,
@@ -227,6 +233,9 @@ impl Kernels {
             matmul_f8_1: gpu.kernel(module, "matmul_f8_1")?,
             matmul_f8_2: gpu.kernel(module, "matmul_f8_2")?,
             matmul_f8_4: gpu.kernel(module, "matmul_f8_4")?,
+            matmul_q4_1: gpu.kernel(module, "matmul_q4_1")?,
+            matmul_q4_2: gpu.kernel(module, "matmul_q4_2")?,
+            matmul_q4_4: gpu.kernel(module, "matmul_q4_4")?,
             moe_route: gpu.kernel(module, "moe_route")?,
             moe_sort: gpu.kernel(module, "moe_sort")?,
             moe_gather: gpu.kernel(module, "moe_gather")?,
@@ -1484,6 +1493,33 @@ fn launch_matmul(
     out: Pointer,
     accumulate: bool,
 ) -> Result<()> {
+    if w.zeros != Pointer::NULL {
+        let (kernel, groups) = match batch {
+            1..=16 => (kernels.matmul_q4_1, 1),
+            17..=32 => (kernels.matmul_q4_2, 2),
+            _ => (kernels.matmul_q4_4, 4),
+        };
+        return gpu.launch_blocks(
+            kernel,
+            [
+                batch.div_ceil(TILE * groups),
+                w.rows.div_ceil(TILE * WARPS_ACROSS),
+            ],
+            32 * WARPS_ACROSS * groups,
+            &[
+                Arg::Ptr(w.data),
+                Arg::Ptr(w.scales),
+                Arg::Ptr(w.zeros),
+                Arg::Int(w.rows),
+                Arg::Int(w.cols.div_ceil(TILE)),
+                Arg::Ptr(x),
+                Arg::Int(batch),
+                Arg::Ptr(out),
+                Arg::Ptr(w.bias),
+                Arg::Int(accumulate as usize),
+            ],
+        );
+    }
     if w.scales != Pointer::NULL {
         let (kernel, groups) = match (batch, w.fp8) {
             (1..=16, false) => (kernels.matmul_i8_1, 1),
@@ -1603,6 +1639,19 @@ fn upload_stacked(
 ) -> Result<Matrix> {
     let rows: usize = layers.iter().map(|(_, rows)| rows).sum();
     let padded = rows.div_ceil(BLOCK_ROWS) * BLOCK_ROWS;
+    // 4-bit checkpoints keep their 4-bit values, when the kernel can take their groups.
+    let all_int4 = layers
+        .iter()
+        .all(|(name, _)| st.dtype(&format!("{name}.weight")) == Some("INT4"));
+    if all_int4 && precision == Precision::Bf16 {
+        match upload_int4(gpu, st, num_params, layers, cols, scale)? {
+            Some(matrix) => return Ok(matrix),
+            None => eprintln!(
+                "{}: its 4-bit groups don't fit the GPU kernel, so using 16-bit weights",
+                layers[0].0
+            ),
+        }
+    }
     // FP8 checkpoints keep their 8-bit floats, with each block scale repeated down its rows.
     let all_fp8 = layers
         .iter()
@@ -1653,6 +1702,7 @@ fn upload_stacked(
             scratch: Pointer::NULL,
             scales: scales_device,
             fp8: true,
+            zeros: Pointer::NULL,
         });
     }
     let mut bias: Option<Vec<f32>> = None;
@@ -1711,6 +1761,7 @@ fn upload_stacked(
             scratch: Pointer::NULL,
             scales: scales_device,
             fp8: false,
+            zeros: Pointer::NULL,
         });
     }
 
@@ -1750,7 +1801,128 @@ fn upload_stacked(
         scratch,
         scales: Pointer::NULL,
         fp8: false,
+        zeros: Pointer::NULL,
     })
+}
+
+/// Stack 4-bit weights for the GPU kernel: their values two to a byte in the lane order of the
+/// 8-bit kernel, and a scale (times `scale`) and zero point for each row and group of 128
+/// columns. `None` if the kernel can't take them, because their groups aren't a whole number of
+/// 128-column groups or GPTQ reordered their columns.
+fn upload_int4(
+    gpu: &Gpu,
+    st: &SafeTensors,
+    num_params: &mut usize,
+    layers: &[(String, usize)],
+    cols: usize,
+    scale: f32,
+) -> Result<Option<Matrix>> {
+    let rows: usize = layers.iter().map(|(_, rows)| rows).sum();
+    let groups = cols.div_ceil(QUANT_GROUP);
+    let (mut values, mut scales, mut zeros) = (
+        Vec::with_capacity(rows * cols),
+        Vec::with_capacity(rows * groups),
+        Vec::with_capacity(rows * groups),
+    );
+    let mut bias: Option<Vec<f32>> = None;
+    let mut row = 0;
+    for (name, count) in layers {
+        let Ok(Some(matrix)) = st.load_int4(&format!("{name}.weight"), &[*count, cols]) else {
+            return Ok(None);
+        };
+        if !matrix.group.is_multiple_of(QUANT_GROUP) || !cols.is_multiple_of(QUANT_GROUP) {
+            return Ok(None);
+        }
+        // Each of the checkpoint's groups covers this many of the kernel's.
+        let (own_groups, repeat) = (cols.div_ceil(matrix.group), matrix.group / QUANT_GROUP);
+        values.extend_from_slice(&matrix.values);
+        for r in 0..*count {
+            for g in 0..groups {
+                let at = r * own_groups + g / repeat;
+                scales.push(matrix.scales[at] * scale);
+                zeros.push(matrix.zeros[at]);
+            }
+        }
+        *num_params += count * cols;
+        let bias_name = format!("{name}.bias");
+        if st.contains(&bias_name) {
+            let values = st.load(&bias_name, &[*count])?;
+            *num_params += values.len();
+            bias.get_or_insert_with(|| vec![0.0; rows])[row..row + count].copy_from_slice(&values);
+        }
+        row += count;
+    }
+    bias.iter_mut().flatten().for_each(|v| *v *= scale);
+    let packed = pack_int4(&values, rows, cols);
+    let data = gpu.alloc(packed.len().div_ceil(4))?;
+    gpu.write_now(data, &packed)?;
+    let scales_device = gpu.alloc(scales.len())?;
+    gpu.write_now(scales_device, &scales)?;
+    let zeros_device = gpu.alloc(zeros.len().div_ceil(4))?;
+    gpu.write_now(zeros_device, &zeros)?;
+    let bias = match bias {
+        Some(values) => {
+            let device = gpu.alloc(rows)?;
+            gpu.write_now(device, &values)?;
+            device
+        }
+        None => Pointer::NULL,
+    };
+    Ok(Some(Matrix {
+        data,
+        rows,
+        cols,
+        bias,
+        scratch: Pointer::NULL,
+        scales: scales_device,
+        fp8: false,
+        zeros: zeros_device,
+    }))
+}
+
+/// 4-bit values `[rows, cols]` in the 8-bit kernel's lane order (see [`to_lane_tiles`]), two to a
+/// byte: each lane's 8 values of a tile become one 32-bit word, the first in the lowest nibble.
+/// Row groups are packed side by side on all the CPU's threads.
+fn pack_int4(values: &[u8], rows: usize, cols: usize) -> Vec<u8> {
+    let chunks = cols.div_ceil(TILE);
+    let groups = rows.div_ceil(TILE);
+    let group_bytes = chunks * TILE * TILE / 2;
+    let mut packed = vec![0u8; groups * group_bytes];
+    let at = |row: usize, column: usize| -> u32 {
+        match row < rows && column < cols {
+            true => values[row * cols + column] as u32,
+            false => 0,
+        }
+    };
+    let pack_group = |group: usize, out: &mut [u8]| {
+        for chunk in 0..chunks {
+            for lane in 0..32 {
+                let (g, t) = (lane / 4, lane % 4);
+                let mut word = 0u32;
+                for half in 0..2 {
+                    let row = group * TILE + half * 8 + g;
+                    let column = chunk * TILE + 2 * t;
+                    for (j, k) in [0, 1, 8, 9].into_iter().enumerate() {
+                        word |= at(row, column + k) << (4 * (half * 4 + j));
+                    }
+                }
+                let index = (chunk * 32 + lane) * 4;
+                out[index..index + 4].copy_from_slice(&word.to_le_bytes());
+            }
+        }
+    };
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let per_thread = groups.div_ceil(threads).max(1);
+    std::thread::scope(|scope| {
+        for (part, out) in packed.chunks_mut(per_thread * group_bytes).enumerate() {
+            scope.spawn(move || {
+                for (i, group_out) in out.chunks_mut(group_bytes).enumerate() {
+                    pack_group(part * per_thread + i, group_out);
+                }
+            });
+        }
+    });
+    packed
 }
 
 /// The most slots a mixture of experts can need for `rows` rows: every (row, expert) pair, and
@@ -1924,6 +2096,13 @@ impl Backend for CudaBackend {
     fn describe(&self) -> String {
         let weights = match (self.precision, self.quantization) {
             _ if self.layers.first().is_some_and(|l| l.qkv.fp8) => "8-bit float",
+            _ if self
+                .layers
+                .first()
+                .is_some_and(|l| l.qkv.zeros != Pointer::NULL) =>
+            {
+                "4-bit"
+            }
             (_, Some(Quantization::Int8)) => "8-bit",
             (Precision::Bf16, None) => "16-bit",
             (Precision::F32, None) => "32-bit",
@@ -2152,6 +2331,106 @@ mod tests {
     }
 
     #[test]
+    fn matmul_with_4_bit_weights_matches_arithmetic() {
+        let Ok(gpu) = Gpu::open() else {
+            return;
+        };
+        gpu.attach().unwrap();
+        let module = gpu.load_kernels(KERNELS_PTX).unwrap();
+        let kernels = Kernels::find(&gpu, &module).unwrap();
+        // Whole groups of 128 columns, rows past one tile and not a whole number of them.
+        for (m, n, batch) in [
+            (16, 128, 1),
+            (40, 256, 17),
+            (24, 384, 3),
+            (64, 256, 64),
+            (8, 128, 2),
+        ] {
+            for (use_bias, accumulate) in [(false, false), (true, true)] {
+                let groups = n / QUANT_GROUP;
+                let values: Vec<u8> = (0..m * n).map(|i| ((i * 7 + i / 5) % 16) as u8).collect();
+                let zeros: Vec<u8> = (0..m * groups).map(|i| ((i * 5) % 17) as u8).collect();
+                let scales: Vec<f32> = pseudo_random(m * groups, 13)
+                    .iter()
+                    .map(|v| v * 0.1)
+                    .collect();
+                let dequantized: Vec<f32> = (0..m * n)
+                    .map(|i| {
+                        let g = (i / n) * groups + (i % n) / QUANT_GROUP;
+                        (values[i] as f32 - zeros[g] as f32) * scales[g]
+                    })
+                    .collect();
+                let x_values = pseudo_random(batch * n, 7);
+                let bias_values = pseudo_random(m, 5);
+                let start_values = pseudo_random(batch * m, 3);
+                let packed = pack_int4(&values, m, n);
+                let data = gpu.alloc(packed.len().div_ceil(4)).unwrap();
+                gpu.write_now(data, &packed).unwrap();
+                let scales_device = gpu.alloc(scales.len()).unwrap();
+                gpu.write_now(scales_device, &scales).unwrap();
+                let zeros_device = gpu.alloc(zeros.len().div_ceil(4)).unwrap();
+                gpu.write_now(zeros_device, &zeros).unwrap();
+                let x16: Vec<u16> = x_values.iter().map(|&v| f32_to_bf16(v)).collect();
+                let rounded_x: Vec<f32> = x16.iter().map(|&h| bf16_to_f32(h)).collect();
+                let x = input_buffer(&gpu, Precision::Bf16, batch + PADDING_ROWS, n).unwrap();
+                gpu.write_now(x, &to_tiles(&x16, batch, n)).unwrap();
+                let bias = match use_bias {
+                    true => {
+                        let device = gpu.alloc(m).unwrap();
+                        gpu.write_now(device, &bias_values).unwrap();
+                        device
+                    }
+                    false => Pointer::NULL,
+                };
+                let out = gpu.alloc((batch + PADDING_ROWS) * m).unwrap();
+                gpu.write_now(out, &start_values).unwrap();
+                let matrix = Matrix {
+                    data,
+                    rows: m,
+                    cols: n,
+                    bias,
+                    scratch: Pointer::NULL,
+                    scales: scales_device,
+                    fp8: false,
+                    zeros: zeros_device,
+                };
+                launch_matmul(
+                    &gpu,
+                    &kernels,
+                    Precision::Bf16,
+                    &matrix,
+                    x,
+                    batch,
+                    out,
+                    accumulate,
+                )
+                .unwrap();
+                let mut result = vec![0.0f32; batch * m];
+                gpu.read(out, &mut result).unwrap();
+                gpu.wait().unwrap();
+                for b in 0..batch {
+                    for r in 0..m {
+                        let mut expected: f64 = (0..n)
+                            .map(|i| dequantized[r * n + i] as f64 * rounded_x[b * n + i] as f64)
+                            .sum();
+                        if use_bias {
+                            expected += bias_values[r] as f64;
+                        }
+                        if accumulate {
+                            expected += start_values[b * m + r] as f64;
+                        }
+                        let got = result[b * m + r] as f64;
+                        assert!(
+                            (got - expected).abs() < 1e-4 * (1.0 + expected.abs()),
+                            "{m}x{n} batch {batch}: [{b}][{r}] = {got}, expected {expected}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn matmul_with_8_bit_weights_matches_arithmetic() {
         let Ok(gpu) = Gpu::open() else {
             return;
@@ -2204,6 +2483,7 @@ mod tests {
                     scratch: Pointer::NULL,
                     scales: scales_device,
                     fp8: false,
+                    zeros: Pointer::NULL,
                 };
                 launch_matmul(
                     &gpu,
@@ -2314,6 +2594,7 @@ mod tests {
                         scratch,
                         scales: Pointer::NULL,
                         fp8: false,
+                        zeros: Pointer::NULL,
                     };
                     launch_matmul(
                         &gpu, &kernels, precision, &matrix, x, batch, out, accumulate,

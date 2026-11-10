@@ -81,17 +81,26 @@ weights, faster generation:
 - **FP8 checkpoints** (such as `Qwen/Qwen3-0.6B-FP8` and other models published that way, with
   `weight_block_size: [128, 128]`) load as they are. The GPU keeps the 8-bit floats, widening them
   inside the matrix kernel; the CPU turns them into 32-bit numbers.
+- **4-bit AWQ and GPTQ checkpoints** (such as `Qwen/Qwen2.5-7B-Instruct-AWQ` and
+  `Qwen/Qwen2.5-0.5B-Instruct-GPTQ-Int4`) load as they are. The NVIDIA GPU keeps the 4-bit values,
+  with each group's zero point and scale, and multiplies them exactly; the CPU and Apple GPU
+  unpack them into 32-bit numbers, which hold them exactly but take 8 times the memory.
 - **`--quantization int8`** stores each layer's weights in one byte, with a scale for every 128
   along a row, on the GPU. The embeddings and output projection stay 16-bit.
 
-Both use the tensor cores' `mma` instruction directly, with the bytes stored in the order each lane
-reads them. On an RTX 2000 Ada, tokens per second:
+All of these use the tensor cores' `mma` instruction directly, with the weights stored in the
+order each lane reads them. On an RTX 2000 Ada, tokens per second:
 
 | | 1 request | 8 at once | 32 at once |
 |---|---|---|---|
 | Phi-3 mini, 16-bit / 8-bit | 26 / 44 | 202 / 339 | 728 / 1,033 |
 | SmolLM3 3B, 16-bit / 8-bit | 31 / 50 | 243 / 382 | 851 / 1,181 |
 | Qwen3 0.6B, 16-bit / 8-bit / FP8 checkpoint | 136 / 173 / 159 | 928 / 1,142 / 1,087 | 2,328 / 2,583 / 2,319 |
+| Qwen2.5 0.5B, 16-bit / AWQ checkpoint | 164 / 232 | 1,118 / 1,527 | 2,822 / 3,252 |
+| Qwen2.5 7B, AWQ checkpoint | 38 | 290 | 712 |
+
+The 7B model takes 15 GB at 16 bits, too much for this 16 GB GPU with room for a KV cache; in 4 bits
+it's 5.6 GB, and a single stream runs close to the speed of reading those bytes once per token.
 
 Prompts in big batches are slower than with 16-bit weights, since there the work is arithmetic
 rather than reading. With 8-bit weights Phi-3 mini's greedy generations matched 32-bit
@@ -99,6 +108,12 @@ rather than reading. With 8-bit weights Phi-3 mini's greedy generations matched 
 was a little more than `transformers`' own 16-bit mode (5). Small models are more sensitive:
 Qwen2.5-0.5B and Qwen3-0.6B differ by up to 4-5. The FP8 checkpoint's results on the GPU match
 the CPU's, which uses exactly the checkpoint's values, as closely as 16-bit weights do.
+
+For 4-bit checkpoints, `scripts/compare_int4.py` unpacks the weights itself, following AutoAWQ's
+and GPTQ's layouts, and runs `transformers` in 32 bits on them. On Qwen2.5-0.5B's AWQ and GPTQ
+checkpoints the CPU matches that to within 2.3e-4, with 32-token greedy generations identical,
+and the GPU as closely as 16-bit weights do (largest difference 0.3 to 1.9, the most likely token
+agreeing at 95–100% of positions). Batching changes nothing on the GPU.
 
 The compiled kernels are in [`src/cuda/kernels.ptx`](src/cuda/kernels.ptx). To change them, edit
 [`kernels.cu`](src/cuda/kernels.cu) and run [`build_kernels.sh`](src/cuda/build_kernels.sh), which
@@ -554,7 +569,7 @@ missing is breadth, and the last 10–20% of single-stream speed.
 | GPU execution | yes | **one NVIDIA GPU**, or an Apple GPU through Metal; no AMD. Slightly slower for one stream, faster under load: see [Performance](#performance) |
 | Reusable compiled batches (CUDA graphs) | yes | yes, for batches of up to 64 |
 | Scheduling overlapped with the GPU's work | yes | not needed so far: scheduling, sampling and streaming take 0–3% of each step with up to 256 requests at once (Qwen2.5-0.5B on the RTX 2000 Ada), and the GPU is busy 96% of the time. `/metrics` shows the split as `tinyllm_forward_seconds_total` |
-| Quantized weights | yes: FP8, INT8, AWQ, GPTQ, GGUF, bitsandbytes, MXFP4 and more | FP8 checkpoints and 8-bit integers on the GPU; bfloat16 weights stay 16-bit on the CPU. **No 4-bit, AWQ, GPTQ or GGUF** |
+| Quantized weights | yes: FP8, INT8, AWQ, GPTQ, GGUF, bitsandbytes, MXFP4 and more | FP8 and 4-bit AWQ/GPTQ checkpoints, and 8-bit integers, on the NVIDIA GPU (the CPU and Apple GPU unpack quantized checkpoints to 32 bits); bfloat16 weights stay 16-bit on the CPU. **No GGUF, bitsandbytes, MXFP4, or GPTQ with 8 bits** |
 | Tool calling, with `tool_choice` and strict schemas | yes, with parsers for many model families | yes, for the families that run here: Qwen and Hermes, Mistral, Llama 3 |
 | Reasoning parsers, thinking budgets | yes, for many families | yes, for `<think>` models (Qwen3, SmolLM3, DeepSeek-R1 and others) |
 | Speculative decoding | yes: EAGLE, MTP, draft models, n-grams | n-grams only, with replies exactly as without it |
@@ -565,8 +580,8 @@ missing is breadth, and the last 10–20% of single-stream speed.
 | Multi-GPU, multi-node, router | yes | **no** |
 | The SGL frontend language (`gen`, `select`, `fork`) | yes | **no** |
 
-Biggest gaps first, the plan is: 4-bit weights (AWQ/GPTQ), LoRA adapters, DeepSeek's attention
-(MLA), then draft-model speculative decoding.
+Biggest gaps first, the plan is: LoRA adapters, DeepSeek's attention (MLA), then draft-model
+speculative decoding.
 
 Other limitations: only BPE tokenizers are supported (not SentencePiece Unigram or WordPiece,
 though that covers the Llama family), embeddings only use last-token pooling, and sliding windows
