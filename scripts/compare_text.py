@@ -5,10 +5,15 @@ usage: compare_text.py HARNESS MODEL_DIR
 HARNESS is the `harness` example (target/release/examples/harness). Prints a line per mismatch and
 a summary for each part; exits non-zero if anything differs."""
 import json, os, subprocess, sys, tempfile
+from tokenizers import Tokenizer
 from transformers import AutoTokenizer
 
 tool, model_dir = sys.argv[1:3]
 tok = AutoTokenizer.from_pretrained(model_dir)
+# transformers sometimes rebuilds a tokenizer differently from its tokenizer.json (for example
+# dropping SmolLM2's digit splitting), so the tokenizers library that reads the file directly is
+# the reference, and transformers only has to agree where it agrees with the file.
+raw = Tokenizer.from_file(os.path.join(model_dir, "tokenizer.json"))
 
 STRINGS = [
     "Hello, world!",
@@ -79,10 +84,13 @@ def ids_of(result):
 failures = 0
 ours = harness("tokenize", STRINGS)
 bad = 0
+notes = 0
 for i, text in enumerate(STRINGS):
-    special = tok(text, add_special_tokens=True)["input_ids"]
-    plain = tok(text, add_special_tokens=False)["input_ids"]
+    special = raw.encode(text, add_special_tokens=True).ids
+    plain = raw.encode(text, add_special_tokens=False).ids
     decoded = tok.decode(plain)
+    if tok(text, add_special_tokens=False)["input_ids"] != plain:
+        notes += 1
     problems = []
     if ours["special"][i] != special:
         problems.append(f"with special tokens: ours {ours['special'][i][:12]}... theirs {special[:12]}...")
@@ -93,7 +101,8 @@ for i, text in enumerate(STRINGS):
     if problems:
         bad += 1
         print(f"  string {i} {text[:30]!r}: " + "; ".join(problems))
-print(f"tokenizer: {len(STRINGS) - bad}/{len(STRINGS)} strings identical (ids with and without special tokens, and decoding)")
+note = f" ({notes} where transformers itself departs from tokenizer.json)" if notes else ""
+print(f"tokenizer: {len(STRINGS) - bad}/{len(STRINGS)} strings identical (ids with and without special tokens, and decoding){note}")
 failures += bad
 
 if tok.chat_template:

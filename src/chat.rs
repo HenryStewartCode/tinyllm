@@ -97,6 +97,7 @@ impl ChatTemplate {
             .map(|(_, source)| source.clone())
             .unwrap_or_default();
         for (name, source) in templates {
+            let source = without_generation_tags(&source);
             env.add_template_owned(name.clone(), source)
                 .with_context(|| format!("couldn't parse the chat template '{name}'"))?;
         }
@@ -212,6 +213,21 @@ pub fn stop_tokens(dir: &Path, config_eos: Vec<u32>, tokenizer: &Tokenizer) -> H
         }
     }
     stop
+}
+
+/// `transformers` lets templates mark the assistant's part of a conversation with
+/// `{% generation %}` ... `{% endgeneration %}`, for training. Rendering, they do nothing, so they
+/// become an `if` that's always true, keeping their whitespace control.
+fn without_generation_tags(source: &str) -> String {
+    let tag = fancy_regex::Regex::new(r"\{%(-?)\s*(end)?generation\s*(-?)%\}").expect("valid");
+    tag.replace_all(source, |captures: &fancy_regex::Captures<'_, str>| {
+        let statement = match captures.get(2) {
+            Some(_) => "endif",
+            None => "if true",
+        };
+        format!("{{%{} {statement} {}%}}", &captures[1], &captures[3])
+    })
+    .into_owned()
 }
 
 fn strftime_now(format: String) -> Result<String, Error> {
@@ -396,5 +412,15 @@ mod tests {
         let t = template("{{ raise_exception('roles must alternate') }}");
         let err = t.render(&json!([]), None, None, false).unwrap_err();
         assert_eq!(err.to_string(), "roles must alternate");
+    }
+
+    #[test]
+    fn generation_tags_render_their_contents() {
+        let template = "{% for m in messages %}{%- generation -%} {{ m.content }} {%- endgeneration %}|{% endfor %}";
+        let out = without_generation_tags(template);
+        assert_eq!(
+            out,
+            "{% for m in messages %}{%- if true -%} {{ m.content }} {%- endif %}|{% endfor %}"
+        );
     }
 }

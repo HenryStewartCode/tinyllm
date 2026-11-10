@@ -17,7 +17,7 @@ use crate::backend::{Backend, LoadedModel, Logits};
 use crate::config::{Activation, Architecture, Config};
 use crate::model::{LogitUse, Row};
 use crate::pool::Pool;
-use crate::safetensors::SafeTensors;
+use crate::safetensors::{SafeTensors, bf16_to_f32, f32_to_bf16};
 use anyhow::{Context, Result, bail};
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -387,6 +387,7 @@ impl CudaBackend {
                 &qkv_names,
                 dim,
                 batch_rows,
+                1.0,
             )?;
             let o_proj = upload_stacked(
                 &gpu,
@@ -396,6 +397,7 @@ impl CudaBackend {
                 &[(format!("{attn}.o_proj"), dim)],
                 q_dim,
                 batch_rows,
+                architecture.residual_scale,
             )?;
             let gate_up_names = match architecture.combined_projections {
                 true => vec![(format!("{p}.mlp.gate_up_proj"), 2 * hidden_dim)],
@@ -412,6 +414,7 @@ impl CudaBackend {
                 &gate_up_names,
                 dim,
                 batch_rows,
+                1.0,
             )?;
             let down = upload_stacked(
                 &gpu,
@@ -421,6 +424,7 @@ impl CudaBackend {
                 &[(format!("{p}.mlp.down_proj"), dim)],
                 hidden_dim,
                 batch_rows,
+                architecture.residual_scale,
             )?;
             layers.push(Layer {
                 attn_norm,
@@ -447,6 +451,7 @@ impl CudaBackend {
             &[("model.embed_tokens".to_string(), vocab_size)],
             dim,
             batch_rows,
+            1.0,
         )?;
         let lm_head = if st.contains("lm_head.weight") {
             upload_stacked(
@@ -457,6 +462,7 @@ impl CudaBackend {
                 &[("lm_head".to_string(), vocab_size)],
                 dim,
                 batch_rows,
+                1.0,
             )?
         } else {
             // Tied embeddings: the same matrix does both jobs.
@@ -1215,6 +1221,7 @@ fn to_tiles(values: &[u16], rows: usize, cols: usize) -> Vec<u16> {
 
 /// Upload some matrices with the same number of columns as one, one on top of the other. Padded
 /// with zero rows to a whole number of blocks. `layers` lists each one's name and row count.
+#[allow(clippy::too_many_arguments)]
 fn upload_stacked(
     gpu: &Gpu,
     st: &SafeTensors,
@@ -1223,6 +1230,7 @@ fn upload_stacked(
     layers: &[(String, usize)],
     cols: usize,
     batch_rows: usize,
+    scale: f32,
 ) -> Result<Matrix> {
     let rows: usize = layers.iter().map(|(_, rows)| rows).sum();
     let padded = rows.div_ceil(BLOCK_ROWS) * BLOCK_ROWS;
@@ -1244,6 +1252,14 @@ fn upload_stacked(
             bias.get_or_insert_with(|| vec![0.0; rows])[row..row + count].copy_from_slice(&values);
         }
         row += count;
+    }
+    // A layer whose output is always scaled has its weights scaled instead.
+    if scale != 1.0 {
+        f32_values.iter_mut().for_each(|v| *v *= scale);
+        for v in &mut bf16_values {
+            *v = f32_to_bf16(bf16_to_f32(*v) * scale);
+        }
+        bias.iter_mut().flatten().for_each(|v| *v *= scale);
     }
 
     let data = match precision {

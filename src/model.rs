@@ -38,7 +38,18 @@ pub struct Linear {
 
 impl Linear {
     fn load(st: &SafeTensors, name: &str, out_dim: usize, in_dim: usize) -> Result<Self> {
-        Ok(Self::load_split(st, name, &[out_dim], in_dim)?.remove(0))
+        Self::load_scaled(st, name, out_dim, in_dim, 1.0)
+    }
+
+    /// Load a layer whose output is always multiplied by `scale`, by multiplying its weights.
+    fn load_scaled(
+        st: &SafeTensors,
+        name: &str,
+        out_dim: usize,
+        in_dim: usize,
+        scale: f32,
+    ) -> Result<Self> {
+        Ok(Self::load_split(st, name, &[out_dim], in_dim, scale)?.remove(0))
     }
 
     /// Load one matrix as several layers, taking `out_dims[i]` rows for the `i`-th.
@@ -47,14 +58,19 @@ impl Linear {
         name: &str,
         out_dims: &[usize],
         in_dim: usize,
+        scale: f32,
     ) -> Result<Vec<Self>> {
         let total = out_dims.iter().sum();
-        let values = st.load(&format!("{name}.weight"), &[total, in_dim])?;
+        let mut values = st.load(&format!("{name}.weight"), &[total, in_dim])?;
         let bias_name = format!("{name}.bias");
-        let bias = match st.contains(&bias_name) {
+        let mut bias = match st.contains(&bias_name) {
             true => Some(st.load(&bias_name, &[total])?),
             false => None,
         };
+        if scale != 1.0 {
+            values.iter_mut().for_each(|v| *v *= scale);
+            bias.iter_mut().flatten().for_each(|v| *v *= scale);
+        }
         let mut start = 0;
         let mut layers = Vec::with_capacity(out_dims.len());
         for &out_dim in out_dims {
@@ -229,6 +245,7 @@ impl Model {
                 .map(|_| None)
                 .collect::<Vec<_>>(),
         );
+        let residual = architecture.residual_scale;
         let load_layer = |i: usize| -> Result<Layer> {
             let p = format!("model.layers.{i}");
             let attn = format!("{p}.self_attn");
@@ -240,12 +257,14 @@ impl Model {
                     &format!("{attn}.qkv_proj"),
                     &[q_dim, kv_dim, kv_dim],
                     dim,
+                    1.0,
                 )?;
                 let mut gate_up = Linear::load_split(
                     &st,
                     &format!("{p}.mlp.gate_up_proj"),
                     &[hidden_dim, hidden_dim],
                     dim,
+                    1.0,
                 )?;
                 let (v, k, q) = (qkv.remove(2), qkv.remove(1), qkv.remove(0));
                 let (up, gate) = (gate_up.remove(1), gate_up.remove(0));
@@ -297,12 +316,18 @@ impl Model {
                 k_proj,
                 v_proj,
                 head_norms,
-                o_proj: Linear::load(&st, &format!("{attn}.o_proj"), dim, q_dim)?,
+                o_proj: Linear::load_scaled(&st, &format!("{attn}.o_proj"), dim, q_dim, residual)?,
                 norm_after_attn,
                 mlp_norm,
                 gate_proj,
                 up_proj,
-                down_proj: Linear::load(&st, &format!("{p}.mlp.down_proj"), dim, hidden_dim)?,
+                down_proj: Linear::load_scaled(
+                    &st,
+                    &format!("{p}.mlp.down_proj"),
+                    dim,
+                    hidden_dim,
+                    residual,
+                )?,
                 norm_after_mlp,
                 rope_table: shape.rope_table,
                 window: shape.window,

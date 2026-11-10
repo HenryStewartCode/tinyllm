@@ -172,6 +172,8 @@ pub struct Architecture {
     pub logit_softcap: f32,
     /// What logits get divided by.
     pub logit_divisor: f32,
+    /// What each block's output is multiplied by before it joins the residual stream.
+    pub residual_scale: f32,
     /// Queries, keys and values come from one `qkv_proj` matrix, and gate and up from one
     /// `gate_up_proj`, instead of from separate ones.
     pub combined_projections: bool,
@@ -214,10 +216,6 @@ impl Config {
         ensure!(
             !self.use_bidirectional_attention.unwrap_or(false),
             "bidirectional attention is not supported"
-        );
-        ensure!(
-            self.residual_multiplier.is_none_or(|r| r == 1.0),
-            "a residual_multiplier other than 1 is not supported"
         );
         ensure!(
             self.partial_rotary_factor.is_none_or(|f| f == 1.0),
@@ -314,6 +312,7 @@ impl Config {
             attention_softcap: attention_softcap.unwrap_or(0.0),
             logit_softcap: logit_softcap.unwrap_or(0.0),
             logit_divisor: self.logits_scaling.unwrap_or(1.0),
+            residual_scale: self.residual_multiplier.unwrap_or(1.0),
             combined_projections: model_type == "phi3",
             norms_after_blocks: matches!(model_type, "gemma2" | "gemma3_text"),
             head_norms: matches!(model_type, "qwen3" | "gemma3_text"),
@@ -669,6 +668,14 @@ mod tests {
     }
 
     #[test]
+    fn granite_scales_what_blocks_add() {
+        let arch = config(json!({"model_type": "granite", "residual_multiplier": 0.22}))
+            .architecture()
+            .unwrap();
+        assert_eq!(arch.residual_scale, 0.22);
+    }
+
+    #[test]
     fn granite_can_scale_its_embeddings_and_logits() {
         let arch = config(json!({"model_type": "granite", "embedding_multiplier": 2.0,
                                  "logits_scaling": 4.0}))
@@ -704,7 +711,6 @@ mod tests {
             json!({"model_type": "llama", "hidden_act": "gelu"}),
             json!({"model_type": "falcon"}),
             json!({"model_type": "gemma3_text", "use_bidirectional_attention": true}),
-            json!({"model_type": "granite", "residual_multiplier": 0.5}),
         ] {
             let mut value = json!({
                 "hidden_size": 128, "intermediate_size": 256, "num_hidden_layers": 2,

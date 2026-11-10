@@ -20,7 +20,7 @@ cases = {
     "mistral-window": ("mistral", dict(sliding_window=9)),
     "phi3": ("phi3", dict(pad_token_id=0)),
     "phi3-window": ("phi3", dict(sliding_window=7)),
-    "granite": ("granite", dict(embedding_multiplier=3.0, logits_scaling=2.0)),
+    "granite": ("granite", dict(embedding_multiplier=3.0, logits_scaling=2.0, residual_multiplier=0.4, attention_multiplier=0.1)),
     "smollm3": ("smollm3", dict(no_rope_layer_interval=2)),
     "gemma": ("gemma", dict(gemma)),
     "gemma2": ("gemma2", dict(gemma, query_pre_attn_scalar=16, attn_logit_softcapping=2.0, final_logit_softcapping=3.0)),

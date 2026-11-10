@@ -65,6 +65,16 @@ enum Segment<'a> {
     Added(u32),
 }
 
+/// A token matched verbatim in the input, before the rest is split into words.
+struct AddedToken {
+    content: String,
+    id: u32,
+    /// It takes the whitespace before it along with it.
+    lstrip: bool,
+    /// It takes the whitespace after it along with it.
+    rstrip: bool,
+}
+
 pub struct Tokenizer {
     /// BPE vocabulary: token string to id.
     vocab: HashMap<String, u32>,
@@ -75,7 +85,7 @@ pub struct Tokenizer {
     /// `(left, right)` to `(rank, merged)`. Lower ranks were learned earlier and win.
     merges: HashMap<(u32, u32), (u32, u32)>,
     /// Tokens matched verbatim in the input, longest first.
-    added: Vec<(String, u32)>,
+    added: Vec<AddedToken>,
     normalizers: Vec<Normalizer>,
     pre_tokenizers: Vec<PreTokenizer>,
     /// Byte-level vocabulary (true) or SentencePiece-style (false), for decoding.
@@ -129,24 +139,29 @@ impl Tokenizer {
             let content = token["content"]
                 .as_str()
                 .context("added token without content")?;
-            added.push((content.to_string(), id));
+            added.push(AddedToken {
+                content: content.to_string(),
+                id,
+                lstrip: token["lstrip"].as_bool().unwrap_or(false),
+                rstrip: token["rstrip"].as_bool().unwrap_or(false),
+            });
             if token["special"].as_bool().unwrap_or(false) {
                 special_ids.push(id);
             }
         }
-        added.sort_by_key(|(content, _)| std::cmp::Reverse(content.len()));
+        added.sort_by_key(|token| std::cmp::Reverse(token.content.len()));
 
         let n_tokens = vocab
             .values()
-            .chain(added.iter().map(|(_, id)| id))
+            .chain(added.iter().map(|token| &token.id))
             .max()
             .map_or(0, |&id| id as usize + 1);
         let mut tokens = vec![String::new(); n_tokens];
         for (token, &id) in &vocab {
             tokens[id as usize] = token.clone();
         }
-        for (token, id) in &added {
-            tokens[*id as usize] = token.clone();
+        for token in &added {
+            tokens[token.id as usize] = token.content.clone();
         }
         let mut special = vec![false; n_tokens];
         for id in special_ids {
@@ -283,9 +298,9 @@ impl Tokenizer {
 
     /// Look up a token by its exact string, e.g. `"<|im_end|>"`.
     pub fn token_id(&self, token: &str) -> Option<u32> {
-        let added = self.added.iter().find(|(content, _)| content == token);
+        let added = self.added.iter().find(|added| added.content == token);
         added
-            .map(|&(_, id)| id)
+            .map(|added| added.id)
             .or_else(|| self.vocab.get(token).copied())
     }
 
@@ -299,16 +314,22 @@ impl Tokenizer {
         let (mut start, mut i) = (0, 0);
         while i < text.len() {
             let rest = &text[i..];
-            let found = self
-                .added
-                .iter()
-                .find(|(content, _)| !content.is_empty() && rest.starts_with(content.as_str()));
-            if let Some((content, id)) = found {
-                if start < i {
-                    segments.push(Segment::Text(&text[start..i]));
+            let found = self.added.iter().find(|token| {
+                !token.content.is_empty() && rest.starts_with(token.content.as_str())
+            });
+            if let Some(token) = found {
+                let before = match token.lstrip {
+                    true => text[start..i].trim_end(),
+                    false => &text[start..i],
+                };
+                if !before.is_empty() {
+                    segments.push(Segment::Text(before));
                 }
-                segments.push(Segment::Added(*id));
-                i += content.len();
+                segments.push(Segment::Added(token.id));
+                i += token.content.len();
+                if token.rstrip {
+                    i = text.len() - text[i..].trim_start().len();
+                }
                 start = i;
             } else {
                 i += rest.chars().next().map_or(1, char::len_utf8);
@@ -680,7 +701,7 @@ mod tests {
     use serde_json::json;
 
     /// A toy byte-level tokenizer: single characters plus a few merges.
-    fn toy() -> Tokenizer {
+    fn toy_json() -> Value {
         let mut vocab = serde_json::Map::new();
         for (i, token) in [
             "h", "e", "l", "o", "Ġ", "w", "r", "d", "he", "ll", "hell", "hello", "Ġw",
@@ -691,7 +712,7 @@ mod tests {
             vocab.insert(token.to_string(), json!(i));
         }
         vocab.insert("<|end|>".into(), json!(13));
-        Tokenizer::from_json(&json!({
+        json!({
             "added_tokens": [{"id": 13, "content": "<|end|>", "special": true}],
             "normalizer": null,
             "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false, "use_regex": true},
@@ -702,8 +723,11 @@ mod tests {
                 "vocab": vocab,
                 "merges": ["h e", "l l", "he ll", ["hell", "o"], "Ġ w"],
             },
-        }))
-        .unwrap()
+        })
+    }
+
+    fn toy() -> Tokenizer {
+        Tokenizer::from_json(&toy_json()).unwrap()
     }
 
     #[test]
@@ -722,6 +746,22 @@ mod tests {
         assert_eq!(ids, vec![11, 12, 3, 6, 2, 7, 13]);
         assert_eq!(tok.decode(&ids), "hello world<|end|>");
         assert!(tok.is_special(13));
+    }
+
+    #[test]
+    fn added_tokens_can_take_whitespace_with_them() {
+        let mut json = toy_json();
+        json["added_tokens"] = json!([
+            {"id": 13, "content": "<|end|>", "special": true, "rstrip": true},
+            {"id": 14, "content": "<|user|>", "special": true, "lstrip": true},
+        ]);
+        let tok = Tokenizer::from_json(&json).unwrap();
+        // The newline after <|end|> and the spaces before <|user|> go with them.
+        assert_eq!(
+            tok.encode("hello<|end|>\n  <|user|>hello", false),
+            vec![11, 13, 14, 11]
+        );
+        assert_eq!(tok.encode("hello <|end|>", false), vec![11, 4, 13]);
     }
 
     #[test]
