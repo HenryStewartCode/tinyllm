@@ -20,7 +20,7 @@
 //! which is exact; others become f32 when they're loaded. Every kernel does plain f32 math.
 
 use crate::cache::KvPool;
-use crate::config::{Activation, Architecture, ClampedGlu, Config, ExpertNaming, Experts};
+use crate::config::{Activation, Architecture, ClampedGlu, Config, ExpertNaming, Experts, Routing};
 use crate::lora::{LoraAdapter, Module};
 use crate::ops::{
     Matrix, add_bias, add_rows, add_scaled, dot, gated_gelu, matmul, rmsnorm, rmsnorm_heads, rope,
@@ -157,9 +157,12 @@ enum FeedForward {
     /// A mixture of experts (see [`crate::config::Experts`]).
     Sparse {
         router: Linear,
+        /// What's added to the router's scores to choose experts (not to weigh them), if
+        /// anything (DeepSeek V3's `e_score_correction_bias`).
+        correction: Option<Vec<f32>>,
         experts: Vec<Mlp>,
-        /// An expert every token goes through, scaled by `sigmoid(gate(x))`.
-        shared: Option<Box<(Mlp, Linear)>>,
+        /// An expert every token goes through, scaled by `sigmoid(gate(x))` if it has a gate.
+        shared: Option<Box<(Mlp, Option<Linear>)>>,
     },
 }
 
@@ -171,12 +174,13 @@ impl FeedForward {
                 router,
                 experts,
                 shared,
+                ..
             } => {
                 router.num_params()
                     + experts.iter().map(Mlp::num_params).sum::<usize>()
-                    + shared
-                        .as_ref()
-                        .map_or(0, |shared| shared.0.num_params() + shared.1.num_params())
+                    + shared.as_ref().map_or(0, |shared| {
+                        shared.0.num_params() + shared.1.as_ref().map_or(0, Linear::num_params)
+                    })
             }
         }
     }
@@ -265,20 +269,71 @@ fn load_experts(
                 load_gpt_oss_experts(st, p, spec, dim)?,
             )
         }
+        ExpertNaming::DeepSeek => {
+            // Each expert by name, or (as transformers 5 saves them) all stacked together.
+            let stacked = format!("{p}.mlp.experts.gate_up_proj");
+            let experts = match st.contains(&stacked) {
+                false => (0..spec.count)
+                    .map(|e| {
+                        mlp(
+                            &format!("{p}.mlp.experts.{e}"),
+                            ["gate_proj", "up_proj", "down_proj"],
+                            h,
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+                true => {
+                    let gate_up = st.load(&stacked, &[spec.count, 2 * h, dim])?;
+                    let mut down =
+                        st.load(&format!("{p}.mlp.experts.down_proj"), &[spec.count, dim, h])?;
+                    down.iter_mut().for_each(|v| *v *= residual);
+                    let part = |values: &[f32], at: usize, rows: usize, cols: usize| {
+                        Linear::from_part(&values[at..at + rows * cols], &[], rows, cols)
+                    };
+                    (0..spec.count)
+                        .map(|e| Mlp {
+                            gate_proj: part(&gate_up, e * 2 * h * dim, h, dim),
+                            up_proj: part(&gate_up, (e * 2 + 1) * h * dim, h, dim),
+                            down_proj: part(&down, e * dim * h, dim, h),
+                        })
+                        .collect()
+                }
+            };
+            (format!("{p}.mlp.gate"), experts)
+        }
     };
-    let shared = match spec.shared_hidden {
-        Some(hidden) => Some(Box::new((
+    let shared = match (spec.shared_hidden, spec.shared_gated) {
+        (Some(hidden), true) => Some(Box::new((
             mlp(
                 &format!("{p}.mlp.shared_expert"),
                 ["gate_proj", "up_proj", "down_proj"],
                 hidden,
             )?,
-            Linear::load(st, &format!("{p}.mlp.shared_expert_gate"), 1, dim)?,
+            Some(Linear::load(
+                st,
+                &format!("{p}.mlp.shared_expert_gate"),
+                1,
+                dim,
+            )?),
         ))),
-        None => None,
+        (Some(hidden), false) => Some(Box::new((
+            mlp(
+                &format!("{p}.mlp.shared_experts"),
+                ["gate_proj", "up_proj", "down_proj"],
+                hidden,
+            )?,
+            None,
+        ))),
+        (None, _) => None,
+    };
+    let correction_name = format!("{router}.e_score_correction_bias");
+    let correction = match st.contains(&correction_name) {
+        true => Some(st.load(&correction_name, &[spec.count])?),
+        false => None,
     };
     Ok(FeedForward::Sparse {
         router: Linear::load(st, &router, spec.count, dim)?,
+        correction,
         experts,
         shared,
     })
@@ -371,7 +426,65 @@ fn load_gpt_oss_experts(st: &SafeTensors, p: &str, spec: &Experts, dim: usize) -
 /// The experts a token goes through, in order of expert, with their weights: the softmax of the
 /// router's scores, the `top_k` best (the earlier expert of any tie), scaled to add up to 1 if
 /// `renormalize`.
-fn route(scores: &[f32], top_k: usize, renormalize: bool) -> Vec<(usize, f32)> {
+fn route(
+    scores: &[f32],
+    top_k: usize,
+    routing: Routing,
+    correction: Option<&[f32]>,
+) -> Vec<(usize, f32)> {
+    let (sigmoid, groups, top_groups, renormalize, scale) = match routing {
+        Routing::Softmax { renormalize } => return route_softmax(scores, top_k, renormalize),
+        Routing::DeepSeek {
+            sigmoid,
+            groups,
+            top_groups,
+            renormalize,
+            scale,
+        } => (sigmoid, groups, top_groups, renormalize, scale),
+    };
+    // DeepSeek: weights from the softmax or the sigmoids; choices by those plus the correction.
+    let weights: Vec<f32> = match sigmoid {
+        true => scores.iter().map(|&s| 1.0 / (1.0 + (-s).exp())).collect(),
+        false => {
+            let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f32> = scores.iter().map(|&s| (s - max).exp()).collect();
+            let sum: f32 = exps.iter().sum();
+            exps.iter().map(|e| e / sum).collect()
+        }
+    };
+    let choice: Vec<f32> = match correction {
+        Some(bias) => weights.iter().zip(bias).map(|(w, b)| w + b).collect(),
+        None => weights.clone(),
+    };
+    // Only the best groups are chosen from: scored by their best two (V3) or best one (V2).
+    let per_group = scores.len() / groups;
+    let group_score = |g: usize| -> f32 {
+        let mut members: Vec<f32> = choice[g * per_group..(g + 1) * per_group].to_vec();
+        members.sort_by(|a, b| b.total_cmp(a));
+        match sigmoid {
+            true => members.iter().take(2).sum(),
+            false => members[0],
+        }
+    };
+    let mut group_order: Vec<usize> = (0..groups).collect();
+    group_order.sort_by(|&a, &b| group_score(b).total_cmp(&group_score(a)).then(a.cmp(&b)));
+    let allowed = &group_order[..top_groups.min(groups)];
+    let mut order: Vec<usize> = (0..scores.len())
+        .filter(|&e| allowed.contains(&(e / per_group)))
+        .collect();
+    order.sort_by(|&a, &b| choice[b].total_cmp(&choice[a]).then(a.cmp(&b)));
+    let mut chosen: Vec<(usize, f32)> = order[..top_k].iter().map(|&e| (e, weights[e])).collect();
+    if renormalize {
+        let total: f32 = chosen.iter().map(|&(_, w)| w).sum::<f32>() + 1e-20;
+        chosen.iter_mut().for_each(|(_, w)| *w /= total);
+    }
+    chosen.iter_mut().for_each(|(_, w)| *w *= scale);
+    chosen.sort_by_key(|&(e, _)| e);
+    chosen
+}
+
+/// The usual routing (see [`route`]).
+fn route_softmax(scores: &[f32], top_k: usize, renormalize: bool) -> Vec<(usize, f32)> {
     let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let exps: Vec<f32> = scores.iter().map(|&s| (s - max).exp()).collect();
     let sum: f32 = exps.iter().sum();
@@ -396,6 +509,8 @@ struct Layer {
     head_norms: Option<(Vec<f32>, Vec<f32>)>,
     /// Each head's attention sink, if the model has them.
     sinks: Option<Vec<f32>>,
+    /// DeepSeek's latent attention, which replaces `q_proj`, `k_proj` and `v_proj` (left empty).
+    latent: Option<Box<Latent>>,
     o_proj: Linear,
     /// Normalizes what attention adds to the residual stream, if the model does that.
     norm_after_attn: Option<Vec<f32>>,
@@ -420,6 +535,11 @@ pub struct Model {
     n_heads: usize,
     n_kv_heads: usize,
     head_dim: usize,
+    /// Each head's key width (for queries too) and value width, and how much of it RoPE
+    /// rotates: `head_dim` for all three, except with DeepSeek's latent attention.
+    head_k: usize,
+    head_v: usize,
+    rope_dim: usize,
     hidden_dim: usize,
     vocab_size: usize,
     /// LoRA adapters, which rows ask for by number: the first is 1.
@@ -430,6 +550,40 @@ pub struct Model {
 /// adapter's scale, and for the modules whose output is scaled, that too).
 struct Adapter {
     layers: Vec<[Option<(Matrix, Matrix)>; 7]>,
+}
+
+/// DeepSeek's latent attention weights for a layer (see [`LatentAttention`]).
+struct Latent {
+    /// `q_a_proj` and `q_a_layernorm`, when queries go through a latent of their own.
+    q_low: Option<(Linear, Vec<f32>)>,
+    /// `q_proj`, or `q_b_proj` after the latent: `[heads * (nope + rope), ...]`.
+    q: Linear,
+    /// `kv_a_proj_with_mqa`: the latent, then the keys' rotated part, `[kv_lora_rank + rope, dim]`.
+    kv_a: Linear,
+    kv_a_norm: Vec<f32>,
+    /// `kv_b_proj`: each head's unrotated key and its value, `[heads * (nope + v), kv_lora_rank]`.
+    kv_b: Linear,
+}
+
+/// Rotate adjacent pairs `(x[2i], x[2i + 1])` of `x` by RoPE's angle `i`, as DeepSeek lays them out.
+fn rotate_pairs(x: &mut [f32], cos: &[f32], sin: &[f32]) {
+    for (i, pair) in x.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+        let (a, b) = (pair[0], pair[1]);
+        pair[0] = a * cos[i] - b * sin[i];
+        pair[1] = b * cos[i] + a * sin[i];
+    }
+}
+
+/// Working memory for latent attention.
+#[derive(Default)]
+struct LatentBuffers {
+    q_low: Vec<f32>,   // [batch, q_lora_rank]
+    q_norm: Vec<f32>,  // the same, normalized
+    kv_low: Vec<f32>,  // [batch, kv_lora_rank + rope]
+    latent: Vec<f32>,  // [batch, kv_lora_rank]
+    normed: Vec<f32>,  // the same, normalized
+    up: Vec<f32>,      // [batch, heads * (nope + v)]
+    rotated: Vec<f32>, // one token's rotated key part
 }
 
 /// One token to run through the model.
@@ -486,6 +640,7 @@ pub struct Workspace {
     dim: usize,
     moe: MoeBuffers,
     lora: LoraBuffers,
+    latent: LatentBuffers,
 }
 
 /// Working memory for LoRA corrections.
@@ -533,6 +688,7 @@ impl Workspace {
             dim: 0,
             moe: MoeBuffers::default(),
             lora: LoraBuffers::default(),
+            latent: LatentBuffers::default(),
         }
     }
 
@@ -559,12 +715,21 @@ impl Model {
 
         let dim = config.hidden_size;
         let n_heads = config.num_attention_heads;
-        let n_kv_heads = config.n_kv_heads();
+        let architecture = config.architecture()?;
+        let latent = architecture.latent;
+        // Latent attention has a key and value for every head.
+        let n_kv_heads = match latent {
+            Some(_) => n_heads,
+            None => config.n_kv_heads(),
+        };
         let head_dim = config.head_dim();
+        let (head_k, head_v, rope_dim) = match latent {
+            Some(l) => (l.nope + l.rope, l.v, l.rope),
+            None => (head_dim, head_dim, head_dim),
+        };
         let hidden_dim = config.intermediate_size;
         let vocab_size = config.vocab_size;
         let (q_dim, kv_dim) = (n_heads * head_dim, n_kv_heads * head_dim);
-        let architecture = config.architecture()?;
 
         // Gemma's norm weights are stored as an offset from 1.
         let load_norm = |name: &str, len: usize| -> Result<Vec<f32>> {
@@ -586,8 +751,23 @@ impl Model {
             let p = format!("model.layers.{i}");
             let attn = format!("{p}.self_attn");
             let shape = architecture.layers[i];
-            let (q_proj, k_proj, v_proj, gate_proj, up_proj) = if architecture.combined_projections
-            {
+            let dense = |name: &str| match shape.sparse {
+                true => Ok(None),
+                false => Linear::load(&st, &format!("{p}.mlp.{name}"), hidden_dim, dim).map(Some),
+            };
+            let empty = || Linear {
+                weight: Matrix::from_rows(&[], 0, dim),
+                bias: None,
+            };
+            let (q_proj, k_proj, v_proj, gate_proj, up_proj) = if latent.is_some() {
+                (
+                    empty(),
+                    empty(),
+                    empty(),
+                    dense("gate_proj")?,
+                    dense("up_proj")?,
+                )
+            } else if architecture.combined_projections {
                 let mut qkv = Linear::load_split(
                     &st,
                     &format!("{attn}.qkv_proj"),
@@ -607,12 +787,6 @@ impl Model {
                 (q, k, v, Some(gate), Some(up))
             } else {
                 // Layers with a mixture of experts have no MLP of their own.
-                let dense = |name: &str| match shape.sparse {
-                    true => Ok(None),
-                    false => {
-                        Linear::load(&st, &format!("{p}.mlp.{name}"), hidden_dim, dim).map(Some)
-                    }
-                };
                 (
                     Linear::load(&st, &format!("{attn}.q_proj"), q_dim, dim)?,
                     Linear::load(&st, &format!("{attn}.k_proj"), kv_dim, dim)?,
@@ -662,14 +836,58 @@ impl Model {
                 true => Some(st.load(&format!("{attn}.sinks"), &[n_heads])?),
                 false => None,
             };
+            let latent = match latent {
+                None => None,
+                Some(l) => {
+                    let q_width = n_heads * (l.nope + l.rope);
+                    let q_low = match l.q_lora_rank {
+                        Some(rank) => Some((
+                            Linear::load(&st, &format!("{attn}.q_a_proj"), rank, dim)?,
+                            load_norm(&format!("{attn}.q_a_layernorm.weight"), rank)?,
+                        )),
+                        None => None,
+                    };
+                    let q = match l.q_lora_rank {
+                        Some(rank) => {
+                            Linear::load(&st, &format!("{attn}.q_b_proj"), q_width, rank)?
+                        }
+                        None => Linear::load(&st, &format!("{attn}.q_proj"), q_width, dim)?,
+                    };
+                    let rank = l.kv_lora_rank;
+                    Some(Box::new(Latent {
+                        q_low,
+                        q,
+                        kv_a: Linear::load(
+                            &st,
+                            &format!("{attn}.kv_a_proj_with_mqa"),
+                            rank + l.rope,
+                            dim,
+                        )?,
+                        kv_a_norm: load_norm(&format!("{attn}.kv_a_layernorm.weight"), rank)?,
+                        kv_b: Linear::load(
+                            &st,
+                            &format!("{attn}.kv_b_proj"),
+                            n_heads * (l.nope + l.v),
+                            rank,
+                        )?,
+                    }))
+                }
+            };
             Ok(Layer {
                 sinks,
+                latent,
                 attn_norm: load_norm(&format!("{p}.input_layernorm.weight"), dim)?,
                 q_proj,
                 k_proj,
                 v_proj,
                 head_norms,
-                o_proj: Linear::load_scaled(&st, &format!("{attn}.o_proj"), dim, q_dim, residual)?,
+                o_proj: Linear::load_scaled(
+                    &st,
+                    &format!("{attn}.o_proj"),
+                    dim,
+                    n_heads * head_v,
+                    residual,
+                )?,
                 norm_after_attn,
                 mlp_norm,
                 feed_forward: match (shape.sparse, &architecture.experts) {
@@ -720,6 +938,9 @@ impl Model {
             n_heads,
             n_kv_heads,
             head_dim,
+            head_k,
+            head_v,
+            rope_dim,
             hidden_dim,
             vocab_size,
             adapters: Vec::new(),
@@ -728,6 +949,10 @@ impl Model {
 
     /// Add a LoRA adapter, which rows then ask for by its number (the first is 1).
     pub fn add_adapter(&mut self, adapter: &LoraAdapter) -> Result<()> {
+        anyhow::ensure!(
+            self.architecture.latent.is_none(),
+            "LoRA adapters for DeepSeek's latent attention aren't supported"
+        );
         anyhow::ensure!(
             adapter.layers.len() == self.layers.len(),
             "{}: made for a model with {} layers, not {}",
@@ -814,6 +1039,16 @@ impl Model {
                 .iter()
                 .map(|lin| lin.num_params())
                 .sum::<usize>()
+                + l.latent.as_ref().map_or(0, |latent| {
+                    latent.q.num_params()
+                        + latent.kv_a.num_params()
+                        + latent.kv_b.num_params()
+                        + latent.kv_a_norm.len()
+                        + latent
+                            .q_low
+                            .as_ref()
+                            .map_or(0, |(a, norm)| a.num_params() + norm.len())
+                })
                 + l.feed_forward.num_params()
                 + l.attn_norm.len()
                 + l.mlp_norm.len()
@@ -836,8 +1071,9 @@ impl Model {
         &self,
         pool: &Pool,
         router: &Linear,
+        correction: Option<&[f32]>,
         experts: &[Mlp],
-        shared: Option<&(Mlp, Linear)>,
+        shared: Option<&(Mlp, Option<Linear>)>,
         xb: &mut [f32],
         moe: &mut MoeBuffers,
         batch: usize,
@@ -853,7 +1089,7 @@ impl Model {
         let mut assigned: Vec<Vec<(usize, f32)>> = vec![Vec::new(); count];
         for r in 0..batch {
             let scores = &moe.scores[r * count..(r + 1) * count];
-            for (e, weight) in route(scores, spec.top_k, spec.renormalize) {
+            for (e, weight) in route(scores, spec.top_k, spec.routing, correction) {
                 assigned[e].push((r, weight));
             }
         }
@@ -882,9 +1118,14 @@ impl Model {
             let hidden = spec.shared_hidden.expect("a shared expert has a width");
             self.run_mlp(pool, mlp, hidden, moe);
             moe.scores.resize(batch, 0.0);
-            gate.forward(pool, &mut moe.scores[..batch], &mut moe.scratch, xb);
+            if let Some(gate) = gate {
+                gate.forward(pool, &mut moe.scores[..batch], &mut moe.scratch, xb);
+            }
             for r in 0..batch {
-                let scale = 1.0 / (1.0 + (-moe.scores[r]).exp());
+                let scale = match gate {
+                    Some(_) => 1.0 / (1.0 + (-moe.scores[r]).exp()),
+                    None => 1.0,
+                };
                 let out = &moe.output[r * dim..(r + 1) * dim];
                 for (sum, &y) in moe.sum[r * dim..(r + 1) * dim].iter_mut().zip(out) {
                     *sum += scale * y;
@@ -914,14 +1155,84 @@ impl Model {
             .forward(pool, &mut moe.output, &mut moe.scratch, &moe.gate);
     }
 
+    /// DeepSeek's latent attention, for a batch whose normalized inputs are in `ws.xb`: queries
+    /// into `ws.q`, keys into `ws.k` and values into `ws.v`, with their rotated parts rotated by
+    /// the angles in `table` of the RoPE tables.
+    #[allow(clippy::too_many_arguments)]
+    fn latent_qkv(
+        &self,
+        pool: &Pool,
+        latent: &Latent,
+        xb: &[f32],
+        (cos, sin): (&[f32], &[f32]),
+        (q, k, v): (&mut [f32], &mut [f32], &mut [f32]),
+        scratch: &mut Vec<f32>,
+        b: &mut LatentBuffers,
+        batch: usize,
+    ) {
+        let l = self
+            .architecture
+            .latent
+            .expect("the model has latent attention");
+        let (n, eps) = (self.n_heads, self.config.rms_norm_eps);
+        let (rank, head_k) = (l.kv_lora_rank, l.nope + l.rope);
+        let half = l.rope / 2;
+        match &latent.q_low {
+            Some((a, norm)) => {
+                b.q_low.resize(batch * a.weight.rows(), 0.0);
+                a.forward(pool, &mut b.q_low, scratch, xb);
+                b.q_norm.resize(b.q_low.len(), 0.0);
+                rmsnorm(pool, &mut b.q_norm, &b.q_low, norm, eps);
+                latent.q.forward(pool, q, scratch, &b.q_norm);
+            }
+            None => latent.q.forward(pool, q, scratch, xb),
+        }
+        let width = rank + l.rope;
+        b.kv_low.resize(batch * width, 0.0);
+        latent.kv_a.forward(pool, &mut b.kv_low, scratch, xb);
+        b.latent.clear();
+        for r in 0..batch {
+            b.latent
+                .extend_from_slice(&b.kv_low[r * width..r * width + rank]);
+        }
+        b.normed.resize(batch * rank, 0.0);
+        rmsnorm(pool, &mut b.normed, &b.latent, &latent.kv_a_norm, eps);
+        b.up.resize(batch * n * (l.nope + l.v), 0.0);
+        latent.kv_b.forward(pool, &mut b.up, scratch, &b.normed);
+        for r in 0..batch {
+            let (c, s) = (
+                &cos[r * half..(r + 1) * half],
+                &sin[r * half..(r + 1) * half],
+            );
+            // The keys' rotated part is the same for every head.
+            b.rotated.clear();
+            b.rotated
+                .extend_from_slice(&b.kv_low[r * width + rank..(r + 1) * width]);
+            rotate_pairs(&mut b.rotated, c, s);
+            for h in 0..n {
+                let up = &b.up[(r * n + h) * (l.nope + l.v)..][..l.nope + l.v];
+                let key = &mut k[(r * n + h) * head_k..][..head_k];
+                key[..l.nope].copy_from_slice(&up[..l.nope]);
+                key[l.nope..].copy_from_slice(&b.rotated);
+                v[(r * n + h) * l.v..][..l.v].copy_from_slice(&up[l.nope..]);
+                rotate_pairs(&mut q[(r * n + h) * head_k + l.nope..][..l.rope], c, s);
+            }
+        }
+    }
+
     /// Bytes of KV cache each token takes up.
     pub fn kv_bytes_per_token(&self) -> usize {
-        2 * self.layers.len() * self.n_kv_heads * self.head_dim * size_of::<f32>()
+        self.layers.len() * self.n_kv_heads * (self.head_k + self.head_v) * size_of::<f32>()
     }
 
     /// A pool with room for the keys and values of `slots` tokens.
     pub fn new_kv_pool(&self, slots: usize) -> KvPool {
-        KvPool::new(self.layers.len(), self.n_kv_heads * self.head_dim, slots)
+        KvPool::new(
+            self.layers.len(),
+            self.n_kv_heads * self.head_k,
+            self.n_kv_heads * self.head_v,
+            slots,
+        )
     }
 
     /// Run a batch of tokens through the model, writing their keys and values into `kv`.
@@ -931,8 +1242,10 @@ impl Model {
     pub fn forward(&self, rows: &[Row], kv: &mut KvPool, ws: &mut Workspace) {
         let batch = rows.len();
         let (dim, head_dim, eps) = (self.dim, self.head_dim, self.config.rms_norm_eps);
-        let (q_dim, kv_dim) = (self.n_heads * head_dim, self.n_kv_heads * head_dim);
-        let half = head_dim / 2;
+        let (q_dim, kv_dim) = (self.n_heads * self.head_k, self.n_kv_heads * self.head_k);
+        let v_dim = self.n_kv_heads * self.head_v;
+        let out_dim = self.n_heads * self.head_v;
+        let half = self.rope_dim / 2;
         let pool = &ws.pool;
 
         let tables = self.architecture.rope_tables.len();
@@ -941,8 +1254,8 @@ impl Model {
         ws.xc.resize(batch * dim, 0.0);
         ws.q.resize(batch * q_dim, 0.0);
         ws.k.resize(batch * kv_dim, 0.0);
-        ws.v.resize(batch * kv_dim, 0.0);
-        ws.attn_out.resize(batch * q_dim, 0.0);
+        ws.v.resize(batch * v_dim, 0.0);
+        ws.attn_out.resize(batch * out_dim, 0.0);
         ws.gate.resize(batch * self.hidden_dim, 0.0);
         ws.up.resize(batch * self.hidden_dim, 0.0);
         ws.cos.resize(tables * batch * half, 0.0);
@@ -976,40 +1289,53 @@ impl Model {
         for (l, layer) in self.layers.iter().enumerate() {
             // Attention block: mix in information from earlier tokens.
             rmsnorm(pool, &mut ws.xb, &ws.x, &layer.attn_norm, eps);
-            layer
-                .q_proj
-                .forward(pool, &mut ws.q, &mut ws.scratch, &ws.xb);
-            layer
-                .k_proj
-                .forward(pool, &mut ws.k, &mut ws.scratch, &ws.xb);
-            layer
-                .v_proj
-                .forward(pool, &mut ws.v, &mut ws.scratch, &ws.xb);
-            if !self.adapters.is_empty() {
-                for (module, out) in [
-                    (Module::Q, &mut ws.q),
-                    (Module::K, &mut ws.k),
-                    (Module::V, &mut ws.v),
-                ] {
-                    self.add_lora(pool, l, module, rows, &ws.xb, out, &mut ws.lora);
-                }
-            }
-            if let Some((q_norm, k_norm)) = &layer.head_norms {
-                rmsnorm_heads(pool, &mut ws.q, q_norm, eps);
-                rmsnorm_heads(pool, &mut ws.k, k_norm, eps);
-            }
             let table = layer.rope_table * batch * half..(layer.rope_table + 1) * batch * half;
-            let (cos, sin) = (&ws.cos[table.clone()], &ws.sin[table]);
-            rope(pool, &mut ws.q, q_dim, head_dim, cos, sin);
-            rope(pool, &mut ws.k, kv_dim, head_dim, cos, sin);
+            if let Some(latent) = &layer.latent {
+                self.latent_qkv(
+                    pool,
+                    latent,
+                    &ws.xb,
+                    (&ws.cos[table.clone()], &ws.sin[table.clone()]),
+                    (&mut ws.q, &mut ws.k, &mut ws.v),
+                    &mut ws.scratch,
+                    &mut ws.latent,
+                    batch,
+                );
+            } else {
+                layer
+                    .q_proj
+                    .forward(pool, &mut ws.q, &mut ws.scratch, &ws.xb);
+                layer
+                    .k_proj
+                    .forward(pool, &mut ws.k, &mut ws.scratch, &ws.xb);
+                layer
+                    .v_proj
+                    .forward(pool, &mut ws.v, &mut ws.scratch, &ws.xb);
+                if !self.adapters.is_empty() {
+                    for (module, out) in [
+                        (Module::Q, &mut ws.q),
+                        (Module::K, &mut ws.k),
+                        (Module::V, &mut ws.v),
+                    ] {
+                        self.add_lora(pool, l, module, rows, &ws.xb, out, &mut ws.lora);
+                    }
+                }
+                if let Some((q_norm, k_norm)) = &layer.head_norms {
+                    rmsnorm_heads(pool, &mut ws.q, q_norm, eps);
+                    rmsnorm_heads(pool, &mut ws.k, k_norm, eps);
+                }
+                let (cos, sin) = (&ws.cos[table.clone()], &ws.sin[table]);
+                rope(pool, &mut ws.q, q_dim, head_dim, cos, sin);
+                rope(pool, &mut ws.k, kv_dim, head_dim, cos, sin);
+            }
             // Keys and values have to be in place before attention, because later rows of a
             // sequence attend to earlier rows in the same batch.
             for (r, row) in rows.iter().enumerate() {
                 let slot = *row.slots.last().expect("a row needs a KV slot") as usize;
                 kv.k[l][slot * kv_dim..(slot + 1) * kv_dim]
                     .copy_from_slice(&ws.k[r * kv_dim..(r + 1) * kv_dim]);
-                kv.v[l][slot * kv_dim..(slot + 1) * kv_dim]
-                    .copy_from_slice(&ws.v[r * kv_dim..(r + 1) * kv_dim]);
+                kv.v[l][slot * v_dim..(slot + 1) * v_dim]
+                    .copy_from_slice(&ws.v[r * v_dim..(r + 1) * v_dim]);
             }
             self.attention(
                 pool,
@@ -1064,6 +1390,7 @@ impl Model {
                 }
                 FeedForward::Sparse {
                     router,
+                    correction,
                     experts,
                     shared,
                 } => {
@@ -1071,6 +1398,7 @@ impl Model {
                     self.experts(
                         pool,
                         router,
+                        correction.as_deref(),
                         experts,
                         shared,
                         &mut ws.xb,
@@ -1162,22 +1490,22 @@ impl Model {
         window: Option<usize>,
         sinks: Option<&[f32]>,
     ) {
-        let (n_heads, head_dim) = (self.n_heads, self.head_dim);
-        let kv_dim = self.n_kv_heads * head_dim;
+        let (n_heads, head_k, head_v) = (self.n_heads, self.head_k, self.head_v);
+        let (k_dim, v_dim) = (self.n_kv_heads * head_k, self.n_kv_heads * head_v);
         let group = n_heads / self.n_kv_heads;
         let scale = self.architecture.attention_scale;
         let cap = self.architecture.attention_softcap;
 
-        pool.for_chunks(out, head_dim, 2, |i, out| {
+        pool.for_chunks(out, head_v, 2, |i, out| {
             let (row, head) = (i / n_heads, i % n_heads);
             let slots = rows[row].slots;
             let slots = &slots[slots.len().saturating_sub(window.unwrap_or(usize::MAX))..];
-            let q = &q[i * head_dim..(i + 1) * head_dim];
-            let kv_head = (head / group) * head_dim;
+            let q = &q[i * head_k..(i + 1) * head_k];
+            let kv_head = head / group;
             with_scratch(slots.len(), |scores| {
                 // How relevant is each earlier token to this one?
                 for (score, &slot) in scores.iter_mut().zip(slots) {
-                    let k = &k_pool[slot as usize * kv_dim + kv_head..][..head_dim];
+                    let k = &k_pool[slot as usize * k_dim + kv_head * head_k..][..head_k];
                     *score = dot(q, k) * scale;
                     if cap > 0.0 {
                         *score = soft_cap(*score, cap);
@@ -1200,7 +1528,7 @@ impl Model {
                 // Blend their values by that relevance.
                 out.fill(0.0);
                 for (&weight, &slot) in scores.iter().zip(slots) {
-                    let v = &v_pool[slot as usize * kv_dim + kv_head..][..head_dim];
+                    let v = &v_pool[slot as usize * v_dim + kv_head * head_v..][..head_v];
                     add_scaled(out, weight, v);
                 }
             });

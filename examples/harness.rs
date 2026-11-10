@@ -36,8 +36,12 @@ fn adapter() -> u16 {
 fn open(dir: &Path, cache_tokens: usize, max_batch: usize) -> (Box<dyn Backend>, Config) {
     let threads = env_usize("THREADS", 4);
     let config = Config::load(dir).unwrap();
-    let kv_dim = config.n_kv_heads() * config.head_dim();
-    let bytes = cache_tokens * 2 * config.num_hidden_layers * kv_dim * 4;
+    // Keys and values per token: DeepSeek's latent attention has its own widths.
+    let per_layer = match config.architecture().unwrap().latent {
+        Some(l) => config.num_attention_heads * (l.nope + l.rope + l.v),
+        None => 2 * config.n_kv_heads() * config.head_dim(),
+    };
+    let bytes = cache_tokens * config.num_hidden_layers * per_layer * 4;
     let device = std::env::var("DEVICE").unwrap_or("cpu".into());
     let backend: Box<dyn Backend> = if device == "cuda" {
         let precision = if std::env::var("PRECISION").unwrap_or_default() == "f32" {

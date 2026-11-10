@@ -24,6 +24,8 @@ const SUPPORTED_MODEL_TYPES: &[&str] = &[
     "olmoe",
     "granitemoe",
     "gpt_oss",
+    "deepseek_v2",
+    "deepseek_v3",
 ];
 
 #[derive(Debug, Clone, Deserialize)]
@@ -81,7 +83,7 @@ pub struct Config {
     quantization_config: Option<Value>,
 
     // Mixture of experts.
-    #[serde(alias = "num_local_experts")]
+    #[serde(alias = "num_local_experts", alias = "n_routed_experts")]
     num_experts: Option<usize>,
     num_experts_per_tok: Option<usize>,
     /// The width of each expert's hidden layer, where it isn't `intermediate_size`.
@@ -94,6 +96,21 @@ pub struct Config {
     // GPT-OSS's activation.
     swiglu_alpha: Option<f32>,
     swiglu_limit: Option<f32>,
+
+    // DeepSeek's latent attention and experts.
+    q_lora_rank: Option<usize>,
+    kv_lora_rank: Option<usize>,
+    qk_nope_head_dim: Option<usize>,
+    qk_rope_head_dim: Option<usize>,
+    v_head_dim: Option<usize>,
+    n_shared_experts: Option<usize>,
+    first_k_dense_replace: Option<usize>,
+    moe_layer_freq: Option<usize>,
+    routed_scaling_factor: Option<f32>,
+    topk_method: Option<String>,
+    n_group: Option<usize>,
+    topk_group: Option<usize>,
+    scoring_func: Option<String>,
 
     // Granite.
     attention_multiplier: Option<f32>,
@@ -196,10 +213,47 @@ pub enum ExpertNaming {
     /// `block_sparse_moe.router.layer`, and every expert in one `input_linear` and one
     /// `output_linear` (Granite MoE).
     Granite,
+    /// `mlp.gate` (with `e_score_correction_bias` for V3), `mlp.experts.N.{gate,up,down}_proj`
+    /// and `mlp.shared_experts` (DeepSeek).
+    DeepSeek,
     /// `mlp.router`, and every expert's gate and up projections in one `gate_up_proj` (their
     /// rows alternating) and down projections in one `down_proj`, all with biases, and either
     /// as plain matrices `[experts, in, out]` or packed in MXFP4 (GPT-OSS).
     GptOss,
+}
+
+/// How the experts are chosen for a token, from the router's scores.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Routing {
+    /// The softmax of the scores, the `top_k` best, scaled to add up to 1 if `renormalize`.
+    Softmax { renormalize: bool },
+    /// DeepSeek's: the softmax of the scores (V2) or their sigmoids (V3, which chooses by them
+    /// plus `e_score_correction_bias` but weighs by them alone); the experts come in `groups`
+    /// and only the best `top_groups` are chosen from (each group scored by its best expert,
+    /// or by its best two when `sigmoid`); the `top_k` best of those, scaled to add up to 1 if
+    /// `renormalize`, then all by `scale`.
+    DeepSeek {
+        sigmoid: bool,
+        groups: usize,
+        top_groups: usize,
+        renormalize: bool,
+        scale: f32,
+    },
+}
+
+/// DeepSeek's multi-head latent attention: each token's keys and values come from one small
+/// latent vector, `kv_lora_rank` wide, expanded for each head; the part of each head that RoPE
+/// rotates (`rope` wide, in adjacent pairs) is kept apart, and for keys is the same for every
+/// head. Queries come straight from the input, or through a latent `q_lora_rank` wide.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LatentAttention {
+    pub q_lora_rank: Option<usize>,
+    pub kv_lora_rank: usize,
+    /// Each head's part without rotation, for queries and keys.
+    pub nope: usize,
+    pub rope: usize,
+    /// Each head's value width.
+    pub v: usize,
 }
 
 /// GPT-OSS's activation: with `g = min(gate, limit)` and `u` the up projection clamped to
@@ -221,8 +275,13 @@ pub struct Experts {
     pub hidden: usize,
     /// The chosen experts' weights are scaled to add up to 1.
     pub renormalize: bool,
-    /// The width of an expert every token goes through, gated by its own score (Qwen2 MoE).
+    /// How they're chosen and weighed.
+    pub routing: Routing,
+    /// The width of an expert every token goes through, gated by its own score (Qwen2 MoE), or
+    /// not gated (DeepSeek, see `shared_gated`).
     pub shared_hidden: Option<usize>,
+    /// The shared expert has a gate of its own.
+    pub shared_gated: bool,
     pub naming: ExpertNaming,
     /// The experts' activation, if it isn't the model's usual one.
     pub glu: Option<ClampedGlu>,
@@ -261,6 +320,8 @@ pub struct Architecture {
     /// Each head has a learned score (`self_attn.sinks`) that joins its attention scores in the
     /// softmax without adding any value, so attention can go nowhere (GPT-OSS).
     pub attention_sinks: bool,
+    /// DeepSeek's multi-head latent attention, instead of the usual projections.
+    pub latent: Option<LatentAttention>,
     /// The mixture of experts in the layers marked `sparse`, if the model has one.
     pub experts: Option<Experts>,
     /// The RoPE speed of each element pair in a head: one list per kind of layer.
@@ -341,6 +402,14 @@ impl Config {
             .unwrap_or(self.hidden_size / self.num_attention_heads)
     }
 
+    /// How much of each head RoPE rotates: all of it, except with DeepSeek's latent attention.
+    pub fn rope_dim(&self) -> usize {
+        match self.model_type.as_str() {
+            "deepseek_v2" | "deepseek_v3" => self.qk_rope_head_dim.unwrap_or(64),
+            _ => self.head_dim(),
+        }
+    }
+
     fn is_gemma(&self) -> bool {
         matches!(self.model_type.as_str(), "gemma" | "gemma2" | "gemma3_text")
     }
@@ -372,9 +441,26 @@ impl Config {
             }
         };
 
-        let attention_scale = match model_type {
-            "gemma2" | "gemma3_text" => self.query_pre_attn_scalar.unwrap_or(256.0).powf(-0.5),
-            "granite" | "granitemoe" => self.attention_multiplier.unwrap_or(1.0),
+        let attention_scale = match (model_type, self.latent()?) {
+            ("gemma2" | "gemma3_text", _) => self.query_pre_attn_scalar.unwrap_or(256.0).powf(-0.5),
+            ("granite" | "granitemoe", _) => self.attention_multiplier.unwrap_or(1.0),
+            // DeepSeek scales its scores up with YaRN's mscale_all_dim, squared.
+            (_, Some(latent)) => {
+                let scale = ((latent.nope + latent.rope) as f32).powf(-0.5);
+                let scaling = self.rope_parameters_or_scaling();
+                match scaling.filter(|s| s.kind() != "default") {
+                    Some(s) if s.mscale_all_dim.is_some_and(|m| m != 0.0) => {
+                        let (factor, all) =
+                            (s.factor.unwrap_or(1.0), s.mscale_all_dim.unwrap_or(0.0));
+                        let mscale = match factor <= 1.0 {
+                            true => 1.0,
+                            false => 0.1 * all * factor.ln() + 1.0,
+                        };
+                        scale * (mscale * mscale) as f32
+                    }
+                    _ => scale,
+                }
+            }
             _ => (self.head_dim() as f32).powf(-0.5),
         };
         // Gemma 3 has the setting, but its attention doesn't use it.
@@ -433,6 +519,7 @@ impl Config {
             head_norms: matches!(model_type, "qwen3" | "gemma3_text" | "qwen3_moe"),
             full_qk_norms: model_type == "olmoe",
             attention_sinks: model_type == "gpt_oss",
+            latent: self.latent()?,
             experts: self.experts()?,
             rope_tables,
             rope_scales,
@@ -448,6 +535,7 @@ impl Config {
             "mixtral" => ExpertNaming::Mixtral,
             "granitemoe" => ExpertNaming::Granite,
             "gpt_oss" => ExpertNaming::GptOss,
+            "deepseek_v2" | "deepseek_v3" => ExpertNaming::DeepSeek,
             _ => return Ok(None),
         };
         let count = self
@@ -462,7 +550,7 @@ impl Config {
             count,
             top_k,
             hidden: match model_type {
-                "qwen3_moe" | "qwen2_moe" => self
+                "qwen3_moe" | "qwen2_moe" | "deepseek_v2" | "deepseek_v3" => self
                     .moe_intermediate_size
                     .context("moe_intermediate_size is missing")?,
                 _ => self.intermediate_size,
@@ -473,16 +561,94 @@ impl Config {
                 "mixtral" | "granitemoe" | "gpt_oss" => true,
                 _ => self.norm_topk_prob.unwrap_or(false),
             },
+            routing: match model_type {
+                "deepseek_v2" | "deepseek_v3" => {
+                    let v3 = model_type == "deepseek_v3";
+                    let sigmoid = self.scoring_func.as_deref().unwrap_or(if v3 {
+                        "sigmoid"
+                    } else {
+                        "softmax"
+                    }) == "sigmoid";
+                    let method = self.topk_method.as_deref().unwrap_or(if v3 {
+                        "noaux_tc"
+                    } else {
+                        "greedy"
+                    });
+                    let grouped = matches!(method, "group_limited_greedy" | "noaux_tc");
+                    ensure!(
+                        matches!(method, "greedy" | "group_limited_greedy" | "noaux_tc"),
+                        "DeepSeek's topk_method {method} isn't supported"
+                    );
+                    let groups = if grouped {
+                        self.n_group.unwrap_or(1).max(1)
+                    } else {
+                        1
+                    };
+                    Routing::DeepSeek {
+                        sigmoid,
+                        groups,
+                        top_groups: if grouped {
+                            self.topk_group.unwrap_or(groups).max(1)
+                        } else {
+                            1
+                        },
+                        // V2 never renormalizes; V3 does if norm_topk_prob.
+                        renormalize: v3 && self.norm_topk_prob.unwrap_or(true),
+                        scale: self.routed_scaling_factor.unwrap_or(1.0),
+                    }
+                }
+                _ => Routing::Softmax {
+                    renormalize: match model_type {
+                        "mixtral" | "granitemoe" | "gpt_oss" => true,
+                        _ => self.norm_topk_prob.unwrap_or(false),
+                    },
+                },
+            },
             shared_hidden: match model_type {
                 "qwen2_moe" => self.shared_expert_intermediate_size,
+                "deepseek_v2" | "deepseek_v3" => match self.n_shared_experts.unwrap_or(0) {
+                    0 => None,
+                    n => Some(
+                        n * self
+                            .moe_intermediate_size
+                            .context("moe_intermediate_size is missing")?,
+                    ),
+                },
                 _ => None,
             },
+            shared_gated: model_type == "qwen2_moe",
             naming,
             glu: (model_type == "gpt_oss").then(|| ClampedGlu {
                 alpha: self.swiglu_alpha.unwrap_or(1.702),
                 limit: self.swiglu_limit.unwrap_or(7.0),
             }),
         }))
+    }
+
+    /// DeepSeek's latent attention, if the model has it.
+    fn latent(&self) -> Result<Option<LatentAttention>> {
+        if !matches!(self.model_type.as_str(), "deepseek_v2" | "deepseek_v3") {
+            return Ok(None);
+        }
+        let need = |value: Option<usize>, name: &str| {
+            value.with_context(|| format!("DeepSeek's attention needs {name}"))
+        };
+        Ok(Some(LatentAttention {
+            q_lora_rank: self.q_lora_rank,
+            kv_lora_rank: need(self.kv_lora_rank, "kv_lora_rank")?,
+            nope: need(self.qk_nope_head_dim, "qk_nope_head_dim")?,
+            rope: need(self.qk_rope_head_dim, "qk_rope_head_dim")?,
+            v: need(self.v_head_dim, "v_head_dim")?,
+        }))
+    }
+
+    /// The RoPE settings for the whole model, wherever the configuration keeps them.
+    fn rope_parameters_or_scaling(&self) -> Option<RopeScaling> {
+        self.rope_parameters
+            .as_ref()
+            .filter(|p| p.is_object() && p.get("rope_type").or(p.get("type")).is_some())
+            .and_then(|p| serde_json::from_value::<RopeScaling>(p.clone()).ok())
+            .or_else(|| self.rope_scaling.clone())
     }
 
     /// Whether layer `l` has a mixture of experts rather than a plain MLP.
@@ -497,6 +663,11 @@ impl Config {
                 !dense && (l + 1).is_multiple_of(step)
             }
             "mixtral" | "olmoe" | "granitemoe" | "gpt_oss" => true,
+            "deepseek_v2" | "deepseek_v3" => {
+                let first_dense = self.first_k_dense_replace.unwrap_or(0);
+                let every = self.moe_layer_freq.unwrap_or(1).max(1);
+                l >= first_dense && l.is_multiple_of(every)
+            }
             _ => false,
         }
     }
@@ -578,7 +749,7 @@ impl Config {
             .or(legacy_theta)
             .unwrap_or(default_theta);
 
-        let head_dim = self.head_dim();
+        let head_dim = self.rope_dim();
         let mut inv_freq: Vec<f64> = (0..head_dim / 2)
             .map(|i| 1.0 / theta.powf((2 * i) as f64 / head_dim as f64))
             .collect();

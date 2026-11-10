@@ -31,22 +31,19 @@ use std::collections::{BinaryHeap, HashMap};
 /// actually been written.
 pub struct KvPool {
     pub capacity: usize,
-    /// Per layer, `[capacity, kv_dim]`.
+    /// Per layer, `[capacity, k_dim]` and `[capacity, v_dim]`.
     pub k: Vec<Vec<f32>>,
     pub v: Vec<Vec<f32>>,
 }
 
 impl KvPool {
-    pub fn new(layers: usize, kv_dim: usize, capacity: usize) -> Self {
-        let arrays = || {
-            (0..layers)
-                .map(|_| vec![0.0f32; capacity * kv_dim])
-                .collect()
-        };
+    /// Room for `capacity` tokens' keys (`k_dim` wide) and values (`v_dim` wide) in each layer.
+    pub fn new(layers: usize, k_dim: usize, v_dim: usize, capacity: usize) -> Self {
+        let arrays = |dim: usize| (0..layers).map(|_| vec![0.0f32; capacity * dim]).collect();
         Self {
             capacity,
-            k: arrays(),
-            v: arrays(),
+            k: arrays(k_dim),
+            v: arrays(v_dim),
         }
     }
 }

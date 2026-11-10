@@ -459,6 +459,10 @@ impl CudaBackend {
         let fits_tiles = n_heads / n_kv_heads <= TILE
             && head_dim.is_multiple_of(TILE)
             && TILE_CHUNK_COUNTS.contains(&(head_dim / TILE));
+        ensure!(
+            architecture.latent.is_none(),
+            "DeepSeek's latent attention only runs on the CPU so far"
+        );
         if let Some(experts) = &architecture.experts {
             ensure!(
                 experts.shared_hidden.is_none(),
@@ -2247,6 +2251,7 @@ fn upload_experts(
         ExpertNaming::GptOss => {
             return upload_gpt_oss_experts(gpu, st, num_params, p, spec, dim, batch_rows);
         }
+        ExpertNaming::DeepSeek => bail!("DeepSeek only runs on the CPU so far"),
     };
     let router = upload_stacked(
         gpu,
@@ -2271,7 +2276,7 @@ fn upload_experts(
     let mut gate_up: Vec<u16> = Vec::with_capacity(spec.count * 2 * h * dim);
     let mut down: Vec<u16> = Vec::with_capacity(spec.count * dim * h);
     match spec.naming {
-        ExpertNaming::GptOss => unreachable!("handled above"),
+        ExpertNaming::GptOss | ExpertNaming::DeepSeek => unreachable!("handled above"),
         ExpertNaming::Granite => {
             let input_name = format!("{p}.block_sparse_moe.input_linear.weight");
             let output_name = format!("{p}.block_sparse_moe.output_linear.weight");

@@ -463,6 +463,10 @@ impl MetalBackend {
             !architecture.attention_sinks,
             "attention sinks (GPT-OSS) don't run on Metal yet"
         );
+        ensure!(
+            architecture.latent.is_none(),
+            "DeepSeek's latent attention doesn't run on Metal yet"
+        );
         let dim = config.hidden_size;
         let n_heads = config.num_attention_heads;
         let n_kv_heads = config.n_kv_heads();

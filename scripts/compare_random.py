@@ -39,9 +39,20 @@ cases = {
     "granitemoe": ("granitemoe", dict(num_local_experts=8, num_experts_per_tok=2, embedding_multiplier=2.0, residual_multiplier=0.5, attention_multiplier=0.1, logits_scaling=2.0)),
     # Attention sinks, alternating windows, YaRN, biases everywhere and a clamped activation.
     "gpt_oss": ("gpt_oss", dict(head_dim=32, num_local_experts=8, num_experts_per_tok=2, sliding_window=9)),
+    # DeepSeek's latent attention, with its experts chosen by group (V2: softmax, best one per
+    # group; V3: sigmoids plus a correction, best two per group), shared experts, dense first layers.
+    "deepseek_v2": ("deepseek_v2", dict(q_lora_rank=None, kv_lora_rank=32, qk_nope_head_dim=16, qk_rope_head_dim=8, v_head_dim=16,
+                                        n_routed_experts=8, num_experts_per_tok=2, n_shared_experts=2, moe_intermediate_size=64,
+                                        first_k_dense_replace=1, topk_method="group_limited_greedy", n_group=2, topk_group=1,
+                                        routed_scaling_factor=1.5, num_key_value_heads=8)),
+    "deepseek_v3": ("deepseek_v3", dict(q_lora_rank=64, kv_lora_rank=32, qk_nope_head_dim=16, qk_rope_head_dim=8, v_head_dim=16,
+                                        n_routed_experts=8, num_experts_per_tok=2, n_shared_experts=1, moe_intermediate_size=64,
+                                        first_k_dense_replace=1, n_group=4, topk_group=2, routed_scaling_factor=2.5, num_key_value_heads=8,
+                                        rope_scaling={"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 16,
+                                                      "mscale": 1.0, "mscale_all_dim": 1.0, "beta_fast": 32, "beta_slow": 1})),
 }
 # The GPU doesn't run these yet, or only in 16 bits.
-CPU_ONLY = {"qwen2_moe"}
+CPU_ONLY = {"qwen2_moe", "deepseek_v2", "deepseek_v3"}
 BF16_ONLY = {"qwen3_moe", "mixtral", "olmoe", "granitemoe", "gpt_oss"}
 torch.manual_seed(5)
 rng = np.random.default_rng(5)
@@ -69,6 +80,10 @@ for name, (kind, extra) in cases.items():
                 p.mul_(5.0)
             elif p.dim() == 1:
                 p.copy_(torch.randn_like(p) * 0.2)
+        for buffer_name, buffer in model.named_buffers():
+            # DeepSeek V3 chooses experts by their scores plus this, which starts at zero.
+            if buffer_name.endswith("e_score_correction_bias"):
+                buffer.copy_(torch.randn_like(buffer) * 0.3)
     path = os.path.join(work, name)
     shutil.rmtree(path, ignore_errors=True)
     model.save_pretrained(path, safe_serialization=True)

@@ -4,7 +4,8 @@ A small LLM serving engine in Rust, built on the same ideas as
 [SGLang](https://github.com/sgl-project/sglang): continuous batching, a radix-tree prefix cache
 and fast structured output, behind OpenAI-, Anthropic- and Ollama-compatible APIs. It runs
 Llama-style models (Llama 2/3, Qwen2.5, Qwen3, Mistral, SmolLM2/3, Phi-3, Granite, Gemma 1–3,
-TinyLlama), mixtures of experts (Qwen3-MoE, Mixtral, OLMoE, Granite MoE, Qwen2-MoE, GPT-OSS),
+TinyLlama), mixtures of experts (Qwen3-MoE, Mixtral, OLMoE, Granite MoE, Qwen2-MoE, GPT-OSS,
+DeepSeek V2 and V3),
 reasoning models, and embedding models straight from Hugging Face checkpoints, on
 NVIDIA GPUs, Apple GPUs or the CPU, with no ML framework underneath. Everything from weight loading and
 tokenization to the GPU and SIMD kernels and the HTTP server is here, in about 18,000 lines
@@ -236,6 +237,13 @@ experts' weights 16-bit.
 
 On an RTX 2000 Ada, Granite 3.1's 1B mixture (400M parameters active per token) generates 159
 tokens/s for one request and 4,314 for 128 at once.
+
+DeepSeek V2 and V3 run on the CPU so far: their multi-head latent attention (each token's keys and
+values expanded from one small latent vector, with a rotated part shared across heads, and queries
+through a latent of their own in V3), and their experts, chosen among the best groups of experts
+(by softmax in V2; by sigmoid plus a learned correction in V3), with shared experts every token
+goes through and dense first layers. The KV cache keeps the expanded keys and values, not yet the
+latent, which would be far smaller.
 
 ### GPT-OSS
 
@@ -557,6 +565,9 @@ Checked against Hugging Face `transformers` (float32) and `tokenizers`:
   context. So do
   mixtures of experts (Qwen3-MoE, Qwen2-MoE, Mixtral, OLMoE, Granite MoE: within 2.2e-7 on the
   CPU, and on the GPU in 16 bits as closely as `transformers`' own 16-bit mode).
+- **DeepSeek:** random-weight V2 (group-limited softmax routing) and V3 (query latent, sigmoid
+  routing with a correction, YaRN with `mscale`) models match `transformers` to within 3.3e-7 on
+  the CPU, and batching changes nothing.
 - **GPT-OSS:** a random-weight model with sinks, alternating windows, YaRN and the clamped
   activation matches `transformers` to within 2.1e-7 on the CPU, and on the GPU in 16 bits as
   closely as `transformers`' own 16-bit mode. Its experts packed in MXFP4 (`scripts/make_mxfp4.py`)
@@ -651,15 +662,15 @@ missing is breadth, and the last 10–20% of single-stream speed.
 | Reasoning parsers, thinking budgets | yes, for many families | yes, for `<think>` models (Qwen3, SmolLM3, DeepSeek-R1 and others) and GPT-OSS's harmony channels (budgets for `<think>` models only) |
 | Speculative decoding | yes: EAGLE, MTP, draft models, n-grams | draft models and n-grams, with replies exactly as without it. **No EAGLE or MTP** |
 | LoRA adapters | yes, mixed in batches, loaded and unloaded while running | yes, mixed in batches, chosen by `model` or `lora_path`, loaded and unloaded while running (unloading doesn't free their memory yet) |
-| Architectures | many | Llama-style (Llama, Mistral, Qwen2/3, SmolLM2/3, Phi-3, Granite, Gemma 1–3) and mixtures of experts (Qwen3-MoE, Qwen2-MoE, Mixtral, OLMoE, Granite MoE, GPT-OSS). **No DeepSeek (MLA), hybrid attention models** |
+| Architectures | many | Llama-style (Llama, Mistral, Qwen2/3, SmolLM2/3, Phi-3, Granite, Gemma 1–3) and mixtures of experts (Qwen3-MoE, Qwen2-MoE, Mixtral, OLMoE, Granite MoE, GPT-OSS, and DeepSeek V2/V3 with latent attention, on the CPU so far). **No hybrid attention models (Qwen3-Next, Jamba)** |
 | Sliding-window attention, logit soft-capping | yes | yes |
 | Embedding models | yes | yes, with last-token pooling |
 | Vision, rerank, reward models | yes | **no** |
 | Multi-GPU, multi-node, router | yes | **no** |
 | The SGL frontend language (`gen`, `select`, `fork`) | yes | **no** |
 
-Biggest gaps first, the plan is: DeepSeek's attention (MLA), then EAGLE-style speculative
-decoding.
+Biggest gaps first, the plan is: DeepSeek on the GPUs (and keeping its latent in the cache), then
+EAGLE-style speculative decoding.
 
 Other limitations: only BPE tokenizers are supported (not SentencePiece Unigram or WordPiece,
 though that covers the Llama family), embeddings only use last-token pooling, and sliding windows
