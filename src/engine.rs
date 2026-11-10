@@ -257,6 +257,11 @@ enum Command {
         events: UnboundedSender<Event>,
     },
     FlushCache,
+    /// Give the backend another LoRA adapter, between steps.
+    AddAdapter {
+        adapter: Box<crate::lora::LoraAdapter>,
+        done: mpsc::Sender<Result<(), String>>,
+    },
 }
 
 /// A connection to a running engine. Dropping every handle shuts the engine down.
@@ -284,6 +289,20 @@ impl EngineHandle {
     /// Throw away everything in the prefix cache that isn't in use.
     pub fn flush_cache(&self) {
         let _ = self.commands.send(Command::FlushCache);
+    }
+
+    /// Give the backend another LoRA adapter (it becomes the next number), waiting until it has.
+    pub fn add_adapter(&self, adapter: crate::lora::LoraAdapter) -> Result<(), String> {
+        let (done, wait) = mpsc::channel();
+        let command = Command::AddAdapter {
+            adapter: Box::new(adapter),
+            done,
+        };
+        self.commands
+            .send(command)
+            .map_err(|_| "the engine has stopped".to_string())?;
+        wait.recv()
+            .map_err(|_| "the engine has stopped".to_string())?
     }
 
     pub fn stats(&self) -> &Stats {
@@ -531,6 +550,10 @@ impl Engine {
         match command {
             Command::Submit { request, events } => self.enqueue(*request, events),
             Command::FlushCache => self.cache.clear(),
+            Command::AddAdapter { adapter, done } => {
+                let added = self.backend.add_adapter(&adapter);
+                let _ = done.send(added.map_err(|err| format!("{err:#}")));
+            }
         }
     }
 
@@ -988,12 +1011,13 @@ impl Engine {
                     .len()
                     .min(start + budget.saturating_sub(rows.len()));
                 for pos in start..end {
+                    // The model's adapters aren't the draft model's.
                     rows.push(Row {
                         token: seq.tokens[pos],
                         slots: &seq.slots[..=pos],
                         want_logits: false,
                         sampling: LogitUse::All,
-                        adapter: seq.params.adapter,
+                        adapter: 0,
                     });
                 }
                 taken.push((i, end));
@@ -1068,7 +1092,7 @@ impl Engine {
                         slots: list,
                         want_logits: true,
                         sampling: seq.sampler.logit_use(seq.generated + round),
-                        adapter: seq.params.adapter,
+                        adapter: 0,
                     }
                 })
                 .collect();

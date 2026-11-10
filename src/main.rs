@@ -483,7 +483,8 @@ fn main() -> Result<()> {
                 reasoning,
                 model_type: config.model_type.clone(),
                 num_params,
-                adapters: Adapters::new(adapter_names),
+                adapters: std::sync::RwLock::new(Adapters::new(adapter_names)),
+                config: Arc::new(config.clone()),
             },
             &format!("{}:{}", args.host, args.port),
         );

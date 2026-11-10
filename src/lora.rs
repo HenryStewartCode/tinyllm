@@ -234,31 +234,53 @@ fn locate(name: &str) -> Option<(usize, Target)> {
     Some((layer, target))
 }
 
-/// The adapters a server was started with, by name.
+/// The adapters a server has, by name. Each keeps its number for good: one that's unloaded
+/// leaves a gap, so requests still running with it are unaffected and a new one never takes
+/// its number (or its cached prompts).
 #[derive(Default)]
 pub struct Adapters {
-    names: Vec<String>,
+    names: Vec<Option<String>>,
 }
 
 impl Adapters {
     pub fn new(names: Vec<String>) -> Self {
-        Self { names }
+        Self {
+            names: names.into_iter().map(Some).collect(),
+        }
     }
 
     /// The number rows use for adapter `name` (1 for the first; 0 means none), if there is one.
     pub fn find(&self, name: &str) -> Option<u16> {
         self.names
             .iter()
-            .position(|n| n == name)
+            .position(|n| n.as_deref() == Some(name))
             .map(|i| i as u16 + 1)
     }
 
-    pub fn names(&self) -> &[String] {
-        &self.names
+    /// The adapters' names, in order.
+    pub fn names(&self) -> Vec<String> {
+        self.names.iter().flatten().cloned().collect()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.names.is_empty()
+        self.names.iter().all(Option::is_none)
+    }
+
+    /// Note that the backend has been given another adapter, which becomes the next number.
+    pub fn push(&mut self, name: String) -> u16 {
+        self.names.push(Some(name));
+        self.names.len() as u16
+    }
+
+    /// Stop offering adapter `name`. Returns whether there was one.
+    pub fn remove(&mut self, name: &str) -> bool {
+        match self.find(name) {
+            Some(number) => {
+                self.names[number as usize - 1] = None;
+                true
+            }
+            None => false,
+        }
     }
 }
 

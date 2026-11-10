@@ -81,7 +81,9 @@ pub struct Server {
     pub model_type: String,
     pub num_params: usize,
     /// The LoRA adapters requests can choose, by name.
-    pub adapters: Adapters,
+    pub adapters: std::sync::RwLock<Adapters>,
+    /// The model's configuration, which adapters loaded later are checked against.
+    pub config: Arc<crate::config::Config>,
 }
 
 struct App {
@@ -128,6 +130,8 @@ pub fn serve(server: Server, address: &str) -> Result<()> {
         .route("/get_model_info", get(model_info))
         .route("/get_server_info", get(server_info))
         .route("/flush_cache", post(flush_cache))
+        .route("/load_lora_adapter", post(load_lora_adapter))
+        .route("/unload_lora_adapter", post(unload_lora_adapter))
         .route("/health_generate", get(health_generate))
         .route("/tokenize", post(tokenize))
         .route("/v1/tokenize", post(tokenize))
@@ -423,7 +427,7 @@ impl App {
         };
         let stop_strings = stop_strings.into_iter().filter(|s| !s.is_empty()).collect();
 
-        let adapters = &self.server.adapters;
+        let adapters = self.server.adapters.read().expect("not poisoned");
         let adapter = match (&fields.lora_path, &fields.model) {
             (Some(name), _) => adapters.find(name).ok_or_else(|| {
                 ApiError::invalid(match adapters.is_empty() {
@@ -1520,7 +1524,8 @@ async fn models(State(app): State<Arc<App>>) -> Response {
         "max_model_len": app.context_limit(),
     })];
     // Each adapter is a model of its own, as vLLM lists them.
-    for name in app.server.adapters.names() {
+    let names = app.server.adapters.read().expect("not poisoned").names();
+    for name in names {
         data.push(json!({
             "id": name,
             "object": "model",
@@ -1552,6 +1557,81 @@ async fn server_info(State(app): State<Arc<App>>) -> Response {
             "context_length": app.context_limit(),
         }),
     )
+}
+
+/// `/load_lora_adapter` and `/unload_lora_adapter`, as SGLang takes them.
+#[derive(Deserialize)]
+struct AdapterRequest {
+    lora_name: String,
+    #[serde(default)]
+    lora_path: Option<String>,
+}
+
+fn adapter_reply(success: bool, message: String) -> Response {
+    let status = match success {
+        true => StatusCode::OK,
+        false => StatusCode::BAD_REQUEST,
+    };
+    json_response(status, &json!({ "success": success, "message": message }))
+}
+
+async fn load_lora_adapter(State(app): State<Arc<App>>, body: Bytes) -> Response {
+    let request: AdapterRequest = match parse_body(&body) {
+        Ok(request) => request,
+        Err(err) => return adapter_reply(false, err.message),
+    };
+    let Some(path) = request.lora_path.clone() else {
+        return adapter_reply(false, "lora_path is required".to_string());
+    };
+    let name = request.lora_name;
+    if app
+        .server
+        .adapters
+        .read()
+        .expect("not poisoned")
+        .find(&name)
+        .is_some()
+    {
+        return adapter_reply(false, format!("there's already an adapter called {name}"));
+    }
+    // Reading the files and handing them to the engine both take a while.
+    let worker = app.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let config = &worker.server.config;
+        let adapter = crate::lora::LoraAdapter::load(&name, std::path::Path::new(&path), config)
+            .map_err(|err| format!("{err:#}"))?;
+        // Numbers are handed out in the order the engine adds adapters, so this holds the lock.
+        let mut adapters = worker.server.adapters.write().expect("not poisoned");
+        worker.server.engine.add_adapter(adapter)?;
+        adapters.push(name.clone());
+        Ok::<_, String>(name)
+    })
+    .await;
+    match result {
+        Ok(Ok(name)) => adapter_reply(true, format!("loaded the adapter {name}")),
+        Ok(Err(message)) => adapter_reply(false, message),
+        Err(err) => adapter_reply(false, format!("loading failed: {err}")),
+    }
+}
+
+async fn unload_lora_adapter(State(app): State<Arc<App>>, body: Bytes) -> Response {
+    let request: AdapterRequest = match parse_body(&body) {
+        Ok(request) => request,
+        Err(err) => return adapter_reply(false, err.message),
+    };
+    let removed = app
+        .server
+        .adapters
+        .write()
+        .expect("not poisoned")
+        .remove(&request.lora_name);
+    match removed {
+        true => adapter_reply(true, format!("unloaded the adapter {}", request.lora_name)),
+        false => adapter_reply(
+            false,
+            format!("there's no adapter called {}", request.lora_name),
+        ),
+    }
 }
 
 async fn flush_cache(State(app): State<Arc<App>>) -> Response {

@@ -193,6 +193,7 @@ curl http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/jso
 | `GET /metrics` | Throughput, queue length and cache use, in Prometheus format. |
 | `GET /health`, `/health_generate`, `/get_model_info`, `/get_server_info` | `/health_generate` checks that a token can actually be generated. |
 | `POST /flush_cache` | Drop everything in the prefix cache that isn't in use. |
+| `POST /load_lora_adapter`, `POST /unload_lora_adapter` | Add a LoRA adapter while running (`{"lora_name", "lora_path"}`), or stop offering one (`{"lora_name"}`), as SGLang does. |
 
 Requests can set `max_tokens` (or `max_completion_tokens`), `temperature`, `top_p`, `top_k`,
 `min_p`, `stop`, `stop_token_ids`, `seed`, `frequency_penalty`, `presence_penalty`,
@@ -303,6 +304,8 @@ model's cache gets 2 GiB on an NVIDIA GPU, leaving room for the draft model's.
 shares them in (`adapter_config.json` and `adapter_model.safetensors`). A request chooses one by
 naming it as its `model`, as with vLLM, or in `lora_path`, as with SGLang (`/generate` takes
 `lora_path` too); requests that don't use the model as it is. `/v1/models` lists the adapters.
+`POST /load_lora_adapter` adds one while the server runs, and `/unload_lora_adapter` stops offering
+one (its memory isn't given back yet, and requests already using it finish with it).
 
 ```bash
 tinyllm -m models/Qwen2.5-0.5B-Instruct --serve --lora sql=adapters/sql chat=adapters/chat
@@ -647,7 +650,7 @@ missing is breadth, and the last 10–20% of single-stream speed.
 | Tool calling, with `tool_choice` and strict schemas | yes, with parsers for many model families | yes, for the families that run here: Qwen and Hermes, Mistral, Llama 3, and GPT-OSS's harmony messages |
 | Reasoning parsers, thinking budgets | yes, for many families | yes, for `<think>` models (Qwen3, SmolLM3, DeepSeek-R1 and others) and GPT-OSS's harmony channels (budgets for `<think>` models only) |
 | Speculative decoding | yes: EAGLE, MTP, draft models, n-grams | draft models and n-grams, with replies exactly as without it. **No EAGLE or MTP** |
-| LoRA adapters | yes, mixed in batches, loaded and unloaded while running | yes, mixed in batches, chosen by `model` or `lora_path`; loaded at start-up only |
+| LoRA adapters | yes, mixed in batches, loaded and unloaded while running | yes, mixed in batches, chosen by `model` or `lora_path`, loaded and unloaded while running (unloading doesn't free their memory yet) |
 | Architectures | many | Llama-style (Llama, Mistral, Qwen2/3, SmolLM2/3, Phi-3, Granite, Gemma 1–3) and mixtures of experts (Qwen3-MoE, Qwen2-MoE, Mixtral, OLMoE, Granite MoE, GPT-OSS). **No DeepSeek (MLA), hybrid attention models** |
 | Sliding-window attention, logit soft-capping | yes | yes |
 | Embedding models | yes | yes, with last-token pooling |
