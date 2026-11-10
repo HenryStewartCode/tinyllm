@@ -139,7 +139,7 @@ impl Mlp {
 
 /// What a layer's feed-forward block is.
 enum FeedForward {
-    Dense(Mlp),
+    Dense(Box<Mlp>),
     /// A mixture of experts (see [`crate::config::Experts`]).
     Sparse {
         router: Linear,
@@ -539,7 +539,7 @@ impl Model {
                 mlp_norm,
                 feed_forward: match (shape.sparse, &architecture.experts) {
                     (true, Some(spec)) => load_experts(&st, &p, spec, dim, residual)?,
-                    _ => FeedForward::Dense(Mlp {
+                    _ => FeedForward::Dense(Box::new(Mlp {
                         gate_proj: gate_proj.context("a dense layer needs gate_proj")?,
                         up_proj: up_proj.context("a dense layer needs up_proj")?,
                         down_proj: Linear::load_scaled(
@@ -549,7 +549,7 @@ impl Model {
                             hidden_dim,
                             residual,
                         )?,
-                    }),
+                    })),
                 },
                 norm_after_mlp,
                 rope_table: shape.rope_table,

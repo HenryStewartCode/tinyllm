@@ -21,7 +21,7 @@ for text in prompts:
     # greedy continuation
     n = 48
     with torch.no_grad():
-        g = model.generate(torch.tensor([ids]), max_new_tokens=n, do_sample=False, temperature=None, top_p=None, top_k=None,
+        g = model.generate(torch.tensor([ids]), attention_mask=torch.ones_like(torch.tensor([ids])), max_new_tokens=n, do_sample=False, temperature=None, top_p=None, top_k=None,
                            repetition_penalty=1.0, eos_token_id=None, pad_token_id=0)[0, len(ids):].tolist()
     o = json.loads(subprocess.check_output([tool, "greedy", model_dir, str(n), *map(str, ids)]))
     same = next((i for i, (a, b) in enumerate(zip(g, o)) if a != b), n)

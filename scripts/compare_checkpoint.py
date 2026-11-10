@@ -30,7 +30,7 @@ def reference(dtype, device):
         t = torch.tensor([ids], device=device)
         with torch.no_grad():
             logits = model(t).logits[0].float().cpu().numpy()
-            greedy = model.generate(t, max_new_tokens=N_GEN, do_sample=False, temperature=None, top_p=None, top_k=None,
+            greedy = model.generate(t, attention_mask=torch.ones_like(t), max_new_tokens=N_GEN, do_sample=False, temperature=None, top_p=None, top_k=None,
                                     repetition_penalty=1.0, eos_token_id=None, pad_token_id=0)[0, len(ids):].tolist()
         out.append((logits, greedy))
     del model
