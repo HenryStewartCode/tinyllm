@@ -100,6 +100,10 @@ impl ReasoningFormat {
 pub enum Piece {
     Reasoning(String),
     Content(String),
+    /// A harmony message addressed to a tool starts a call to it (by name)...
+    Call(String),
+    /// ...and its text is the call's arguments.
+    Arguments(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -131,7 +135,7 @@ enum Channel {
     Analysis,
     /// `final`, or `commentary` with no recipient: the answer.
     Answer,
-    /// Addressed to a tool, which isn't read as a call yet, so it's left out.
+    /// Addressed to a tool: a call, whose text is its arguments.
     ToTool,
 }
 
@@ -176,9 +180,17 @@ impl ReasoningParser {
                         .nth(1)
                         .and_then(|rest| rest.split(|c: char| c.is_whitespace() || c == '<').next())
                         .unwrap_or("final");
-                    self.message = Some(match channel {
-                        "analysis" => Channel::Analysis,
-                        _ if header.contains(" to=") => Channel::ToTool,
+                    // The recipient can come before or after the channel.
+                    let recipient = header.split("to=").nth(1).and_then(|rest| {
+                        rest.split(|c: char| c.is_whitespace() || c == '<').next()
+                    });
+                    self.message = Some(match (channel, recipient) {
+                        ("analysis", _) => Channel::Analysis,
+                        (_, Some(recipient)) => {
+                            let name = recipient.strip_prefix("functions.").unwrap_or(recipient);
+                            out.push(Piece::Call(name.to_string()));
+                            Channel::ToTool
+                        }
                         _ => Channel::Answer,
                     });
                 }
@@ -304,7 +316,8 @@ fn emit_message(out: &mut Vec<Piece>, channel: Channel, text: String) {
         (Channel::Analysis, _) => out.push(Piece::Reasoning(text)),
         (Channel::Answer, Some(Piece::Content(so_far))) => so_far.push_str(&text),
         (Channel::Answer, _) => out.push(Piece::Content(text)),
-        (Channel::ToTool, _) => {}
+        (Channel::ToTool, Some(Piece::Arguments(so_far))) => so_far.push_str(&text),
+        (Channel::ToTool, _) => out.push(Piece::Arguments(text)),
     }
 }
 
@@ -333,6 +346,7 @@ pub fn split(format: &ReasoningFormat, open: bool, text: &str) -> (String, Strin
         match piece {
             Piece::Reasoning(text) => reasoning.push_str(&text),
             Piece::Content(text) => content.push_str(&text),
+            Piece::Call(_) | Piece::Arguments(_) => {}
         }
     }
     (reasoning, content)
@@ -354,6 +368,7 @@ mod tests {
             match piece {
                 Piece::Reasoning(text) => reasoning.push_str(&text),
                 Piece::Content(text) => content.push_str(&text),
+                Piece::Call(_) | Piece::Arguments(_) => {}
             }
         }
         (reasoning, content)
@@ -467,6 +482,7 @@ mod tests {
                 match piece {
                     Piece::Reasoning(text) => r.push_str(&text),
                     Piece::Content(text) => c.push_str(&text),
+                    Piece::Call(_) | Piece::Arguments(_) => {}
                 }
             }
             assert_eq!(
@@ -475,5 +491,23 @@ mod tests {
                 "cut at {cut}"
             );
         }
+    }
+
+    #[test]
+    fn harmony_calls_to_tools_are_read() {
+        let reply = "<|channel|>analysis<|message|>Need the weather.<|end|><|start|>assistant\
+                     <|channel|>commentary to=functions.get_weather <|constrain|>json<|message|>\
+                     {\"city\": \"Paris\"}";
+        let mut parser = ReasoningParser::new(ReasoningFormat::harmony(), true);
+        let mut pieces = parser.push(reply);
+        pieces.extend(parser.finish());
+        assert_eq!(
+            pieces,
+            vec![
+                Piece::Reasoning("Need the weather.".into()),
+                Piece::Call("get_weather".into()),
+                Piece::Arguments("{\"city\": \"Paris\"}".into()),
+            ]
+        );
     }
 }

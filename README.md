@@ -242,8 +242,9 @@ OpenAI's `gpt-oss-20b` runs on a 16 GB GPU: its experts stay in the MXFP4 they'r
 (4-bit floats with a power-of-two scale for each 32), which a tensor-core kernel decodes exactly as
 it multiplies, and the rest is 16-bit, 13.7 GB in all. Its attention sinks, alternating 128-token
 windows, YaRN and biases are supported, and so is its "harmony" reply format: the `analysis`
-channel comes back as `reasoning_content`, the `final` channel as the answer, and structured output
-applies to the answer only. Tool calls in harmony format aren't read yet.
+channel comes back as `reasoning_content`, the `final` channel as the answer, messages addressed to
+`functions.NAME` as tool calls (streamed or not), and structured output applies to the answer only.
+`tool_choice` "required" or a named tool isn't enforced for it yet.
 
 ```bash
 tinyllm -m models/gpt-oss-20b --serve --batch-size 128 --parallel 16 --cache-mb 600
@@ -541,7 +542,7 @@ Checked against Hugging Face `transformers` (float32) and `tokenizers`:
   closely as `transformers`' own 16-bit mode. Its experts packed in MXFP4 (`scripts/make_mxfp4.py`)
   give exactly the same logits as the same values unpacked on the CPU, and on the GPU within 9e-4
   of them, against 5.7e-2 for 16-bit rounding. The real `gpt-oss-20b` answers and reasons sensibly,
-  and keeps to JSON schemas in its answer.
+  keeps to JSON schemas in its answer, and calls a weather tool, then answers from its result.
 - **A real mixture of experts:** Granite 3.1 1B-A400M matches 32-bit `transformers` to within
   2.2e-4 on the CPU, and its greedy generations are identical for 32 tokens on the CPU and the GPU
   (where `transformers`' 16-bit mode diverged after one token on one prompt).
@@ -626,7 +627,7 @@ missing is breadth, and the last 10–20% of single-stream speed.
 | Reusable compiled batches (CUDA graphs) | yes | yes, for batches of up to 64 |
 | Scheduling overlapped with the GPU's work | yes | not needed so far: scheduling, sampling and streaming take 0–3% of each step with up to 256 requests at once (Qwen2.5-0.5B on the RTX 2000 Ada), and the GPU is busy 96% of the time. `/metrics` shows the split as `tinyllm_forward_seconds_total` |
 | Quantized weights | yes: FP8, INT8, AWQ, GPTQ, GGUF, bitsandbytes, MXFP4 and more | FP8 and 4-bit AWQ/GPTQ checkpoints, and 8-bit integers, on the NVIDIA GPU (the CPU and Apple GPU unpack quantized checkpoints to 32 bits); bfloat16 weights stay 16-bit on the CPU. **No GGUF, bitsandbytes, MXFP4, or GPTQ with 8 bits** |
-| Tool calling, with `tool_choice` and strict schemas | yes, with parsers for many model families | yes, for the families that run here: Qwen and Hermes, Mistral, Llama 3 |
+| Tool calling, with `tool_choice` and strict schemas | yes, with parsers for many model families | yes, for the families that run here: Qwen and Hermes, Mistral, Llama 3, and GPT-OSS's harmony messages |
 | Reasoning parsers, thinking budgets | yes, for many families | yes, for `<think>` models (Qwen3, SmolLM3, DeepSeek-R1 and others) and GPT-OSS's harmony channels (budgets for `<think>` models only) |
 | Speculative decoding | yes: EAGLE, MTP, draft models, n-grams | n-grams only, with replies exactly as without it |
 | LoRA adapters | yes, mixed in batches, loaded and unloaded while running | yes, mixed in batches, chosen by `model` or `lora_path`; loaded at start-up only |

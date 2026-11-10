@@ -888,6 +888,7 @@ impl ReplyReading {
                 .as_ref()
                 .map(|(format, open)| ReasoningParser::new(format.clone(), *open)),
             calls: self.tools.as_ref().map(ToolReading::parser),
+            harmony_calls: 0,
         }
     }
 
@@ -923,6 +924,8 @@ struct Reply {
 struct ChoiceReader {
     thinking: Option<ReasoningParser>,
     calls: Option<ToolParser>,
+    /// Calls read from harmony messages addressed to tools, rather than by `calls`.
+    harmony_calls: usize,
 }
 
 impl ChoiceReader {
@@ -942,6 +945,20 @@ impl ChoiceReader {
                     parts.extend(parser.push(&text).into_iter().map(ReplyPart::from));
                 }
                 (Piece::Content(text), None) => parts.push(ReplyPart::Content(text)),
+                (Piece::Call(name), _) => {
+                    parts.push(ReplyPart::Call {
+                        index: self.harmony_calls,
+                        name,
+                    });
+                    self.harmony_calls += 1;
+                }
+                (Piece::Arguments(text), _) if self.harmony_calls > 0 => {
+                    parts.push(ReplyPart::Arguments {
+                        index: self.harmony_calls - 1,
+                        text,
+                    });
+                }
+                (Piece::Arguments(_), _) => {}
             }
         }
         if text.is_none()
@@ -953,7 +970,7 @@ impl ChoiceReader {
     }
 
     fn calls_made(&self) -> usize {
-        self.calls.as_ref().map_or(0, ToolParser::calls)
+        self.calls.as_ref().map_or(0, ToolParser::calls) + self.harmony_calls
     }
 }
 
@@ -983,7 +1000,8 @@ fn part_chunk(
         ReplyPart::Reasoning(text) => format.reasoning_delta(index, &text, logprobs),
         ReplyPart::Content(text) => format.delta(index, &text, logprobs),
         ReplyPart::Call { index: call, name } => {
-            let id = app.call_id(tool_format.expect("calls are only read with a format"));
+            // Harmony calls come without a format of their own; any will do for an id.
+            let id = app.call_id(tool_format.unwrap_or(ToolFormat::Hermes));
             let call = json!({
                 "index": call,
                 "id": id,
@@ -1166,6 +1184,20 @@ fn prepare_chat(app: &App, request: &ChatRequest) -> Result<ChatPrompt, ApiError
     // Some templates only understand plain strings, so a text-only list of parts is joined.
     let mut messages: Vec<Value> = request.messages.iter().map(flatten_content).collect();
     tools::prepare_messages(&mut messages).map_err(ApiError::invalid)?;
+    // GPT-OSS's template looks for its markers in every message's content, which it can't do
+    // when a tool-calling message's content is null, as OpenAI's clients send it.
+    if app
+        .server
+        .reasoning
+        .as_ref()
+        .is_some_and(|format| format.harmony)
+    {
+        for message in &mut messages {
+            if message.get("content").is_some_and(Value::is_null) {
+                message["content"] = Value::String(String::new());
+            }
+        }
+    }
     let plan = tools::plan(ToolOptions {
         tools: request.tools.as_ref(),
         tool_choice: request.tool_choice.as_ref(),
@@ -1280,6 +1312,8 @@ async fn chat_completions(State(app): State<Arc<App>>, body: Bytes) -> Result<Re
 /// A finished reply as an OpenAI message.
 fn openai_message(app: &App, reply: &Reply, tool_format: Option<ToolFormat>) -> Value {
     let mut message = json!({ "role": "assistant", "content": reply.content });
+    // Harmony calls come without a format of their own; any will do for their ids.
+    let tool_format = tool_format.or(Some(ToolFormat::Hermes));
     if let Some(format) = tool_format.filter(|_| !reply.calls.is_empty()) {
         let calls: Vec<Value> = reply
             .calls
