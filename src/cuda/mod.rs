@@ -95,6 +95,9 @@ pub struct Options {
     pub cache_bytes: Option<usize>,
     /// CPU threads for work between GPU steps (choosing the next tokens).
     pub host_threads: usize,
+    /// Another checkpoint to take the embeddings from if this one has none (an EAGLE head
+    /// uses its model's).
+    pub weights_from: Option<std::path::PathBuf>,
 }
 
 /// A weight matrix on the GPU.
@@ -155,6 +158,29 @@ struct LatentLayer {
     /// The cache: each slot's normalized latent and rotated key part, `[slots, rank + rope]` as
     /// tiles.
     pool: Pointer,
+}
+
+/// What an EAGLE-3 draft head has that a model doesn't (see [`crate::config::Eagle3`]), and its
+/// working memory. Its one layer's `attn_norm` normalizes each token's embedding.
+struct EagleParts {
+    /// Folds the model's kept features (`3 * dim`) into one hidden state.
+    fc: Matrix,
+    hidden_norm: Pointer,
+    /// The model's token id for each of the head's output rows.
+    targets: Pointer,
+    draft_vocab: usize,
+    /// Each row's hidden state for the next forward, `width` a row (at most `3 * dim`), and the
+    /// same as tiles for `fc`.
+    hidden_in: Pointer,
+    hidden_tiles: Pointer,
+    width: usize,
+    /// What's being copied to `hidden_in`, which has to stay put until the GPU has it.
+    hidden_host: Vec<f32>,
+    /// The layer's input: each row's normalized embedding, then its normalized hidden state, as
+    /// tiles `[rows, 2 * dim]`.
+    wide: Pointer,
+    /// Scores for the head's own vocabulary, `[rows, draft_vocab]`.
+    draft_logits: Pointer,
 }
 
 /// Working memory for latent attention, each per-head part `[heads][rows, ...]`.
@@ -292,6 +318,9 @@ struct Kernels {
     latent_store: Kernel,
     attention_latent: Kernel,
     heads_to_tiles: Kernel,
+    copy_rows: Kernel,
+    tiles_bf16: Kernel,
+    scatter_logits: Kernel,
 }
 
 impl Kernels {
@@ -348,6 +377,9 @@ impl Kernels {
             latent_store: gpu.kernel(module, "latent_store")?,
             attention_latent: gpu.kernel(module, "attention_latent")?,
             heads_to_tiles: gpu.kernel(module, "heads_to_tiles")?,
+            copy_rows: gpu.kernel(module, "copy_rows")?,
+            tiles_bf16: gpu.kernel(module, "tiles_bf16")?,
+            scatter_logits: gpu.kernel(module, "scatter_logits")?,
             swiglu_bf16: gpu.kernel(module, "swiglu_bf16")?,
             geglu_bf16: gpu.kernel(module, "geglu_bf16")?,
             rope_store_bf16: gpu.kernel(module, "rope_store_bf16")?,
@@ -453,13 +485,21 @@ pub struct CudaBackend {
     step_buffer: Pointer,
     moe: Option<MoeBuffers>,
     latent_buffers: Option<LatentBuffers>,
+    eagle: Option<EagleParts>,
+    /// The layers whose output (the residual stream after them) each forward keeps for every
+    /// row, where it goes on the GPU, `[rows, capture.len() * dim]`, and what came back.
+    capture: Vec<usize>,
+    features_device: Pointer,
+    features: Vec<f32>,
 
     slot_list_buffer: Growing,
     scratch: Growing,
     step: StepData,
     /// The kernels of a forward pass, recorded once per batch size, then replayed. That saves
     /// a little GPU time per kernel, which only matters when the batch is small.
-    graphs: HashMap<(usize, bool), Graph>,
+    /// Keyed by the batch size, whether any row uses an adapter, and (for an EAGLE head)
+    /// whether its hidden states are its model's features.
+    graphs: HashMap<(usize, bool, bool), Graph>,
 
     /// Two entries per row that wants logits: how many candidates it has, and the token drawn.
     results_device: Pointer,
@@ -516,7 +556,7 @@ impl CudaBackend {
     /// Load `config.json` and the weights onto the GPU.
     pub fn load(dir: &Path, options: &Options) -> Result<LoadedModel<Self>> {
         let config = Config::load(dir)?;
-        let st = SafeTensors::open(dir)?;
+        let st = SafeTensors::open_with(dir, options.weights_from.as_deref())?;
         let gpu = Gpu::open()?;
         gpu.attach()?;
         let gpu_name = gpu.name();
@@ -530,6 +570,16 @@ impl CudaBackend {
         let (q_dim, kv_dim) = (n_heads * head_dim, n_kv_heads * head_dim);
         let architecture = config.architecture()?;
         let latent = architecture.latent;
+        let eagle = architecture.eagle3;
+        ensure!(
+            eagle.is_none() || options.precision == Precision::Bf16,
+            "EAGLE heads need 16-bit precision on the GPU"
+        );
+        // An EAGLE head's attention reads each token's embedding next to its hidden state.
+        let attn_in = match eagle {
+            Some(_) => 2 * dim,
+            None => dim,
+        };
         // What attention's output is: every head's value.
         let attn_width = latent.map_or(q_dim, |l| n_heads * l.v);
         if head_dim > MAX_HEAD_DIM {
@@ -680,7 +730,7 @@ impl CudaBackend {
                 precision,
                 &mut num_params,
                 &qkv_names,
-                dim,
+                attn_in,
                 batch_rows,
                 1.0,
                 options.quantization,
@@ -822,7 +872,8 @@ impl CudaBackend {
                 &st,
                 precision,
                 &mut num_params,
-                &[("lm_head".to_string(), vocab_size)],
+                // An EAGLE head scores its own, smaller, vocabulary.
+                &[("lm_head".to_string(), eagle.map_or(vocab_size, |e| e.draft_vocab))],
                 dim,
                 batch_rows,
                 1.0,
@@ -857,6 +908,43 @@ impl CudaBackend {
         let gate_up = gpu.alloc(rows * 2 * mlp_width)?;
         let gated = input_buffer(&gpu, precision, rows, mlp_width)?;
         let padded_rows = rows.next_multiple_of(TILE);
+        let eagle = match eagle {
+            None => None,
+            Some(e) => {
+                ensure!(
+                    config.num_hidden_layers == 1 && st.contains("lm_head.weight"),
+                    "an EAGLE-3 head has one layer and an output projection of its own"
+                );
+                let targets = crate::model::eagle_targets(&st, e.draft_vocab, vocab_size)?;
+                let targets_device = gpu.alloc(targets.len())?;
+                gpu.write_now(targets_device, &targets)?;
+                let hidden_norm = st.load("model.layers.0.hidden_norm.weight", &[dim])?;
+                let hidden_norm_device = gpu.alloc(dim)?;
+                gpu.write_now(hidden_norm_device, &hidden_norm)?;
+                Some(EagleParts {
+                    fc: upload_stacked(
+                        &gpu,
+                        &st,
+                        precision,
+                        &mut num_params,
+                        &[("fc".to_string(), dim)],
+                        3 * dim,
+                        batch_rows,
+                        1.0,
+                        None,
+                    )?,
+                    hidden_norm: hidden_norm_device,
+                    targets: targets_device,
+                    draft_vocab: e.draft_vocab,
+                    hidden_in: gpu.alloc(rows * 3 * dim)?,
+                    hidden_tiles: input_buffer(&gpu, Precision::Bf16, rows, 3 * dim)?,
+                    width: 0,
+                    hidden_host: Vec::new(),
+                    wide: input_buffer(&gpu, Precision::Bf16, rows, 2 * dim)?,
+                    draft_logits: gpu.alloc(rows * e.draft_vocab)?,
+                })
+            }
+        };
         let latent_buffers = match latent {
             Some(l) => Some(LatentBuffers {
                 q_low: match l.q_lora_rank {
@@ -988,6 +1076,10 @@ impl CudaBackend {
                 gated,
                 moe,
                 latent_buffers,
+                eagle,
+                capture: Vec::new(),
+                features_device: Pointer::NULL,
+                features: Vec::new(),
                 logits_device,
                 step_buffer,
                 slot_list_buffer: Growing::default(),
@@ -1964,11 +2056,19 @@ impl CudaBackend {
             Activation::Silu => (self.kernels.swiglu_bf16, self.kernels.swiglu),
             Activation::Gelu => (self.kernels.geglu_bf16, self.kernels.geglu),
         };
+        if let Some(eagle) = &self.eagle {
+            self.eagle_input(eagle, batch)?;
+        }
 
         for (l, layer) in self.layers.iter().enumerate() {
             // Attention block: mix in information from earlier tokens.
-            self.rmsnorm(self.x, self.xb, layer.attn_norm, batch, Pointer::NULL)?;
-            self.matmul(&layer.qkv, self.xb, batch, self.qkv, false)?;
+            match &self.eagle {
+                Some(eagle) => self.matmul(&layer.qkv, eagle.wide, batch, self.qkv, false)?,
+                None => {
+                    self.rmsnorm(self.x, self.xb, layer.attn_norm, batch, Pointer::NULL)?;
+                    self.matmul(&layer.qkv, self.xb, batch, self.qkv, false)?;
+                }
+            }
             if let Some(latent) = &layer.latent {
                 self.latent_attention(layer, latent, batch, step)?;
             } else {
@@ -1997,6 +2097,7 @@ impl CudaBackend {
                 FeedForward::Dense { gate_up, down } => (gate_up, down),
                 FeedForward::Sparse(experts) => {
                     self.experts(experts, batch)?;
+                    self.keep_features(l, batch)?;
                     continue;
                 }
             };
@@ -2024,8 +2125,78 @@ impl CudaBackend {
                 Some((l, 3)),
                 step,
             )?;
+            self.keep_features(l, batch)?;
         }
         Ok(())
+    }
+
+    /// Queue keeping the residual stream after layer `l`, if it's one of those asked for.
+    fn keep_features(&self, l: usize, batch: usize) -> Result<()> {
+        let Some(k) = self.capture.iter().position(|&c| c == l) else {
+            return Ok(());
+        };
+        self.gpu.launch(
+            self.kernels.copy_rows,
+            [batch, 1],
+            &[
+                Arg::Ptr(self.x),
+                Arg::Int(self.dim),
+                Arg::Ptr(self.features_device),
+                Arg::Int(self.capture.len() * self.dim),
+                Arg::Int(k * self.dim),
+            ],
+        )
+    }
+
+    /// Queue an EAGLE head's start (see [`EagleParts`]): with each row's embedding in `x`,
+    /// normalize it into the left half of `wide`, then make the hidden state the residual
+    /// stream (through `fc`, if it's the model's features) and normalize it into the right half.
+    fn eagle_input(&self, eagle: &EagleParts, batch: usize) -> Result<()> {
+        let dim = self.dim;
+        let norm = |x: Pointer, out: Pointer, weight: Pointer| {
+            self.gpu.launch(
+                self.kernels.rmsnorm_bf16,
+                [batch, 1],
+                &[
+                    Arg::Ptr(x),
+                    Arg::Ptr(out),
+                    Arg::Ptr(weight),
+                    Arg::Int(dim),
+                    Arg::Float(self.eps),
+                    Arg::Ptr(Pointer::NULL),
+                    Arg::Int(2 * dim / TILE),
+                    Arg::Int(dim),
+                ],
+            )
+        };
+        norm(self.x, eagle.wide, self.layers[0].attn_norm)?;
+        if eagle.width == 3 * dim {
+            self.gpu.launch(
+                self.kernels.tiles_bf16,
+                [batch, 1],
+                &[
+                    Arg::Ptr(eagle.hidden_in),
+                    Arg::Int(3 * dim),
+                    Arg::Ptr(eagle.hidden_tiles),
+                    Arg::Int(3 * dim / TILE),
+                ],
+            )?;
+            self.matmul(&eagle.fc, eagle.hidden_tiles, batch, self.x, false)?;
+        } else {
+            self.gpu.launch(
+                self.kernels.copy_rows,
+                [batch, 1],
+                &[
+                    Arg::Ptr(eagle.hidden_in),
+                    Arg::Int(dim),
+                    Arg::Ptr(self.x),
+                    Arg::Int(dim),
+                    Arg::Int(0),
+                ],
+            )?;
+        }
+        // Column `dim` of a tile-layout row starts `dim / 16` whole tiles in.
+        norm(self.x, eagle.wide.offset(dim / TILE * TILE * TILE / 2), eagle.hidden_norm)
     }
 
     /// Record the kernels of one forward pass for this batch size.
@@ -2044,7 +2215,11 @@ impl CudaBackend {
         assert!(batch <= self.max_batch, "batch larger than the buffers");
         let step = self.upload_step(rows)?;
         if batch <= MAX_RECORDED_BATCH {
-            let key = (batch, step.any_adapter);
+            let key = (
+                batch,
+                step.any_adapter,
+                self.eagle.as_ref().is_some_and(|e| e.width == 3 * self.dim),
+            );
             if !self.graphs.contains_key(&key) {
                 let graph = self.record_graph(batch, &step)?;
                 self.graphs.insert(key, graph);
@@ -2075,9 +2250,32 @@ impl CudaBackend {
             self.hidden.resize(n_logits * self.dim, 0.0);
             self.gpu.read(self.added, &mut self.hidden)?;
         }
+        if !self.capture.is_empty() {
+            let width = self.capture.len() * self.dim;
+            self.features.resize(batch * width, 0.0);
+            self.gpu.read(self.features_device, &mut self.features)?;
+        }
         if n_logits > 0 {
             self.rmsnorm(self.x, self.xb, self.norm, n_logits, step.logit_rows)?;
-            self.matmul(&self.lm_head, self.xb, n_logits, self.logits_device, false)?;
+            match &self.eagle {
+                None => self.matmul(&self.lm_head, self.xb, n_logits, self.logits_device, false)?,
+                // An EAGLE head's scores go to their tokens' places in the model's vocabulary.
+                Some(eagle) => {
+                    self.matmul(&self.lm_head, self.xb, n_logits, eagle.draft_logits, false)?;
+                    self.gpu.launch_blocks(
+                        self.kernels.scatter_logits,
+                        [n_logits, 1],
+                        SCAN_THREADS,
+                        &[
+                            Arg::Ptr(eagle.draft_logits),
+                            Arg::Int(eagle.draft_vocab),
+                            Arg::Ptr(eagle.targets),
+                            Arg::Ptr(self.logits_device),
+                            Arg::Int(self.vocab_size),
+                        ],
+                    )?;
+                }
+            }
             let (divisor, softcap) = (
                 self.architecture.logit_divisor,
                 self.architecture.logit_softcap,
@@ -3142,6 +3340,53 @@ impl Backend for CudaBackend {
             Precision::Bf16 => TILE,
             Precision::F32 => 1,
         }
+    }
+
+    fn capture_layers(&mut self, layers: &[usize]) -> Result<()> {
+        ensure!(
+            layers.iter().all(|&l| l < self.layers.len()),
+            "there are only {} layers",
+            self.layers.len()
+        );
+        if !self.capture.is_empty() {
+            self.gpu.free(self.features_device)?;
+        }
+        self.capture = layers.to_vec();
+        self.features_device = Pointer::NULL;
+        if !layers.is_empty() {
+            let rows = self.max_batch + PADDING_ROWS;
+            self.features_device = self.gpu.alloc(rows * layers.len() * self.dim)?;
+        }
+        // Recorded kernels don't keep anything.
+        for (_, graph) in self.graphs.drain() {
+            self.gpu.destroy_graph(graph)?;
+        }
+        Ok(())
+    }
+
+    fn features(&self, row: usize) -> &[f32] {
+        let width = self.capture.len() * self.dim;
+        self.features.get(row * width..(row + 1) * width).unwrap_or(&[])
+    }
+
+    fn set_hidden_inputs(&mut self, width: usize, values: &[f32]) -> Result<()> {
+        let dim = self.dim;
+        let Some(eagle) = &mut self.eagle else {
+            bail!("{} isn't an EAGLE head", self.gpu_name);
+        };
+        ensure!(
+            width == dim || width == 3 * dim,
+            "an EAGLE head takes hidden states {dim} or {} wide",
+            3 * dim
+        );
+        ensure!(
+            values.len() <= (self.max_batch + PADDING_ROWS) * width,
+            "too many hidden states"
+        );
+        eagle.width = width;
+        eagle.hidden_host.clear();
+        eagle.hidden_host.extend_from_slice(values);
+        self.gpu.write(eagle.hidden_in, &eagle.hidden_host)
     }
 
     fn add_adapter(&mut self, adapter: &LoraAdapter) -> Result<()> {

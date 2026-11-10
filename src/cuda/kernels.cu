@@ -1918,3 +1918,36 @@ extern "C" __global__ void add_gated(const float *y, const float *gate, int dim,
     for (int i = threadIdx.x; i < dim; i += WARP)
         x[(size_t)row * dim + i] += scale * y[(size_t)row * dim + i];
 }
+
+// ---------------------------------------------------------------------------------------------
+// EAGLE draft heads
+// ---------------------------------------------------------------------------------------------
+
+// One block per row: copy the row's `dim` floats into `out`, whose rows are `stride` apart, at
+// `offset` into the row (keeping a layer's residual stream for an EAGLE head, say).
+extern "C" __global__ void copy_rows(const float *x, int dim, float *out, int stride, int offset) {
+    const int row = blockIdx.x;
+    for (int i = threadIdx.x; i < dim; i += WARP)
+        out[(size_t)row * stride + offset + i] = x[(size_t)row * dim + i];
+}
+
+// One block per row: x's row, `cols` floats, as bfloat16 in its place in a tile-layout matrix.
+extern "C" __global__ void tiles_bf16(const float *x, int cols, __nv_bfloat16 *out, int chunks) {
+    const int row = blockIdx.x;
+    for (int i = threadIdx.x; i < cols; i += WARP)
+        out[tile_index(row, i, chunks)] = __float2bfloat16(x[(size_t)row * cols + i]);
+}
+
+// One block per row: an EAGLE head's scores for its own vocabulary, put in their tokens' places
+// in the model's (`targets[i]` for score i), and -infinity for the tokens it doesn't have.
+extern "C" __global__ void scatter_logits(const float *draft, int draft_vocab,
+                                          const unsigned *targets, float *logits, int vocab) {
+    const int row = blockIdx.x;
+    float *to = logits + (size_t)row * vocab;
+    for (int i = threadIdx.x; i < vocab; i += blockDim.x)
+        to[i] = -INFINITY;
+    __syncthreads();
+    const float *from = draft + (size_t)row * draft_vocab;
+    for (int i = threadIdx.x; i < draft_vocab; i += blockDim.x)
+        to[targets[i]] = from[i];
+}

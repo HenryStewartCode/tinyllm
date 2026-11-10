@@ -75,6 +75,9 @@ pub struct Speculative {
     /// The most guessed tokens to check in one step, over all sequences. Once a batch is big
     /// enough, checking guesses that turn out wrong costs real time.
     pub max_draft_rows: usize,
+    /// The draft model is an EAGLE-3 head, which guesses from the model's own hidden states
+    /// (kept for it with [`Backend::capture_layers`]) rather than from the tokens alone.
+    pub eagle: bool,
 }
 
 #[derive(Clone)]
@@ -362,8 +365,13 @@ struct Sequence {
     tokens: Vec<u32>,
     /// KV slots for `tokens[..slots.len()]`. The rest haven't been through the model yet.
     slots: Vec<u32>,
-    /// How many of those the draft model has been through too (at most `slots.len()`).
+    /// How many of those the draft model has been through too (at most `slots.len()`). For an
+    /// EAGLE head, position `p` is the model's features there and the token at `p + 1`.
     draft_len: usize,
+    /// For an EAGLE head: the model's features for each position from `draft_len` on that it
+    /// hasn't been through yet, `feature_width` a position.
+    features: Vec<f32>,
+    feature_width: usize,
     /// The sequence's place in the prefix cache, which keeps its shared slots from being evicted.
     pinned: Option<NodeId>,
     /// How many of `tokens` the prefix cache has been told about.
@@ -619,6 +627,8 @@ impl Engine {
             tokens,
             slots: Vec::new(),
             draft_len: 0,
+            features: Vec::new(),
+            feature_width: 0,
             pinned: None,
             prompt_len,
             prompt_committed: false,
@@ -693,6 +703,9 @@ impl Engine {
             .fetch_add(forward_start.elapsed().as_micros() as u64, Relaxed);
         let row_count = rows.len();
         drop(rows);
+        if self.eagle() {
+            self.keep_features();
+        }
 
         self.sample();
         self.advance();
@@ -703,6 +716,35 @@ impl Engine {
             .step_micros
             .fetch_add(start.elapsed().as_micros() as u64, Relaxed);
         self.update_gauges();
+    }
+
+    /// Whether the draft model is an EAGLE head.
+    fn eagle(&self) -> bool {
+        self.draft.is_some() && self.config.speculative.is_some_and(|s| s.eagle)
+    }
+
+    /// For an EAGLE head: keep the model's features from this step's rows, for the head to go
+    /// through when it next guesses. They line up with positions from `draft_len`; if they
+    /// wouldn't (the head missed some), it starts again from here.
+    fn keep_features(&mut self) {
+        let width = self.backend.features(0).len();
+        if width == 0 {
+            return;
+        }
+        let mut row = 0;
+        for seq in &mut self.active {
+            let first = seq.slots.len() - seq.take;
+            let held = seq.features.len() / width;
+            if seq.feature_width != width || seq.draft_len + held != first {
+                seq.features.clear();
+                seq.feature_width = width;
+                seq.draft_len = first;
+            }
+            for _ in 0..seq.take {
+                seq.features.extend_from_slice(self.backend.features(row));
+                row += 1;
+            }
+        }
     }
 
     fn update_gauges(&self) {
@@ -777,6 +819,12 @@ impl Engine {
                 .cache
                 .acquire(adapter, &seq.tokens[..cacheable], &mut seq.slots);
             seq.pinned = Some(pinned);
+            // An EAGLE head can't go back over a cached prefix, which needs the model's
+            // features, but it went through those same slots when they were computed.
+            if self.config.speculative.is_some_and(|s| s.eagle) {
+                seq.draft_len = seq.slots.len();
+                seq.features.clear();
+            }
             if seq.cached_tokens.is_none() {
                 seq.cached_tokens = Some(seq.slots.len());
                 self.stats
@@ -868,6 +916,7 @@ impl Engine {
             self.retire(&mut seq);
             seq.slots.clear();
             seq.draft_len = 0;
+            seq.features.clear();
             seq.prompt_committed = false;
             self.stats.retractions.fetch_add(1, Relaxed);
             self.waiting.push_front(seq);
@@ -936,7 +985,8 @@ impl Engine {
                 if !seq.prompt_committed {
                     // The prompt is done, so other requests can start using it.
                     seq.prompt_committed = true;
-                    Self::commit_into(&mut self.cache, seq);
+                    let eagle = self.config.speculative.is_some_and(|s| s.eagle);
+                    Self::commit_into(&mut self.cache, seq, eagle);
                 }
                 finished = match (seq.params.embed, seq.draft) {
                     (true, _) => {
@@ -977,14 +1027,17 @@ impl Engine {
             return;
         };
         let decoding = self.active.iter().filter(|s| s.is_decoding()).count();
-        if decoding == 0 {
-            return;
-        }
         let per_sequence = speculative
             .draft_tokens
-            .min(speculative.max_draft_rows / decoding);
-        if per_sequence == 0 {
+            .min(speculative.max_draft_rows / decoding.max(1));
+        if self.eagle() {
+            return self.propose_with_eagle(per_sequence * (decoding > 0) as usize);
+        }
+        if decoding == 0 || per_sequence == 0 {
             return;
+        }
+        if self.eagle() {
+            return self.propose_with_eagle(per_sequence);
         }
         if self.draft.is_some() {
             return self.propose_with_draft(per_sequence);
@@ -1148,6 +1201,185 @@ impl Engine {
         }
     }
 
+    /// Guess up to `per_sequence` tokens ahead for each sequence that's generating, with an EAGLE
+    /// head. First the head goes through the positions the model has been through since it last
+    /// ran, every sequence's, each with the model's features there and the token after it; for
+    /// a sequence that's to guess, the last of those (its newest token) gives the first guess.
+    /// Then each further guess comes from the head's own output for the guess before, in slots
+    /// borrowed for the purpose, as with a draft model, and is sampled exactly as the model
+    /// will sample that position.
+    fn propose_with_eagle(&mut self, per_sequence: usize) {
+        let limit = self.config.ctx_size.min(self.config.cache_tokens);
+        // How many guesses each sequence makes.
+        let wants: Vec<usize> = (self.active.iter())
+            .map(|seq| {
+                let ready = seq.draft == 0
+                    && seq.pending() == 1
+                    && seq.can_speculate()
+                    && seq.draft_len + seq.features.len() / seq.feature_width.max(1)
+                        == seq.slots.len()
+                    && !seq.features.is_empty();
+                match ready {
+                    false => 0,
+                    true => (seq.params.max_tokens.saturating_sub(seq.generated + 1))
+                        .min(limit.saturating_sub(seq.tokens.len() + 1))
+                        .min(per_sequence),
+                }
+            })
+            .collect();
+        let draft = self.draft.as_mut().expect("checked by the caller");
+        let dim = self.active.iter().map(|s| s.feature_width).max().unwrap_or(0) / 3;
+        // The head's output for each guessing sequence's last row, for its next guess.
+        let mut outputs: Vec<Vec<f32>> = vec![Vec::new(); self.active.len()];
+
+        // Go through what's new, a batch at a time.
+        let budget = self.config.max_batch.max(1);
+        let mut hidden = Vec::new();
+        loop {
+            let mut rows = Vec::new();
+            let mut taken = Vec::new();
+            hidden.clear();
+            for (i, seq) in self.active.iter().enumerate() {
+                let width = seq.feature_width;
+                if width == 0 || seq.features.is_empty() {
+                    continue;
+                }
+                let held = seq.features.len() / width;
+                // A position's pair needs the token after it.
+                let usable = held.min((seq.tokens.len() - 1).saturating_sub(seq.draft_len));
+                let count = usable.min(budget.saturating_sub(rows.len()));
+                if count == 0 {
+                    continue;
+                }
+                for offset in 0..count {
+                    let position = seq.draft_len + offset;
+                    let last = wants[i] > 0 && position + 1 == seq.slots.len();
+                    rows.push(Row {
+                        token: seq.tokens[position + 1],
+                        slots: &seq.slots[..=position],
+                        want_logits: last,
+                        sampling: seq.sampler.logit_use(seq.generated),
+                        adapter: 0,
+                    });
+                }
+                hidden.extend_from_slice(&seq.features[..count * width]);
+                taken.push((i, count, rows.len() - 1));
+            }
+            if rows.is_empty() {
+                break;
+            }
+            let width = 3 * dim;
+            let ran = draft.set_hidden_inputs(width, &hidden).is_ok();
+            if ran {
+                draft.forward(&rows);
+            }
+            drop(rows);
+            let mut logit_row = 0;
+            for (i, count, last_row) in taken {
+                let seq = &mut self.active[i];
+                let width = seq.feature_width;
+                seq.features.drain(..count * width);
+                seq.draft_len += count;
+                if ran && wants[i] > 0 && seq.draft_len == seq.slots.len() {
+                    let logits = draft.logits(logit_row);
+                    logit_row += 1;
+                    let guess = seq.sampler.sample(logits, &seq.tokens, seq.generated, None);
+                    seq.tokens.push(guess);
+                    seq.draft += 1;
+                    outputs[i] = draft.features(last_row).to_vec();
+                }
+            }
+            if !ran {
+                return;
+            }
+        }
+
+        // Borrow slots for the guesses after the first, page by page as the sequence would use
+        // them: the head's guess from its output at position p is for position p + 2.
+        let page_size = self.cache.page_size();
+        let mut borrowed: Vec<(usize, Vec<u32>)> = Vec::new();
+        let mut new_pages = Vec::new();
+        for (i, seq) in self.active.iter().enumerate() {
+            let more = wants[i].saturating_sub(1);
+            if seq.draft == 0 || more == 0 || outputs[i].is_empty() {
+                continue;
+            }
+            let first = seq.slots.len();
+            let pages = (first + more).div_ceil(page_size) - first.div_ceil(page_size);
+            new_pages.clear();
+            if !self.cache.allocate(pages, &mut new_pages) {
+                continue;
+            }
+            let mut fresh = new_pages.iter().copied();
+            let mut slots = Vec::with_capacity(more);
+            for position in first..first + more {
+                let page = match position % page_size {
+                    0 => fresh.next().expect("counted above"),
+                    _ => match slots.last() {
+                        Some(&slot) => slot / page_size as u32,
+                        None => seq.slots[position - 1] / page_size as u32,
+                    },
+                };
+                slots.push(page * page_size as u32 + (position % page_size) as u32);
+            }
+            borrowed.push((i, slots));
+        }
+
+        // Each further guess in turn.
+        let longest = borrowed.iter().map(|(_, s)| s.len()).max().unwrap_or(0);
+        let mut lists: Vec<Vec<u32>> = Vec::new();
+        for round in 0..longest {
+            lists.clear();
+            hidden.clear();
+            let going: Vec<usize> = (0..borrowed.len())
+                .filter(|&b| round < borrowed[b].1.len())
+                .collect();
+            for &b in &going {
+                let (i, slots) = &borrowed[b];
+                let mut list = self.active[*i].slots.clone();
+                list.extend_from_slice(&slots[..=round]);
+                lists.push(list);
+                hidden.extend_from_slice(&outputs[*i]);
+            }
+            let rows: Vec<Row> = (going.iter().zip(&lists))
+                .map(|(&b, list)| {
+                    let seq = &self.active[borrowed[b].0];
+                    Row {
+                        token: *seq.tokens.last().expect("a sequence has tokens"),
+                        slots: list,
+                        want_logits: true,
+                        sampling: seq.sampler.logit_use(seq.generated + round + 1),
+                        adapter: 0,
+                    }
+                })
+                .collect();
+            if draft.set_hidden_inputs(dim, &hidden).is_err() {
+                break;
+            }
+            draft.forward(&rows);
+            drop(rows);
+            for (row, &b) in going.iter().enumerate() {
+                let i = borrowed[b].0;
+                let seq = &mut self.active[i];
+                let logits = draft.logits(row);
+                let guess = (seq.sampler).sample(logits, &seq.tokens, seq.generated + round + 1, None);
+                seq.tokens.push(guess);
+                seq.draft += 1;
+                outputs[i] = draft.features(row).to_vec();
+            }
+        }
+
+        // Give the borrowed slots back: the model gets its own when it checks the guesses.
+        for (i, slots) in borrowed {
+            let first = self.active[i].slots.len();
+            for (offset, slot) in slots.iter().enumerate() {
+                if (first + offset).is_multiple_of(page_size) {
+                    self.cache.free_page(slot / page_size as u32);
+                }
+            }
+        }
+    }
+
     /// Take the guesses that were right, then the token sampled after them, and forget the rest.
     fn accept_guesses(&mut self, index: usize) -> Option<FinishReason> {
         let seq = &mut self.active[index];
@@ -1191,6 +1423,8 @@ impl Engine {
         }
         seq.slots.truncate(keep);
         seq.draft_len = seq.draft_len.min(keep);
+        let kept = keep - seq.draft_len;
+        seq.features.truncate(kept * seq.feature_width);
     }
 
     /// Add the sampled token to its sequence. Returns why the sequence ended, if it has.
@@ -1301,7 +1535,7 @@ impl Engine {
 
     /// Hand what a sequence has computed to the prefix cache, and let go of what it held.
     fn retire(&mut self, seq: &mut Sequence) {
-        Self::commit_into(&mut self.cache, seq);
+        Self::commit_into(&mut self.cache, seq, false);
         if let Some(pinned) = seq.pinned.take() {
             self.cache.release(pinned);
         }
@@ -1314,10 +1548,14 @@ impl Engine {
     }
 
     /// Give the sequence's computed tokens to the prefix cache, as far as whole pages go.
-    fn commit_into(cache: &mut PrefixCache, seq: &mut Sequence) {
+    fn commit_into(cache: &mut PrefixCache, seq: &mut Sequence, eagle: bool) {
         // Committing can swap the sequence's slots for shared ones, which the draft model may
         // not have been through, so it starts again (going over the same tokens is harmless).
-        seq.draft_len = 0;
+        // An EAGLE head can't, without the model's features, but it went through the shared
+        // slots when they were computed, for the same tokens.
+        if !eagle {
+            seq.draft_len = 0;
+        }
         if let Some(pinned) = seq.pinned {
             let whole = seq.slots.len() - seq.slots.len() % cache.page_size();
             let adapter = seq.params.adapter;

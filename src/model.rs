@@ -28,7 +28,7 @@ use crate::ops::{
 };
 use crate::pool::Pool;
 use crate::safetensors::SafeTensors;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -544,6 +544,19 @@ pub struct Model {
     vocab_size: usize,
     /// LoRA adapters, which rows ask for by number: the first is 1.
     adapters: Vec<Adapter>,
+    /// What an EAGLE-3 draft head has that a model doesn't, if this is one.
+    eagle: Option<EagleHead>,
+}
+
+/// An EAGLE-3 draft head's own parts (see [`crate::config::Eagle3`]). Its one layer is
+/// `layers[0]`, whose `attn_norm` normalizes the token's embedding.
+struct EagleHead {
+    /// Folds the model's captured residual streams (`3 * dim`) into one hidden state.
+    fc: Linear,
+    /// Normalizes the hidden state before it joins the embedding.
+    hidden_norm: Vec<f32>,
+    /// The model's token id for each of the head's output rows.
+    targets: Vec<u32>,
 }
 
 /// A LoRA adapter's corrections, as matrices: for each layer and module, `A` and `B` (with the
@@ -563,6 +576,22 @@ struct Latent {
     kv_a_norm: Vec<f32>,
     /// `kv_b_proj`: each head's unrotated key and its value, `[heads * (nope + v), kv_lora_rank]`.
     kv_b: Linear,
+}
+
+/// The model token id of each of an EAGLE-3 head's `draft_vocab` output rows: row `i` is token
+/// `i + d2t[i]`.
+pub fn eagle_targets(st: &SafeTensors, draft_vocab: usize, vocab: usize) -> Result<Vec<u32>> {
+    let offsets = st.load_i64("d2t", &[draft_vocab])?;
+    (offsets.iter().enumerate())
+        .map(|(i, &offset)| {
+            let target = i as i64 + offset;
+            ensure!(
+                (0..vocab as i64).contains(&target),
+                "the EAGLE head's token {i} maps to {target}, outside the vocabulary"
+            );
+            Ok(target as u32)
+        })
+        .collect()
 }
 
 /// Rotate adjacent pairs `(x[2i], x[2i + 1])` of `x` by RoPE's angle `i`, as DeepSeek lays them out.
@@ -641,6 +670,19 @@ pub struct Workspace {
     moe: MoeBuffers,
     lora: LoraBuffers,
     latent: LatentBuffers,
+    /// The layers whose output (the residual stream after them) `forward` keeps for every
+    /// row, and what it kept: `[batch, capture.len() * dim]`.
+    capture: Vec<usize>,
+    features: Vec<f32>,
+    /// For an EAGLE head, the hidden state each row starts from, `hidden_width` a row.
+    hidden_in: Vec<f32>,
+    hidden_width: usize,
+    /// For an EAGLE head: the layer's input (the normalized embeddings next to the normalized
+    /// hidden states, `[batch, 2 * dim]`), the two halves on their way, and the scores for its
+    /// own vocabulary.
+    wide: Vec<f32>,
+    halves: (Vec<f32>, Vec<f32>),
+    draft_logits: Vec<f32>,
 }
 
 /// Working memory for LoRA corrections.
@@ -689,7 +731,32 @@ impl Workspace {
             moe: MoeBuffers::default(),
             lora: LoraBuffers::default(),
             latent: LatentBuffers::default(),
+            capture: Vec::new(),
+            features: Vec::new(),
+            hidden_in: Vec::new(),
+            hidden_width: 0,
+            wide: Vec::new(),
+            halves: (Vec::new(), Vec::new()),
+            draft_logits: Vec::new(),
         }
+    }
+
+    /// Keep the residual stream after each of `layers`, for every row, from now on.
+    pub fn capture_layers(&mut self, layers: &[usize]) {
+        self.capture = layers.to_vec();
+    }
+
+    /// What was kept for row `r` of the last batch (see [`Workspace::capture_layers`]).
+    pub fn features(&self, r: usize) -> &[f32] {
+        let width = self.capture.len() * self.dim;
+        self.features.get(r * width..(r + 1) * width).unwrap_or(&[])
+    }
+
+    /// For an EAGLE head, the hidden state each row of the next batch starts from.
+    pub fn set_hidden_inputs(&mut self, width: usize, values: &[f32]) {
+        self.hidden_width = width;
+        self.hidden_in.clear();
+        self.hidden_in.extend_from_slice(values);
     }
 
     pub fn pool(&self) -> &Pool {
@@ -710,12 +777,23 @@ impl Workspace {
 impl Model {
     /// Load `config.json` and the safetensors weights from a Hugging Face model directory.
     pub fn load(dir: &Path) -> Result<Self> {
+        Self::load_with(dir, None)
+    }
+
+    /// `load`, taking weights this checkpoint doesn't have (an EAGLE head's embeddings) from
+    /// the one in `fallback`.
+    pub fn load_with(dir: &Path, fallback: Option<&Path>) -> Result<Self> {
         let config = Config::load(dir)?;
-        let st = SafeTensors::open(dir)?;
+        let st = SafeTensors::open_with(dir, fallback)?;
 
         let dim = config.hidden_size;
         let n_heads = config.num_attention_heads;
         let architecture = config.architecture()?;
+        // An EAGLE head's attention reads the embedding and the hidden state side by side.
+        let attn_in = match architecture.eagle3 {
+            Some(_) => 2 * dim,
+            None => dim,
+        };
         let latent = architecture.latent;
         // Latent attention has a key and value for every head.
         let n_kv_heads = match latent {
@@ -788,9 +866,9 @@ impl Model {
             } else {
                 // Layers with a mixture of experts have no MLP of their own.
                 (
-                    Linear::load(&st, &format!("{attn}.q_proj"), q_dim, dim)?,
-                    Linear::load(&st, &format!("{attn}.k_proj"), kv_dim, dim)?,
-                    Linear::load(&st, &format!("{attn}.v_proj"), kv_dim, dim)?,
+                    Linear::load(&st, &format!("{attn}.q_proj"), q_dim, attn_in)?,
+                    Linear::load(&st, &format!("{attn}.k_proj"), kv_dim, attn_in)?,
+                    Linear::load(&st, &format!("{attn}.v_proj"), kv_dim, attn_in)?,
                     dense("gate_proj")?,
                     dense("up_proj")?,
                 )
@@ -922,10 +1000,24 @@ impl Model {
 
         let embed_tokens = Linear::load(&st, "model.embed_tokens", vocab_size, dim)?;
         let norm = load_norm("model.norm.weight", dim)?;
+        // An EAGLE head scores its own, smaller, vocabulary.
+        let out_rows = architecture.eagle3.map_or(vocab_size, |e| e.draft_vocab);
         let lm_head = match st.contains("lm_head.weight") {
-            true => Some(Linear::load(&st, "lm_head", vocab_size, dim)?),
+            true => Some(Linear::load(&st, "lm_head", out_rows, dim)?),
             false => None, // tied embeddings
         };
+        let eagle = match architecture.eagle3 {
+            None => None,
+            Some(e) => Some(EagleHead {
+                fc: Linear::load(&st, "fc", dim, 3 * dim)?,
+                hidden_norm: load_norm("model.layers.0.hidden_norm.weight", dim)?,
+                targets: eagle_targets(&st, e.draft_vocab, vocab_size)?,
+            }),
+        };
+        ensure!(
+            eagle.is_none() || (config.num_hidden_layers == 1 && lm_head.is_some()),
+            "an EAGLE-3 head has one layer and an output projection of its own"
+        );
 
         Ok(Self {
             config,
@@ -944,6 +1036,7 @@ impl Model {
             hidden_dim,
             vocab_size,
             adapters: Vec::new(),
+            eagle,
         })
     }
 
@@ -1286,9 +1379,42 @@ impl Model {
             }
         }
 
+        // An EAGLE head's residual stream starts from the hidden state it's given (folded into
+        // one by `fc` if it's its model's captured features), and its layer reads that next to
+        // the embedding, each normalized.
+        if let Some(eagle) = &self.eagle {
+            let width = ws.hidden_width;
+            assert_eq!(ws.hidden_in.len(), batch * width, "an EAGLE head needs hidden states");
+            let (left, right) = &mut ws.halves;
+            left.resize(batch * dim, 0.0);
+            right.resize(batch * dim, 0.0);
+            rmsnorm(pool, left, &ws.x, &self.layers[0].attn_norm, eps);
+            match width == 3 * dim {
+                true => eagle.fc.forward(pool, &mut ws.x, &mut ws.scratch, &ws.hidden_in),
+                false => {
+                    assert_eq!(width, dim, "an EAGLE head's hidden states are 1 or 3 wide");
+                    ws.x.copy_from_slice(&ws.hidden_in);
+                }
+            }
+            rmsnorm(pool, right, &ws.x, &eagle.hidden_norm, eps);
+            ws.wide.clear();
+            for r in 0..batch {
+                ws.wide.extend_from_slice(&left[r * dim..(r + 1) * dim]);
+                ws.wide.extend_from_slice(&right[r * dim..(r + 1) * dim]);
+            }
+        }
+        let captured = ws.capture.len();
+        ws.features.resize(batch * captured * dim, 0.0);
+
         for (l, layer) in self.layers.iter().enumerate() {
             // Attention block: mix in information from earlier tokens.
-            rmsnorm(pool, &mut ws.xb, &ws.x, &layer.attn_norm, eps);
+            let attn_input = match self.eagle {
+                Some(_) => &ws.wide,
+                None => {
+                    rmsnorm(pool, &mut ws.xb, &ws.x, &layer.attn_norm, eps);
+                    &ws.xb
+                }
+            };
             let table = layer.rope_table * batch * half..(layer.rope_table + 1) * batch * half;
             if let Some(latent) = &layer.latent {
                 self.latent_qkv(
@@ -1304,13 +1430,13 @@ impl Model {
             } else {
                 layer
                     .q_proj
-                    .forward(pool, &mut ws.q, &mut ws.scratch, &ws.xb);
+                    .forward(pool, &mut ws.q, &mut ws.scratch, attn_input);
                 layer
                     .k_proj
-                    .forward(pool, &mut ws.k, &mut ws.scratch, &ws.xb);
+                    .forward(pool, &mut ws.k, &mut ws.scratch, attn_input);
                 layer
                     .v_proj
-                    .forward(pool, &mut ws.v, &mut ws.scratch, &ws.xb);
+                    .forward(pool, &mut ws.v, &mut ws.scratch, attn_input);
                 if !self.adapters.is_empty() {
                     for (module, out) in [
                         (Module::Q, &mut ws.q),
@@ -1415,6 +1541,12 @@ impl Model {
                 None => &ws.xb,
             };
             add_rows(pool, &mut ws.x, added, dim);
+            if let Some(k) = ws.capture.iter().position(|&c| c == l) {
+                for r in 0..batch {
+                    let at = (r * captured + k) * dim;
+                    ws.features[at..at + dim].copy_from_slice(&ws.x[r * dim..(r + 1) * dim]);
+                }
+            }
         }
 
         // Only some rows need the output projection, which is by far the largest matrix.
@@ -1445,13 +1577,28 @@ impl Model {
             // A batch of nothing but embeddings needs no scores.
             if wanted().any(|r| r.sampling != LogitUse::Hidden) {
                 let lm_head = self.lm_head.as_ref().unwrap_or(&self.embed_tokens);
-                lm_head.forward(
-                    pool,
-                    &mut ws.logits,
-                    &mut ws.scratch,
-                    &ws.xb[..n_logits * dim],
-                );
-                self.finish_logits(pool, &mut ws.logits);
+                let Some(eagle) = &self.eagle else {
+                    lm_head.forward(
+                        pool,
+                        &mut ws.logits,
+                        &mut ws.scratch,
+                        &ws.xb[..n_logits * dim],
+                    );
+                    return self.finish_logits(pool, &mut ws.logits);
+                };
+                // An EAGLE head's scores go to their tokens' places in the model's vocabulary;
+                // the tokens it doesn't have can't come out.
+                let draft = eagle.targets.len();
+                ws.draft_logits.resize(n_logits * draft, 0.0);
+                let input = &ws.xb[..n_logits * dim];
+                lm_head.forward(pool, &mut ws.draft_logits, &mut ws.scratch, input);
+                ws.logits.fill(f32::NEG_INFINITY);
+                for r in 0..n_logits {
+                    let to = &mut ws.logits[r * self.vocab_size..(r + 1) * self.vocab_size];
+                    for (i, &target) in eagle.targets.iter().enumerate() {
+                        to[target as usize] = ws.draft_logits[r * draft + i];
+                    }
+                }
             }
         }
     }

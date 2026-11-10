@@ -44,6 +44,25 @@ pub trait Backend: Send {
     fn add_adapter(&mut self, _adapter: &LoraAdapter) -> Result<()> {
         bail!("{} can't run LoRA adapters yet", self.describe())
     }
+
+    /// From now on, keep each row's residual stream after each of `layers` in every `forward`,
+    /// for [`Backend::features`]: the hidden states an EAGLE head guesses from.
+    fn capture_layers(&mut self, _layers: &[usize]) -> Result<()> {
+        bail!("{} can't keep hidden states yet", self.describe())
+    }
+
+    /// What was kept for row `row` in the last `forward` (counting every row, not only those
+    /// that wanted logits): the residual stream after each layer asked for, one after another.
+    fn features(&self, _row: usize) -> &[f32] {
+        &[]
+    }
+
+    /// For an EAGLE-3 head: the hidden state each row of the next `forward` starts from,
+    /// `width` floats a row. That's its model's kept features (`3 * dim`), which the head folds
+    /// into one, or the head's own features (`dim`) from the row for the position before.
+    fn set_hidden_inputs(&mut self, _width: usize, _values: &[f32]) -> Result<()> {
+        bail!("{} isn't an EAGLE head", self.describe())
+    }
 }
 
 /// Scores for the next token.
@@ -72,7 +91,18 @@ pub struct CpuBackend {
 
 impl CpuBackend {
     pub fn load(dir: &Path, threads: usize, cache_bytes: usize) -> Result<LoadedModel<Self>> {
-        let model = Model::load(dir)?;
+        Self::load_with(dir, None, threads, cache_bytes)
+    }
+
+    /// `load`, taking weights the checkpoint doesn't have (an EAGLE head's embeddings) from the
+    /// one in `fallback`.
+    pub fn load_with(
+        dir: &Path,
+        fallback: Option<&Path>,
+        threads: usize,
+        cache_bytes: usize,
+    ) -> Result<LoadedModel<Self>> {
+        let model = Model::load_with(dir, fallback)?;
         let capacity = (cache_bytes / model.kv_bytes_per_token()).max(16);
         Ok(LoadedModel {
             config: model.config.clone(),
@@ -114,5 +144,19 @@ impl Backend for CpuBackend {
 
     fn add_adapter(&mut self, adapter: &LoraAdapter) -> Result<()> {
         self.model.add_adapter(adapter)
+    }
+
+    fn capture_layers(&mut self, layers: &[usize]) -> Result<()> {
+        self.workspace.capture_layers(layers);
+        Ok(())
+    }
+
+    fn features(&self, row: usize) -> &[f32] {
+        self.workspace.features(row)
+    }
+
+    fn set_hidden_inputs(&mut self, width: usize, values: &[f32]) -> Result<()> {
+        self.workspace.set_hidden_inputs(width, values);
+        Ok(())
     }
 }

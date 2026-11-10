@@ -1,6 +1,6 @@
 //! Command-line front end: load a model directory, then complete a prompt, chat, or serve.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, ValueEnum};
 use serde_json::Value;
 use std::io::{BufRead, Write};
@@ -78,6 +78,10 @@ enum SpeculativeArg {
     /// Guess with a smaller model that shares the tokenizer, given by
     /// --speculative-draft-model-path (SGLang's STANDALONE)
     Standalone,
+    /// Guess with an EAGLE-3 head trained for the model, given by
+    /// --speculative-draft-model-path: one layer that reads the model's own hidden states
+    #[value(alias = "EAGLE3")]
+    Eagle3,
 }
 
 /// The order waiting requests start in.
@@ -220,8 +224,8 @@ struct Args {
     #[arg(long, default_value_t = 6)]
     speculative_num_draft_tokens: usize,
 
-    /// The smaller model that guesses ahead for --speculative-algorithm standalone. It needs the
-    /// same tokenizer as the model
+    /// The smaller model that guesses ahead for --speculative-algorithm standalone (it needs the
+    /// same tokenizer as the model), or the EAGLE-3 head for --speculative-algorithm eagle3
     #[arg(long)]
     speculative_draft_model_path: Option<PathBuf>,
 
@@ -266,7 +270,11 @@ fn main() -> Result<()> {
         .batch_size
         .unwrap_or(if on_gpu { 512 } else { 64 })
         .max(1);
-    let standalone = args.speculative_algorithm == SpeculativeArg::Standalone;
+    let standalone = matches!(
+        args.speculative_algorithm,
+        SpeculativeArg::Standalone | SpeculativeArg::Eagle3
+    );
+    let eagle = args.speculative_algorithm == SpeculativeArg::Eagle3;
     // On an NVIDIA GPU the cache takes what's left unless told otherwise, which would leave
     // nothing for a draft model's.
     let cache_bytes = match (args.cache_mb, standalone && device == Device::Cuda) {
@@ -305,6 +313,7 @@ fn main() -> Result<()> {
             max_batch: batch_size.max(parallel + 8),
             cache_bytes,
             host_threads: threads,
+            weights_from: None,
         };
         match CudaBackend::load(&args.model, &options) {
             Ok(LoadedModel {
@@ -321,6 +330,7 @@ fn main() -> Result<()> {
         let options = metal::Options {
             cache_bytes: cache_bytes.unwrap_or_else(|| default_cache_mb() << 20),
             host_threads: threads,
+            weights_from: None,
         };
         match MetalBackend::load(&args.model, &options) {
             Ok(LoadedModel {
@@ -370,11 +380,14 @@ fn main() -> Result<()> {
         ctx_size: args.ctx_size.unwrap_or(config.max_position_embeddings),
         speculative: match args.speculative_algorithm {
             SpeculativeArg::None => None,
-            SpeculativeArg::Ngram | SpeculativeArg::Standalone => Some(Speculative {
-                draft_tokens: args.speculative_num_draft_tokens,
-                // Past this many rows a batch stops being nearly free.
-                max_draft_rows: if device == Device::Cuda { 64 } else { 16 },
-            }),
+            SpeculativeArg::Ngram | SpeculativeArg::Standalone | SpeculativeArg::Eagle3 => {
+                Some(Speculative {
+                    draft_tokens: args.speculative_num_draft_tokens,
+                    // Past this many rows a batch stops being nearly free.
+                    max_draft_rows: if device == Device::Cuda { 64 } else { 16 },
+                    eagle,
+                })
+            }
         },
         schedule: match args.schedule_policy {
             ScheduleArg::Fcfs => SchedulePolicy::Fcfs,
@@ -384,14 +397,15 @@ fn main() -> Result<()> {
     let draft = match (standalone, &args.speculative_draft_model_path) {
         (true, Some(path)) => Some(load_draft(
             path,
-            &*backend,
+            &mut *backend,
+            &config,
             &tokenizer,
             &args,
             threads,
             batch_size.max(parallel + 8),
         )?),
         (true, None) => {
-            bail!("--speculative-algorithm standalone needs --speculative-draft-model-path")
+            bail!("--speculative-algorithm standalone and eagle3 need --speculative-draft-model-path")
         }
         (false, _) => None,
     };
@@ -508,25 +522,44 @@ fn main() -> Result<()> {
 }
 
 /// Load the draft model for speculative decoding on the same kind of device as the model, with a
-/// cache that has every slot the model's does (the two keep a token in the same slot).
+/// cache that has every slot the model's does (the two keep a token in the same slot). For an
+/// EAGLE-3 head, which borrows the model's embeddings and reads its hidden states, also tell the
+/// model which of those to keep.
 fn load_draft(
     path: &std::path::Path,
-    model: &dyn Backend,
+    model: &mut dyn Backend,
+    model_config: &Config,
     tokenizer: &Tokenizer,
     args: &Args,
     threads: usize,
     max_batch: usize,
 ) -> Result<Box<dyn Backend>> {
     let config = Config::load(path)?;
-    let draft_tokenizer = Tokenizer::load(path)?;
-    let sample =
-        "Hello, world! The quick brown fox jumps over the lazy dog. 1234 ½ 你好 <|im_end|>";
-    if draft_tokenizer.encode(sample, true) != tokenizer.encode(sample, true) {
-        bail!(
-            "the draft model {} needs the same tokenizer as the model",
+    let eagle = args.speculative_algorithm == SpeculativeArg::Eagle3;
+    if eagle {
+        ensure!(
+            config.architecture()?.eagle3.is_some(),
+            "{} isn't an EAGLE-3 head",
             path.display()
         );
+        ensure!(
+            config.hidden_size == model_config.hidden_size
+                && config.vocab_size == model_config.vocab_size,
+            "the EAGLE head {} wasn't made for this model (its sizes differ)",
+            path.display()
+        );
+    } else {
+        let draft_tokenizer = Tokenizer::load(path)?;
+        let sample =
+            "Hello, world! The quick brown fox jumps over the lazy dog. 1234 ½ 你好 <|im_end|>";
+        if draft_tokenizer.encode(sample, true) != tokenizer.encode(sample, true) {
+            bail!(
+                "the draft model {} needs the same tokenizer as the model",
+                path.display()
+            );
+        }
     }
+    let weights_from = eagle.then(|| args.model.clone());
     let described = model.describe();
     let (on_cuda, on_metal) = (described.contains("(CUDA"), described.contains("(Metal"));
     let element = match (on_cuda, args.precision) {
@@ -547,26 +580,42 @@ fn load_draft(
             max_batch,
             cache_bytes: Some(cache_bytes),
             host_threads: threads,
+            weights_from: weights_from.clone(),
         };
         Box::new(CudaBackend::load(path, &options)?.backend)
     } else if on_metal {
         let options = metal::Options {
             cache_bytes,
             host_threads: threads,
+            weights_from: weights_from.clone(),
         };
         Box::new(MetalBackend::load(path, &options)?.backend)
     } else {
-        Box::new(CpuBackend::load(path, threads, cache_bytes)?.backend)
+        let fallback = weights_from.as_deref();
+        Box::new(CpuBackend::load_with(path, fallback, threads, cache_bytes)?.backend)
     };
+    let mut draft = draft;
+    if eagle {
+        let layers = config.eagle_layers(model_config.num_hidden_layers);
+        model.capture_layers(&layers)?;
+        draft.capture_layers(&[0])?;
+    }
     if draft.page_size() != model.page_size() || draft.capacity() < model.capacity() {
         bail!("the draft model's cache doesn't line up with the model's");
     }
-    eprintln!(
-        "Guessing ahead with the draft model {} ({} layers) on {}",
-        path.display(),
-        config.num_hidden_layers,
-        draft.describe()
-    );
+    match eagle {
+        true => eprintln!(
+            "Guessing ahead with the EAGLE-3 head {} on {}",
+            path.display(),
+            draft.describe()
+        ),
+        false => eprintln!(
+            "Guessing ahead with the draft model {} ({} layers) on {}",
+            path.display(),
+            config.num_hidden_layers,
+            draft.describe()
+        ),
+    }
     Ok(draft)
 }
 

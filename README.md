@@ -335,6 +335,34 @@ ahead for Qwen2.5-7B (AWQ) on the RTX 2000 Ada:
 60% of the guesses were right, and the 20 replies were again identical. Without `--cache-mb`, the
 model's cache gets 2 GiB on an NVIDIA GPU, leaving room for the draft model's.
 
+`--speculative-algorithm eagle3 --speculative-draft-model-path DIR` guesses with an EAGLE-3 head
+trained for the model, as SGLang's EAGLE3 does with `--speculative-eagle-topk 1`. A head is one
+decoder layer that reads the model's own hidden states, the residual stream after three of its
+layers (low, middle and high), next to each token's embedding, which it borrows from the model.
+The model keeps those hidden states for every token it goes through. After each step the head
+goes through the positions the model has just accepted, and the newest gives the first guess; each
+further guess comes from the head's own output for the one before. Its output layer covers a
+smaller vocabulary (32,000 of Qwen3's 151,936 tokens), mapped into the model's. As with the other
+methods, guesses are sampled as the model will sample them, so replies come out exactly the same.
+
+On the RTX 2000 Ada, Qwen3-4B with AngelSlim's head for it (`AngelSlim/Qwen3-4B_eagle3`), guessing
+4 tokens ahead, requests sampled at temperature 0.8, 128 tokens each:
+
+| | 1 request | 4 at once | 16 at once |
+|---|---|---|---|
+| tok/s without / with | 24 / 31 (1.3×) | 94 / 110 (1.2×) | 360 / 382 (1.1×) |
+
+Greedy replies gain more: 2.2 tokens a step without thinking and 1.9 with it, at 42 and 37 tok/s
+(1.8× and 1.5×). SGLang 0.5.23 with the same head and settings accepts about 2.0 tokens a step on
+the same requests, at 44 and 38 tok/s; its EAGLE crashes on sampled requests on this machine,
+whose CUDA toolkit can't compile its sampling kernel. The head's first guess agrees with the
+model's own next token 69–75% of the time on the model's replies (`harness eagle`), the same on
+the CPU and both GPUs, and all 20 test replies were identical with and without it on the NVIDIA
+GPU and the Apple GPU. On the Apple GPU (an M1 Max) the head accepts just as many tokens a step but
+helps much less, 1.1–1.2× for greedy replies, and sampled ones come out slower, because checking 5
+tokens there takes twice as long as checking one: its matrix kernel for small batches doesn't yet
+run at the speed of reading the weights.
+
 ### LoRA adapters
 
 `--lora NAME=PATH` (repeat it for more) loads a LoRA adapter in the PEFT format that Hugging Face
@@ -444,7 +472,7 @@ cargo run --release -- -m models/Qwen2.5-0.5B-Instruct --chat --system "You are 
 | `--ctx-size N` | model max | longest allowed conversation, in tokens |
 | `--threads N` | performance cores − 2 | CPU worker threads (on a GPU, all available, for choosing tokens) |
 | `--parallel N` | 32 CPU, 128 GPU | requests in progress at once |
-| `--speculative-algorithm A` | none | `ngram` or `standalone` to guess tokens ahead (see [Speculative decoding](#speculative-decoding)) |
+| `--speculative-algorithm A` | none | `ngram`, `standalone` or `eagle3` to guess tokens ahead (see [Speculative decoding](#speculative-decoding)) |
 | `--speculative-draft-model-path DIR` | | the smaller model that guesses for `standalone` |
 | `--schedule-policy P` | fcfs | `fcfs`, or `lpm` to start the requests with the longest cached prefix first (with up to 128 waiting) |
 | `--speculative-num-draft-tokens N` | 6 | the most tokens to guess ahead per request |
@@ -699,7 +727,7 @@ missing is breadth, and the last 10–20% of single-stream speed.
 | Quantized weights | yes: FP8, INT8, AWQ, GPTQ, GGUF, bitsandbytes, MXFP4 and more | FP8 and 4-bit AWQ/GPTQ checkpoints, 8-bit integers, and GPT-OSS's MXFP4 experts, on the NVIDIA GPU (the CPU and Apple GPU unpack quantized checkpoints); bfloat16 weights stay 16-bit on the CPU. **No GGUF, bitsandbytes, or GPTQ with 8 bits** |
 | Tool calling, with `tool_choice` and strict schemas | yes, with parsers for many model families | yes, for the families that run here: Qwen and Hermes, Mistral, Llama 3, and GPT-OSS's harmony messages |
 | Reasoning parsers, thinking budgets | yes, for many families | yes, for `<think>` models (Qwen3, SmolLM3, DeepSeek-R1 and others) and GPT-OSS's harmony channels (budgets for `<think>` models only) |
-| Speculative decoding | yes: EAGLE, MTP, draft models, n-grams | draft models and n-grams, with replies exactly as without it. **No EAGLE or MTP** |
+| Speculative decoding | yes: EAGLE (with draft trees), MTP, draft models, n-grams | EAGLE-3 heads, draft models and n-grams, with replies exactly as without it; EAGLE-3 accepts as many tokens a step as SGLang's with the same head. **No draft trees yet (one guess per position), no MTP** |
 | LoRA adapters | yes, mixed in batches, loaded and unloaded while running | yes, mixed in batches, chosen by `model` or `lora_path`, loaded and unloaded while running (unloading doesn't free their memory yet) |
 | Architectures | many | Llama-style (Llama, Mistral, Qwen2/3, SmolLM2/3, Phi-3, Granite, Gemma 1–3) and mixtures of experts (Qwen3-MoE, Qwen2-MoE, Mixtral, OLMoE, Granite MoE, GPT-OSS, and DeepSeek V2/V3, with only the latent in the cache on the GPUs: 3–13% behind SGLang on DeepSeek-V2-Lite's shape). GPT-OSS doesn't run on the Apple GPU yet. **No hybrid attention models (Qwen3-Next, Jamba)** |
 | Sliding-window attention, logit soft-capping | yes | yes |
@@ -709,8 +737,8 @@ missing is breadth, and the last 10–20% of single-stream speed.
 | Multi-GPU, multi-node, router | yes | **no** |
 | The SGL frontend language (`gen`, `select`, `fork`) | yes | **no** |
 
-Biggest gaps first, the plan is: EAGLE-style speculative decoding (and DeepSeek's multi-token
-prediction), then GPT-OSS on the Apple GPU and closing the gap with SGLang on DeepSeek.
+Biggest gaps first, the plan is: draft trees for EAGLE and DeepSeek's multi-token prediction, then
+GPT-OSS on the Apple GPU and closing the gap with SGLang on DeepSeek.
 
 Other limitations: only BPE tokenizers are supported (not SentencePiece Unigram or WordPiece,
 though that covers the Llama family), embeddings only use last-token pooling, and sliding windows

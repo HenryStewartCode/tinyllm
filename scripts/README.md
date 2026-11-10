@@ -29,6 +29,8 @@ cargo build --release --example harness      # target/release/examples/harness
 | `serve_test.py BASE_URL CHECK` | Server behaviour: determinism, structured output, the prefix cache, cancellation. |
 | `tools_test.py`, `tools_forced.py`, `tools_schemas.py`, `tools_diff.py` | Tool calling through the official `openai` client, compared with SGLang. |
 | `client.py BASE_URL/v1` | The `openai` client end to end. |
+| `speculative_test.py PLAIN SPEC [concurrency]` | Speculative decoding changes nothing but speed: the same 20 requests (greedy and sampled, thinking included) to a server without it and one with it give identical replies; also throughput and how many guesses were right. `PLAIN --save FILE` keeps the replies for comparing later, when the two servers don't fit on one GPU. |
+| `harness eagle MODEL HEAD TOKENS...` | An EAGLE-3 head against its model: how often its first guess is the model's own next token over a text (`EAGLE_LAYERS=a,b,c` tries other layers), and a few guesses drafted on from the end. |
 | `load.py BASE_URL MAX_TOKENS CONCURRENCY...` | Throughput at several levels of concurrency. |
 | `ttft.py BASE_URL` | Time to first token for a long shared prompt, cold and cached. |
 | `pressure.py` | Retraction and resumption when the KV cache is too small. |

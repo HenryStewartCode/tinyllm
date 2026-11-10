@@ -1,12 +1,16 @@
 """Check that speculative decoding changes nothing but speed: the same requests to a server without
 it (PLAIN) and one with it (SPEC) must give identical replies.
 
-usage: speculative_test.py PLAIN_URL SPEC_URL [concurrency]"""
+usage: speculative_test.py PLAIN SPEC [concurrency]
+
+PLAIN can also be a file of replies saved before (when the two servers won't fit on one GPU at
+once): `speculative_test.py PLAIN_URL --save FILE` saves them, and then
+`speculative_test.py FILE SPEC_URL` compares with them."""
 import json, re, sys, time, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 plain, spec = sys.argv[1:3]
-concurrency = int(sys.argv[3]) if len(sys.argv) > 3 else 1
+concurrency = int(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[2] != "--save" else 1
 
 CODE = '''def merge_sorted(a, b):
     result = []
@@ -44,7 +48,10 @@ def ask(base, prompt, settings):
     body = {"messages": [{"role": "user", "content": prompt}], "max_tokens": 200, **settings}
     request = urllib.request.Request(f"{base}/v1/chat/completions", json.dumps(body).encode(), {"Content-Type": "application/json"})
     reply = json.load(urllib.request.urlopen(request, timeout=600))
-    return reply["choices"][0]["message"]["content"], reply["usage"]["completion_tokens"]
+    message = reply["choices"][0]["message"]
+    # A reasoning model's thinking counts too: it can take up the whole reply.
+    text = (message.get("reasoning_content") or "") + "\n" + (message.get("content") or "")
+    return text, reply["usage"]["completion_tokens"]
 
 
 def metric(base, name):
@@ -62,8 +69,17 @@ def run(base):
     return results, sum(tokens for _, tokens in results) / elapsed
 
 
+if spec == "--save":
+    results, speed = run(plain)
+    json.dump({"results": results, "speed": speed, "concurrency": concurrency}, open(sys.argv[3], "w"))
+    print(f"saved {len(results)} replies at {speed:.1f} tok/s")
+    sys.exit(0)
 drafted0, accepted0 = metric(spec, "spec_drafted_tokens_total"), metric(spec, "spec_accepted_tokens_total")
-plain_results, plain_speed = run(plain)
+if plain.startswith("http"):
+    plain_results, plain_speed = run(plain)
+else:
+    saved = json.load(open(plain))
+    plain_results, plain_speed = [tuple(r) for r in saved["results"]], saved["speed"]
 spec_results, spec_speed = run(spec)
 drafted = metric(spec, "spec_drafted_tokens_total") - drafted0
 accepted = metric(spec, "spec_accepted_tokens_total") - accepted0

@@ -60,6 +60,9 @@ pub struct Options {
     pub cache_bytes: usize,
     /// CPU threads for work between GPU steps (choosing the next tokens).
     pub host_threads: usize,
+    /// Another checkpoint to take the embeddings from if this one has none (an EAGLE head
+    /// uses its model's).
+    pub weights_from: Option<std::path::PathBuf>,
 }
 
 // The kernels' arguments, laid out as in `kernels.metal`.
@@ -79,6 +82,21 @@ struct NormArgs {
     select: u32,
     /// How far apart the input's rows are.
     stride: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CopyArgs {
+    dim: u32,
+    stride: u32,
+    offset: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ScatterArgs {
+    draft_vocab: u32,
+    vocab: u32,
 }
 
 #[repr(C)]
@@ -251,6 +269,9 @@ struct Kernels {
     latent_queries: Pipeline,
     latent_store: Pipeline,
     attention_latent: Pipeline,
+    copy_rows: Pipeline,
+    eagle_input: Pipeline,
+    scatter_logits: Pipeline,
 }
 
 impl Kernels {
@@ -288,6 +309,9 @@ impl Kernels {
             latent_queries: get("latent_queries")?,
             latent_store: get("latent_store")?,
             attention_latent: get("attention_latent")?,
+            copy_rows: get("copy_rows")?,
+            eagle_input: get("eagle_input")?,
+            scatter_logits: get("scatter_logits")?,
         })
     }
 }
@@ -338,6 +362,25 @@ struct LatentLayer {
     absorb_k: Matrix,
     /// Each head's value matrix: `[heads][v, rank]`.
     absorb_v: Matrix,
+}
+
+/// What an EAGLE-3 draft head has that a model doesn't (see [`crate::config::Eagle3`]), and its
+/// working memory. Its one layer's `attn_norm` normalizes each token's embedding.
+struct EagleParts {
+    /// Folds the model's kept features (`3 * dim`) into one hidden state.
+    fc: Matrix,
+    hidden_norm: Buffer,
+    /// The model's token id for each of the head's output rows.
+    targets: Buffer,
+    draft_vocab: usize,
+    /// Each row's hidden state for the next forward, `width` a row.
+    hidden_in: Buffer,
+    width: usize,
+    /// The layer's input: each row's normalized embedding, then its normalized hidden state,
+    /// `[rows, 2 * dim]`.
+    wide: Buffer,
+    /// Scores for the head's own vocabulary, `[rows, draft_vocab]`.
+    draft_logits: Buffer,
 }
 
 /// Working memory for latent attention, sized for the workspace's rows.
@@ -824,6 +867,13 @@ pub struct MetalBackend {
     lora_hidden: Buffer,
     /// The largest rank of any adapter's correction.
     lora_rank: usize,
+    eagle: Option<EagleParts>,
+    /// The layers whose output (the residual stream after them) each forward keeps for every
+    /// row, and where: `[rows, capture.len() * dim]`.
+    capture: Vec<usize>,
+    features: Buffer,
+    /// How many rows the last forward had.
+    last_rows: usize,
 }
 
 /// The matrices LoRA corrections go to, as stacked here, and the modules each stacks.
@@ -881,6 +931,12 @@ impl MetalBackend {
             "attention sinks (GPT-OSS) don't run on Metal yet"
         );
         let latent = architecture.latent;
+        let eagle3 = architecture.eagle3;
+        // An EAGLE head's attention reads each token's embedding next to its hidden state.
+        let attn_in = match eagle3 {
+            Some(_) => 2 * config.hidden_size,
+            None => config.hidden_size,
+        };
         if let Some(l) = latent {
             ensure!(
                 l.kv_lora_rank <= 512
@@ -924,7 +980,7 @@ impl MetalBackend {
                 && kernels.rmsnorm_add.max_threads >= NORM_THREADS,
             "this GPU can't run the Metal attention and norm kernels"
         );
-        let st = SafeTensors::open(dir)?;
+        let st = SafeTensors::open_with(dir, options.weights_from.as_deref())?;
         let loader = Loader {
             device: &device,
             st: &st,
@@ -1026,7 +1082,7 @@ impl MetalBackend {
             };
             layers.push(Layer {
                 attn_norm: norm("input_layernorm")?,
-                qkv: loader.matrix(&qkv_names, dim, 1.0)?,
+                qkv: loader.matrix(&qkv_names, attn_in, 1.0)?,
                 head_norms,
                 o_proj: loader.matrix(&[(format!("{attn}.o_proj"), dim)], attn_width, residual)?,
                 norm_after_attn,
@@ -1042,9 +1098,31 @@ impl MetalBackend {
             });
         }
         let embed = loader.matrix(&[("model.embed_tokens".into(), vocab_size)], dim, 1.0)?;
+        // An EAGLE head scores its own, smaller, vocabulary.
+        let out_rows = eagle3.map_or(vocab_size, |e| e.draft_vocab);
         let lm_head = match st.contains("lm_head.weight") {
-            true => Some(loader.matrix(&[("lm_head".into(), vocab_size)], dim, 1.0)?),
+            true => Some(loader.matrix(&[("lm_head".into(), out_rows)], dim, 1.0)?),
             false => None,
+        };
+        let eagle = match eagle3 {
+            None => None,
+            Some(e) => {
+                ensure!(
+                    config.num_hidden_layers == 1 && lm_head.is_some(),
+                    "an EAGLE-3 head has one layer and an output projection of its own"
+                );
+                let targets = crate::model::eagle_targets(&st, e.draft_vocab, vocab_size)?;
+                Some(EagleParts {
+                    fc: loader.matrix(&[("fc".into(), dim)], 3 * dim, 1.0)?,
+                    hidden_norm: loader.norm("model.layers.0.hidden_norm.weight", dim, false)?,
+                    targets: loader.upload(&targets)?,
+                    draft_vocab: e.draft_vocab,
+                    hidden_in: device.buffer(16)?,
+                    width: 0,
+                    wide: device.buffer(16)?,
+                    draft_logits: device.buffer(16)?,
+                })
+            }
         };
         let norm = loader.norm("model.norm.weight", dim, false)?;
         let num_params = loader.params.get();
@@ -1114,6 +1192,7 @@ impl MetalBackend {
             latent,
         };
         let ws = Workspace::new(&device, shape, 16)?;
+        let features = device.buffer(16)?;
         Ok(LoadedModel {
             num_params,
             backend: Self {
@@ -1141,6 +1220,10 @@ impl MetalBackend {
                 adapters: Vec::new(),
                 lora: Vec::new(),
                 lora_rank: 0,
+                eagle,
+                capture: Vec::new(),
+                features,
+                last_rows: 0,
             },
             config,
         })
@@ -1261,6 +1344,20 @@ impl MetalBackend {
             let bytes = rows.len() * self.lora_rank * 4;
             reserve(&self.device, &mut self.lora_hidden, bytes)?;
         }
+        let dim = self.shape.dim;
+        if let Some(eagle) = &mut self.eagle {
+            ensure!(
+                eagle.hidden_in.bytes >= rows.len() * eagle.width * 4 && eagle.width > 0,
+                "an EAGLE head needs its hidden states first"
+            );
+            reserve(&self.device, &mut eagle.wide, rows.len() * 2 * dim * 4)?;
+            reserve(&self.device, &mut eagle.draft_logits, step.n_logits.max(1) * eagle.draft_vocab * 4)?;
+        }
+        if !self.capture.is_empty() {
+            let bytes = rows.len() * self.capture.len() * dim * 4;
+            reserve(&self.device, &mut self.features, bytes)?;
+        }
+        self.last_rows = rows.len();
         self.device.run(|e| {
             self.encode(e, &step, None);
             Ok(())
@@ -1324,15 +1421,24 @@ impl MetalBackend {
         if on(Part::Other) {
             e.dispatch([batch, 1], threads(pipeline, ROW_THREADS));
         }
+        if let Some(eagle) = &self.eagle {
+            self.eagle_input(e, eagle, batch);
+        }
 
         for (l, layer) in self.layers.iter().enumerate() {
             // Attention block: mix in information from earlier tokens.
-            if on(Part::Norms) {
-                self.rmsnorm(e, &ws.x, &ws.xb, &layer.attn_norm, batch, false);
-            }
+            let attn_input = match &self.eagle {
+                Some(eagle) => &eagle.wide,
+                None => {
+                    if on(Part::Norms) {
+                        self.rmsnorm(e, &ws.x, &ws.xb, &layer.attn_norm, batch, false);
+                    }
+                    &ws.xb
+                }
+            };
             if on(Part::Matmuls) {
-                self.matmul(e, &layer.qkv, &ws.xb, &ws.qkv, batch, false);
-                self.lora(e, step, l, 0, &ws.xb, &ws.qkv);
+                self.matmul(e, &layer.qkv, attn_input, &ws.qkv, batch, false);
+                self.lora(e, step, l, 0, attn_input, &ws.qkv);
             }
             if let Some(latent) = &layer.latent {
                 self.latent_attention(e, layer, latent, batch, &on);
@@ -1368,6 +1474,7 @@ impl MetalBackend {
                 FeedForward::Dense { gate_up, down } => (gate_up, down),
                 FeedForward::Sparse(experts) => {
                     self.experts(e, experts, batch, &on);
+                    self.keep_features(e, l, batch);
                     continue;
                 }
             };
@@ -1388,6 +1495,7 @@ impl MetalBackend {
                     (step, l, 3),
                 );
             }
+            self.keep_features(e, l, batch);
         }
 
         // Only the rows that want logits go through the last norm and the output projection.
@@ -1401,7 +1509,25 @@ impl MetalBackend {
         if step.scores {
             self.rmsnorm(e, &ws.x, &ws.xb, &self.norm, n_logits, true);
             let lm_head = self.lm_head.as_ref().unwrap_or(&self.embed);
-            self.matmul(e, lm_head, &ws.xb, &self.logits, n_logits, false);
+            match &self.eagle {
+                None => self.matmul(e, lm_head, &ws.xb, &self.logits, n_logits, false),
+                // An EAGLE head's scores go to their tokens' places in the model's vocabulary.
+                Some(eagle) => {
+                    self.matmul(e, lm_head, &ws.xb, &eagle.draft_logits, n_logits, false);
+                    e.set_pipeline(&k.scatter_logits);
+                    e.set_buffer(0, &eagle.draft_logits, 0);
+                    e.set_buffer(1, &eagle.targets, 0);
+                    e.set_buffer(2, &self.logits, 0);
+                    e.set_bytes(
+                        3,
+                        &ScatterArgs {
+                            draft_vocab: eagle.draft_vocab as u32,
+                            vocab: self.vocab_size as u32,
+                        },
+                    );
+                    e.dispatch([n_logits, 1], threads(&k.scatter_logits, 1024));
+                }
+            }
             let (divisor, softcap) = (
                 self.architecture.logit_divisor,
                 self.architecture.logit_softcap,
@@ -1590,6 +1716,68 @@ impl MetalBackend {
             },
         );
         e.dispatch_3d([groups[0], groups[1], self.n_heads], threads);
+    }
+
+    /// Queue keeping the residual stream after layer `l`, if it's one of those asked for.
+    fn keep_features(&self, e: &Encoder, l: usize, batch: usize) {
+        let Some(k) = self.capture.iter().position(|&c| c == l) else {
+            return;
+        };
+        let dim = self.shape.dim;
+        e.set_pipeline(&self.kernels.copy_rows);
+        e.set_buffer(0, &self.ws.x, 0);
+        e.set_buffer(1, &self.features, 0);
+        e.set_bytes(
+            2,
+            &CopyArgs {
+                dim: dim as u32,
+                stride: (self.capture.len() * dim) as u32,
+                offset: (k * dim) as u32,
+            },
+        );
+        e.dispatch([batch, 1], threads(&self.kernels.copy_rows, ROW_THREADS));
+    }
+
+    /// Queue an EAGLE head's start (see [`EagleParts`]): with each row's embedding in `ws.x`,
+    /// make its hidden state (through `fc`, if it's the model's features) the residual stream,
+    /// and put the two, normalized, side by side in `wide`.
+    fn eagle_input(&self, e: &Encoder, eagle: &EagleParts, batch: usize) {
+        let (ws, k, dim) = (&self.ws, &self.kernels, self.shape.dim);
+        let hidden = match eagle.width == 3 * dim {
+            true => {
+                self.matmul(e, &eagle.fc, &eagle.hidden_in, &ws.added, batch, false);
+                &ws.added
+            }
+            false => &eagle.hidden_in,
+        };
+        e.set_pipeline(&k.eagle_input);
+        e.set_buffer(0, &ws.x, 0);
+        e.set_buffer(1, hidden, 0);
+        e.set_buffer(2, &self.layers[0].attn_norm, 0);
+        e.set_buffer(3, &eagle.hidden_norm, 0);
+        e.set_buffer(4, &eagle.wide, 0);
+        e.set_bytes(
+            5,
+            &NormArgs {
+                dim: dim as u32,
+                eps: self.eps,
+                select: 0,
+                stride: dim as u32,
+            },
+        );
+        e.dispatch([batch, 1], NORM_THREADS);
+        e.set_pipeline(&k.copy_rows);
+        e.set_buffer(0, hidden, 0);
+        e.set_buffer(1, &ws.x, 0);
+        e.set_bytes(
+            2,
+            &CopyArgs {
+                dim: dim as u32,
+                stride: dim as u32,
+                offset: 0,
+            },
+        );
+        e.dispatch([batch, 1], threads(&k.copy_rows, ROW_THREADS));
     }
 
     /// Queue `out = act(gate) * up` for `rows` rows of `gate_up`, `hidden` wide.
@@ -2214,6 +2402,44 @@ impl Backend for MetalBackend {
 
     fn capacity(&self) -> usize {
         self.capacity
+    }
+
+    fn capture_layers(&mut self, layers: &[usize]) -> Result<()> {
+        ensure!(
+            layers.iter().all(|&l| l < self.layers.len()),
+            "there are only {} layers",
+            self.layers.len()
+        );
+        self.capture = layers.to_vec();
+        Ok(())
+    }
+
+    fn features(&self, row: usize) -> &[f32] {
+        let width = self.capture.len() * self.shape.dim;
+        if width == 0 || row >= self.last_rows {
+            return &[];
+        }
+        // SAFETY: the GPU finished writing them before `forward` returned.
+        let all = unsafe { self.features.slice::<f32>() };
+        &all[row * width..(row + 1) * width]
+    }
+
+    fn set_hidden_inputs(&mut self, width: usize, values: &[f32]) -> Result<()> {
+        let dim = self.shape.dim;
+        let Some(eagle) = &mut self.eagle else {
+            anyhow::bail!("{} isn't an EAGLE head", self.gpu_name);
+        };
+        ensure!(
+            width == dim || width == 3 * dim,
+            "an EAGLE head takes hidden states {dim} or {} wide",
+            3 * dim
+        );
+        reserve(&self.device, &mut eagle.hidden_in, values.len().max(1) * 4)?;
+        // SAFETY: the GPU isn't using it between forwards.
+        let memory = unsafe { eagle.hidden_in.slice_mut::<f32>() };
+        memory[..values.len()].copy_from_slice(values);
+        eagle.width = width;
+        Ok(())
     }
 
     fn add_adapter(&mut self, adapter: &LoraAdapter) -> Result<()> {

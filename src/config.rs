@@ -107,6 +107,12 @@ pub struct Config {
     first_k_dense_replace: Option<usize>,
     moe_layer_freq: Option<usize>,
     routed_scaling_factor: Option<f32>,
+
+    // EAGLE-3 draft heads (see `Eagle3`).
+    #[serde(default)]
+    architectures: Vec<String>,
+    draft_vocab_size: Option<usize>,
+    eagle_config: Option<Value>,
     topk_method: Option<String>,
     n_group: Option<usize>,
     topk_group: Option<usize>,
@@ -256,6 +262,19 @@ pub struct LatentAttention {
     pub v: usize,
 }
 
+/// An EAGLE-3 draft head: one decoder layer that guesses a model's next tokens from the model's
+/// own residual streams (after three of its layers, low, middle and high), which `fc` folds into
+/// one hidden state. Each row's layer input is that hidden state, normalized with `hidden_norm`,
+/// next to its token's normalized embedding (the model's embeddings), so the attention
+/// projections take `2 * hidden_size` inputs, and the residual stream starts from the hidden
+/// state. The layer's output (before the final norm) is the hidden state for guessing the token
+/// after. The output projection covers `draft_vocab` tokens, which `d2t` maps to the model's:
+/// draft token `i` is model token `i + d2t[i]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Eagle3 {
+    pub draft_vocab: usize,
+}
+
 /// GPT-OSS's activation: with `g = min(gate, limit)` and `u` the up projection clamped to
 /// `[-limit, limit]`, `(u + 1) * g * sigmoid(alpha * g)`.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -322,6 +341,8 @@ pub struct Architecture {
     pub attention_sinks: bool,
     /// DeepSeek's multi-head latent attention, instead of the usual projections.
     pub latent: Option<LatentAttention>,
+    /// What makes this an EAGLE-3 draft head rather than a model, if it is one.
+    pub eagle3: Option<Eagle3>,
     /// The mixture of experts in the layers marked `sparse`, if the model has one.
     pub experts: Option<Experts>,
     /// The RoPE speed of each element pair in a head: one list per kind of layer.
@@ -520,10 +541,32 @@ impl Config {
             full_qk_norms: model_type == "olmoe",
             attention_sinks: model_type == "gpt_oss",
             latent: self.latent()?,
+            eagle3: self.eagle3(),
             experts: self.experts()?,
             rope_tables,
             rope_scales,
             layers,
+        })
+    }
+
+    /// What makes this an EAGLE-3 draft head, if it is one.
+    fn eagle3(&self) -> Option<Eagle3> {
+        let named = self.architectures.iter().any(|name| name.contains("Eagle3"));
+        named.then(|| Eagle3 {
+            draft_vocab: self.draft_vocab_size.unwrap_or(self.vocab_size),
+        })
+    }
+
+    /// For an EAGLE-3 draft head, the layers of its model, which has `model_layers` of them,
+    /// whose outputs (the residual stream after each) it reads, in order: those its
+    /// configuration names, or by default the second layer's, the one before the middle's, and
+    /// the fourth from last's, as SGLang and the EAGLE authors' code take them.
+    pub fn eagle_layers(&self, model_layers: usize) -> Vec<usize> {
+        let named = (self.eagle_config.as_ref())
+            .and_then(|config| config["eagle_aux_hidden_state_layer_ids"].as_array())
+            .map(|ids| ids.iter().filter_map(Value::as_u64).map(|id| id as usize).collect());
+        named.unwrap_or_else(|| {
+            vec![1, (model_layers / 2).saturating_sub(1), model_layers.saturating_sub(4)]
         })
     }
 

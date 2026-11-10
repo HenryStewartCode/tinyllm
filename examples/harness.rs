@@ -34,6 +34,17 @@ fn adapter() -> u16 {
 /// A backend chosen by the DEVICE environment variable (cpu, cuda or metal), with the LoRA
 /// adapter in the directory LORA names, if any.
 fn open(dir: &Path, cache_tokens: usize, max_batch: usize) -> (Box<dyn Backend>, Config) {
+    open_with(dir, None, cache_tokens, max_batch)
+}
+
+/// `open`, taking weights the checkpoint doesn't have (an EAGLE head's embeddings) from
+/// `fallback`.
+fn open_with(
+    dir: &Path,
+    fallback: Option<&Path>,
+    cache_tokens: usize,
+    max_batch: usize,
+) -> (Box<dyn Backend>, Config) {
     let threads = env_usize("THREADS", 4);
     let config = Config::load(dir).unwrap();
     // Keys and values per token: DeepSeek's latent attention has its own widths.
@@ -59,6 +70,7 @@ fn open(dir: &Path, cache_tokens: usize, max_batch: usize) -> (Box<dyn Backend>,
             max_batch,
             cache_bytes: Some(bytes),
             host_threads: threads,
+            weights_from: fallback.map(Path::to_path_buf),
         };
         let LoadedModel { backend, .. } = CudaBackend::load(dir, &options).unwrap();
         Box::new(backend)
@@ -66,11 +78,13 @@ fn open(dir: &Path, cache_tokens: usize, max_batch: usize) -> (Box<dyn Backend>,
         let options = metal::Options {
             cache_bytes: bytes,
             host_threads: threads,
+            weights_from: fallback.map(Path::to_path_buf),
         };
         let LoadedModel { backend, .. } = MetalBackend::load(dir, &options).unwrap();
         Box::new(backend)
     } else {
-        let LoadedModel { backend, .. } = CpuBackend::load(dir, threads, bytes).unwrap();
+        let LoadedModel { backend, .. } =
+            CpuBackend::load_with(dir, fallback, threads, bytes).unwrap();
         Box::new(backend)
     };
     let mut backend = backend;
@@ -84,6 +98,123 @@ fn open(dir: &Path, cache_tokens: usize, max_batch: usize) -> (Box<dyn Backend>,
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args[1].as_str() {
+        // How often an EAGLE-3 head guesses the token after next as the model itself does: the
+        // model goes over the tokens (keeping its features), then the head over each pair of a
+        // position's features and the token after it, and the head's best guess is compared
+        // with the model's best for the same position. Then, from the end, the head guesses on
+        // from its own output for a few tokens, the way it drafts, against the model's greedy
+        // continuation. Usage: eagle MODEL HEAD TOKENS...
+        "eagle" => {
+            let (model_dir, head_dir) = (Path::new(&args[2]), Path::new(&args[3]));
+            let mut tokens: Vec<u32> = args[4..].iter().map(|s| s.parse().unwrap()).collect();
+            let n = tokens.len();
+            const AHEAD: usize = 6;
+            let room = (n + AHEAD + 1).next_multiple_of(16) + 16;
+            let (mut model, config) = open(model_dir, room, n);
+            let (mut head, head_config) = open_with(head_dir, Some(model_dir), room, n);
+            // EAGLE_LAYERS=a,b,c tries other layers than the head's own.
+            let layers = match std::env::var("EAGLE_LAYERS") {
+                Ok(list) => list.split(',').map(|l| l.parse().unwrap()).collect(),
+                Err(_) => head_config.eagle_layers(config.num_hidden_layers),
+            };
+            model.attach();
+            model.capture_layers(&layers).unwrap();
+            head.attach();
+            head.capture_layers(&[0]).unwrap();
+            let best = |logits: Logits| match logits {
+                Logits::All(l) => argmax(l),
+                Logits::Candidates(c) => c.iter().fold((f32::MIN, 0), |m, x| if x.0 > m.0 { *x } else { m }).1,
+            };
+            let slots: Vec<u32> = (0..room as u32).collect();
+            let rows: Vec<Row> = (0..n)
+                .map(|i| Row {
+                    token: tokens[i],
+                    slots: &slots[..=i],
+                    want_logits: true,
+                    sampling: LogitUse::All,
+                    adapter: 0,
+                })
+                .collect();
+            model.attach();
+            model.forward(&rows);
+            let predicted: Vec<u32> = (0..n).map(|i| best(model.logits(i))).collect();
+            let width = model.features(0).len();
+            let mut features: Vec<f32> = (0..n).flat_map(|p| model.features(p).to_vec()).collect();
+            if std::env::var("EAGLE_DEBUG").is_ok() {
+                // Each kept layer's size, at a few positions.
+                let dim = width / layers.len();
+                for p in [0, n / 2, n - 1] {
+                    let f = model.features(p);
+                    let sizes: Vec<String> = (0..layers.len())
+                        .map(|k| {
+                            let part = &f[k * dim..(k + 1) * dim];
+                            let norm = part.iter().map(|v| v * v).sum::<f32>().sqrt();
+                            let largest = part.iter().fold(0f32, |m, v| m.max(v.abs()));
+                            format!("layer {}: norm {norm:.1}, largest {largest:.1}", layers[k])
+                        })
+                        .collect();
+                    println!("position {p}: {}", sizes.join(" | "));
+                }
+            }
+            // Pair p is position p's features and the token at p + 1; the last uses the model's
+            // own next token.
+            tokens.push(predicted[n - 1]);
+            head.attach();
+            head.set_hidden_inputs(width, &features).unwrap();
+            let rows: Vec<Row> = (0..n)
+                .map(|p| Row {
+                    token: tokens[p + 1],
+                    slots: &slots[..=p],
+                    want_logits: true,
+                    sampling: LogitUse::All,
+                    adapter: 0,
+                })
+                .collect();
+            head.forward(&rows);
+            let guesses: Vec<u32> = (0..n).map(|p| best(head.logits(p))).collect();
+            let right = (0..n - 1).filter(|&p| guesses[p] == predicted[p + 1]).count();
+            println!(
+                "{} | the head's next guess matches the model's {right} of {} times ({:.0}%)",
+                head.describe(),
+                n - 1,
+                100.0 * right as f64 / (n - 1) as f64
+            );
+            // Drafting on from the end: the model's greedy continuation, and the head's.
+            let mut continuation = vec![predicted[n - 1]];
+            for step in 0..AHEAD {
+                let position = n + step;
+                let row = [Row {
+                    token: *continuation.last().unwrap(),
+                    slots: &slots[..=position],
+                    want_logits: true,
+                    sampling: LogitUse::All,
+                    adapter: 0,
+                }];
+                model.attach();
+                model.forward(&row);
+                continuation.push(best(model.logits(0)));
+            }
+            let mut drafted = vec![guesses[n - 1]];
+            let mut hidden = head.features(n - 1).to_vec();
+            features.clear();
+            for step in 1..AHEAD {
+                // Pair n - 1 + step: the head's own output, and its last guess.
+                let row = [Row {
+                    token: *drafted.last().unwrap(),
+                    slots: &slots[..=n - 1 + step],
+                    want_logits: true,
+                    sampling: LogitUse::All,
+                    adapter: 0,
+                }];
+                head.attach();
+                head.set_hidden_inputs(hidden.len(), &hidden).unwrap();
+                head.forward(&row);
+                drafted.push(best(head.logits(0)));
+                hidden = head.features(0).to_vec();
+            }
+            let run = drafted.iter().zip(&continuation[1..]).take_while(|(a, b)| a == b).count();
+            println!("model continues {:?}\nhead drafts     {:?} ({run} right in a row)", &continuation[1..], drafted);
+        }
         "tokenize" => {
             let tok = Tokenizer::load(Path::new(&args[2])).unwrap();
             let strings: Vec<String> =
@@ -142,6 +273,7 @@ fn main() {
             let options = metal::Options {
                 cache_bytes: batch * (context + 1) * 2 * config.num_hidden_layers * kv_dim * 4,
                 host_threads: 4,
+                weights_from: None,
             };
             let LoadedModel { mut backend, .. } = MetalBackend::load(dir, &options).unwrap();
             let slots: Vec<Vec<u32>> = (0..batch)

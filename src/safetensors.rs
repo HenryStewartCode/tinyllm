@@ -17,13 +17,14 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct TensorInfo {
     dtype: String,
     shape: Vec<usize>,
     data_offsets: [u64; 2],
 }
 
+#[derive(Clone)]
 struct Entry {
     file: usize,
     /// Where the data section of `file` starts.
@@ -130,7 +131,45 @@ const AWQ_SLOT: [usize; 8] = [0, 4, 1, 5, 2, 6, 3, 7];
 impl SafeTensors {
     /// Index `model.safetensors`, or every shard named in `model.safetensors.index.json`.
     pub fn open(dir: &Path) -> Result<Self> {
+        Self::open_with(dir, None)
+    }
+
+    /// `open`, taking the embeddings from the checkpoint in `fallback` if this one has none (an
+    /// EAGLE-3 draft head uses its model's). An EAGLE-3 head's tensors are renamed to where a
+    /// one-layer model's would be: `midlayer.*` to `model.layers.0.*` and `norm` to
+    /// `model.norm`.
+    pub fn open_with(dir: &Path, fallback: Option<&Path>) -> Result<Self> {
         let mut st = Self::index(find_files(dir)?)?;
+        if st.tensors.contains_key("fc.weight")
+            && st.tensors.keys().any(|name| name.starts_with("midlayer."))
+        {
+            st.tensors = std::mem::take(&mut st.tensors)
+                .into_iter()
+                .map(|(name, entry)| {
+                    let name = match name.strip_prefix("midlayer.") {
+                        Some(rest) => format!("model.layers.0.{rest}"),
+                        None if name == "norm.weight" || name == "embed_tokens.weight" => {
+                            format!("model.{name}")
+                        }
+                        None => name,
+                    };
+                    (name, entry)
+                })
+                .collect();
+        }
+        if let Some(fallback) = fallback
+            && !st.tensors.contains_key("model.embed_tokens.weight")
+        {
+            let other = Self::open(fallback)?;
+            let name = "model.embed_tokens.weight";
+            let entry = other.tensors.get(name).with_context(|| {
+                format!("{} has no embeddings to borrow", fallback.display())
+            })?;
+            st.files.push(other.files[entry.file].clone());
+            let mut entry = entry.clone();
+            entry.file = st.files.len() - 1;
+            st.tensors.insert(name.to_string(), entry);
+        }
         // Checkpoints of a bare model (embedding models, often) leave off the "model." that the
         // names of the same weights carry inside a model for generating text.
         let bare = st.tensors.contains_key("embed_tokens.weight")
@@ -209,6 +248,18 @@ impl SafeTensors {
         self.tensors
             .get(name)
             .map(|entry| entry.info.shape.as_slice())
+    }
+
+    /// A tensor of 64-bit integers (an EAGLE-3 head's `d2t`, say).
+    pub fn load_i64(&self, name: &str, shape: &[usize]) -> Result<Vec<i64>> {
+        let (bytes, dtype) = self.read(name, shape)?;
+        ensure!(dtype == "I64", "tensor {name}: expected I64, found {dtype}");
+        Ok(bytes
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|b| i64::from_le_bytes(*b))
+            .collect())
     }
 
     pub fn contains(&self, name: &str) -> bool {
@@ -501,8 +552,9 @@ impl SafeTensors {
             info.shape
         );
         let elem_size = match info.dtype.as_str() {
-            "U8" | "I8" => 1,
+            "U8" | "I8" | "BOOL" => 1,
             "F32" | "I32" => 4,
+            "I64" => 8,
             "F16" | "BF16" => 2,
             "F8_E4M3" => 1,
             other => bail!("tensor {name}: unsupported dtype {other}"),

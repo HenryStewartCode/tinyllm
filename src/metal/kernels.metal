@@ -1099,3 +1099,65 @@ kernel void attention_latent(device const float *query [[buffer(0)]], device con
         to[d] = value / sum;
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// EAGLE draft heads
+// ---------------------------------------------------------------------------------------------
+
+// One threadgroup per row: copy the row's `dim` floats into `out`, whose rows are `stride` apart,
+// at `offset` into the row (keeping a layer's residual stream for an EAGLE head, say).
+struct CopyArgs {
+    uint dim;
+    uint stride;
+    uint offset;
+};
+kernel void copy_rows(device const float *x [[buffer(0)]], device float *out [[buffer(1)]],
+                      constant CopyArgs &a [[buffer(2)]], uint row [[threadgroup_position_in_grid]],
+                      uint tid [[thread_position_in_threadgroup]],
+                      uint threads [[threads_per_threadgroup]]) {
+    for (uint i = tid; i < a.dim; i += threads)
+        out[(ulong)row * a.stride + a.offset + i] = x[(ulong)row * a.dim + i];
+}
+
+// One threadgroup of NORM_THREADS per row, for an EAGLE head's layer input: the row's embedding
+// normalized with `embed_norm`, then its hidden state normalized with `hidden_norm`, side by side
+// in `wide` (`[rows, 2 * dim]`).
+kernel void eagle_input(device const float *embeds [[buffer(0)]], device const float *hidden [[buffer(1)]],
+                        device const float *embed_norm [[buffer(2)]], device const float *hidden_norm [[buffer(3)]],
+                        device float *wide [[buffer(4)]], constant NormArgs &a [[buffer(5)]],
+                        uint row [[threadgroup_position_in_grid]],
+                        uint tid [[thread_index_in_threadgroup]],
+                        uint simd [[simdgroup_index_in_threadgroup]],
+                        uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float partial[NORM_THREADS / SIMD];
+    device float4 *to = (device float4 *)(wide + (ulong)row * 2 * a.dim);
+    for (uint half_index = 0; half_index < 2; half_index++) {
+        device const float4 *from =
+            (device const float4 *)((half_index == 0 ? embeds : hidden) + (ulong)row * a.dim);
+        device const float4 *w = (device const float4 *)(half_index == 0 ? embed_norm : hidden_norm);
+        const float scale = 1.0f / sqrt(sum_of_squares(from, a.dim, partial, tid, simd, lane) / a.dim + a.eps);
+        for (uint i = tid; i < a.dim / 4; i += NORM_THREADS)
+            to[half_index * a.dim / 4 + i] = from[i] * scale * w[i];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+// One threadgroup per row: an EAGLE head's scores for its own vocabulary, put in their tokens'
+// places in the model's (`targets[i]` for score i), and -infinity for the tokens it doesn't have.
+struct ScatterArgs {
+    uint draft_vocab;
+    uint vocab;
+};
+kernel void scatter_logits(device const float *draft [[buffer(0)]], device const uint *targets [[buffer(1)]],
+                           device float *logits [[buffer(2)]], constant ScatterArgs &a [[buffer(3)]],
+                           uint row [[threadgroup_position_in_grid]],
+                           uint tid [[thread_position_in_threadgroup]],
+                           uint threads [[threads_per_threadgroup]]) {
+    device float *to = logits + (ulong)row * a.vocab;
+    for (uint i = tid; i < a.vocab; i += threads)
+        to[i] = -INFINITY;
+    threadgroup_barrier(mem_flags::mem_device);
+    device const float *from = draft + (ulong)row * a.draft_vocab;
+    for (uint i = tid; i < a.draft_vocab; i += threads)
+        to[targets[i]] = from[i];
+}

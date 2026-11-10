@@ -12,6 +12,8 @@ pub struct Options {
     pub cache_bytes: usize,
     /// CPU threads for work between GPU steps (choosing the next tokens).
     pub host_threads: usize,
+    /// Another checkpoint to take the embeddings from if this one has none.
+    pub weights_from: Option<std::path::PathBuf>,
 }
 
 /// Never made, since there's no Metal here: [`MetalBackend::load`] always fails.
