@@ -12,7 +12,7 @@ use tinyllm::chat::{self, ChatTemplate};
 use tinyllm::config::Config;
 use tinyllm::cuda::{self, CudaBackend};
 use tinyllm::engine::{
-    self, EngineConfig, EngineHandle, Event, GenerateParams, Request, Speculative,
+    self, EngineConfig, EngineHandle, Event, GenerateParams, Request, SchedulePolicy, Speculative,
 };
 use tinyllm::lora::{self, Adapters, LoraAdapter};
 use tinyllm::metal::{self, MetalBackend};
@@ -78,6 +78,15 @@ enum SpeculativeArg {
     /// Guess with a smaller model that shares the tokenizer, given by
     /// --speculative-draft-model-path (SGLang's STANDALONE)
     Standalone,
+}
+
+/// The order waiting requests start in.
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ScheduleArg {
+    /// First come, first served
+    Fcfs,
+    /// Longest prefix match: the most of the prompt already cached first
+    Lpm,
 }
 
 /// How to separate a reasoning model's thinking from its answer.
@@ -215,6 +224,10 @@ struct Args {
     /// same tokenizer as the model
     #[arg(long)]
     speculative_draft_model_path: Option<PathBuf>,
+
+    /// Which waiting requests start first
+    #[arg(long, value_enum, default_value_t = ScheduleArg::Fcfs)]
+    schedule_policy: ScheduleArg,
 
     /// A LoRA adapter (a PEFT directory) that requests can choose by naming it as their model,
     /// or in `lora_path`: NAME=PATH, or just PATH to name it after its directory. Repeat for more.
@@ -362,6 +375,10 @@ fn main() -> Result<()> {
                 // Past this many rows a batch stops being nearly free.
                 max_draft_rows: if device == Device::Cuda { 64 } else { 16 },
             }),
+        },
+        schedule: match args.schedule_policy {
+            ScheduleArg::Fcfs => SchedulePolicy::Fcfs,
+            ScheduleArg::Lpm => SchedulePolicy::Lpm,
         },
     };
     let draft = match (standalone, &args.speculative_draft_model_path) {

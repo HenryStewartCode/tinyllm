@@ -406,6 +406,7 @@ cargo run --release -- -m models/Qwen2.5-0.5B-Instruct --chat --system "You are 
 | `--parallel N` | 32 CPU, 128 GPU | requests in progress at once |
 | `--speculative-algorithm A` | none | `ngram` or `standalone` to guess tokens ahead (see [Speculative decoding](#speculative-decoding)) |
 | `--speculative-draft-model-path DIR` | | the smaller model that guesses for `standalone` |
+| `--schedule-policy P` | fcfs | `fcfs`, or `lpm` to start the requests with the longest cached prefix first (with up to 128 waiting) |
 | `--speculative-num-draft-tokens N` | 6 | the most tokens to guess ahead per request |
 | `--lora NAME=PATH` | | a LoRA adapter requests can choose (see [LoRA adapters](#lora-adapters)); without `--serve`, the first is used |
 | `--batch-size N` | 64 CPU, 512 GPU | tokens run through the model per step |
@@ -634,7 +635,7 @@ missing is breadth, and the last 10–20% of single-stream speed.
 | `/tokenize`, `/detokenize`, `/health_generate` | yes | yes |
 | Continuous batching | yes | yes |
 | Prefix caching with a radix tree, eviction, retraction | yes | yes |
-| Longest-prefix-aware scheduling | yes | waits for in-flight prompts; otherwise first come, first served |
+| Longest-prefix-aware scheduling | yes | yes: `--schedule-policy lpm` starts the waiting requests with the most of their prompt cached first, and either way a request waits for an in-flight prompt it shares a long prefix with |
 | JSON schema / regex / EBNF constraints | yes | yes |
 | Model's own Jinja chat templates | yes | yes |
 | Deterministic results across batch shapes | optional | always |

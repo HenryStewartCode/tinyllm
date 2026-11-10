@@ -48,7 +48,24 @@ pub struct EngineConfig {
     pub ctx_size: usize,
     /// Guess tokens ahead and check them together (see [`crate::speculative`]), if set.
     pub speculative: Option<Speculative>,
+    /// Which waiting requests start first.
+    pub schedule: SchedulePolicy,
 }
+
+/// The order waiting requests start in, as SGLang's `--schedule-policy` chooses it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SchedulePolicy {
+    /// First come, first served.
+    #[default]
+    Fcfs,
+    /// Longest prefix match: the requests with the most of their prompt already cached go
+    /// first, so that shared prefixes are used while they're still in the cache. (With a long
+    /// queue, finding that out costs too much, so it's first come, first served again.)
+    Lpm,
+}
+
+/// Past this many waiting requests, `Lpm` scheduling falls back to first come, first served.
+const LPM_MAX_QUEUE: usize = 128;
 
 /// Settings for speculative decoding.
 #[derive(Clone, Copy, Debug)]
@@ -672,6 +689,23 @@ impl Engine {
 
     /// Start as many waiting requests as there's room for.
     fn admit(&mut self) {
+        if self.config.schedule == SchedulePolicy::Lpm
+            && (2..=LPM_MAX_QUEUE).contains(&self.waiting.len())
+        {
+            // Most of its prompt cached first; ties stay in the order they came in.
+            let cache = &self.cache;
+            let mut order: Vec<(usize, Sequence)> = self
+                .waiting
+                .drain(..)
+                .map(|seq| {
+                    let cacheable = seq.tokens.len() - 1;
+                    let cached = cache.match_len(seq.params.adapter, &seq.tokens[..cacheable]);
+                    (cached, seq)
+                })
+                .collect();
+            order.sort_by_key(|(cached, _)| std::cmp::Reverse(*cached));
+            self.waiting.extend(order.into_iter().map(|(_, seq)| seq));
+        }
         let mut i = 0;
         while i < self.waiting.len() && self.active.len() < self.config.max_parallel {
             let seq = &self.waiting[i];
