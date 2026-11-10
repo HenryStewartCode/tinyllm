@@ -18,7 +18,7 @@ use crate::config::{Activation, Architecture, Config};
 use crate::model::{LogitUse, Row};
 use crate::pool::Pool;
 use crate::safetensors::{FP8_BLOCK, SafeTensors, bf16_to_f32, f32_to_bf16};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::Path;
@@ -345,6 +345,10 @@ impl CudaBackend {
         let fits_tiles = n_heads / n_kv_heads <= TILE
             && head_dim.is_multiple_of(TILE)
             && TILE_CHUNK_COUNTS.contains(&(head_dim / TILE));
+        ensure!(
+            architecture.experts.is_none() && !architecture.full_qk_norms,
+            "mixtures of experts only run on the CPU so far"
+        );
         let precision = if options.precision == Precision::Bf16 && !fits_tiles {
             eprintln!("This model's attention heads don't fit 16-bit tiles, so using 32-bit.");
             Precision::F32

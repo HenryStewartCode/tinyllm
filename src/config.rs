@@ -18,6 +18,11 @@ const SUPPORTED_MODEL_TYPES: &[&str] = &[
     "gemma",
     "gemma2",
     "gemma3_text",
+    "qwen3_moe",
+    "qwen2_moe",
+    "mixtral",
+    "olmoe",
+    "granitemoe",
 ];
 
 #[derive(Debug, Clone, Deserialize)]
@@ -73,6 +78,18 @@ pub struct Config {
 
     /// How the checkpoint's weights are quantized, if they are.
     quantization_config: Option<Value>,
+
+    // Mixture of experts.
+    #[serde(alias = "num_local_experts")]
+    num_experts: Option<usize>,
+    num_experts_per_tok: Option<usize>,
+    /// The width of each expert's hidden layer, where it isn't `intermediate_size`.
+    moe_intermediate_size: Option<usize>,
+    shared_expert_intermediate_size: Option<usize>,
+    norm_topk_prob: Option<bool>,
+    decoder_sparse_step: Option<usize>,
+    mlp_only_layers: Option<Vec<usize>>,
+    clip_qkv: Option<f32>,
 
     // Granite.
     attention_multiplier: Option<f32>,
@@ -154,6 +171,36 @@ pub struct LayerShape {
     pub rope_table: usize,
     /// How many tokens it can see, counting the current one. `None` for no limit.
     pub window: Option<usize>,
+    /// Its MLP is a mixture of experts (see [`Architecture::experts`]).
+    pub sparse: bool,
+}
+
+/// Where a family keeps its experts' weights.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExpertNaming {
+    /// `mlp.gate`, `mlp.experts.N.{gate,up,down}_proj` (Qwen MoE, OLMoE).
+    Qwen,
+    /// `block_sparse_moe.gate`, `block_sparse_moe.experts.N.{w1,w3,w2}` (Mixtral).
+    Mixtral,
+    /// `block_sparse_moe.router.layer`, and every expert in one `input_linear` and one
+    /// `output_linear` (Granite MoE).
+    Granite,
+}
+
+/// A mixture-of-experts MLP: a router scores the experts for each token, and the token goes
+/// through its best few, whose outputs are added up weighted by their scores.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Experts {
+    pub count: usize,
+    /// How many each token goes through.
+    pub top_k: usize,
+    /// The width of each expert's hidden layer.
+    pub hidden: usize,
+    /// The chosen experts' weights are scaled to add up to 1.
+    pub renormalize: bool,
+    /// The width of an expert every token goes through, gated by its own score (Qwen2 MoE).
+    pub shared_hidden: Option<usize>,
+    pub naming: ExpertNaming,
 }
 
 /// What makes a family of models different from the plain Llama layout. Both backends build
@@ -184,6 +231,10 @@ pub struct Architecture {
     pub norms_after_blocks: bool,
     /// Qwen3 and Gemma 3 normalize each head of the queries and keys.
     pub head_norms: bool,
+    /// OLMoE normalizes all the queries, and all the keys, of a token together.
+    pub full_qk_norms: bool,
+    /// The mixture of experts in the layers marked `sparse`, if the model has one.
+    pub experts: Option<Experts>,
     /// The RoPE speed of each element pair in a head: one list per kind of layer.
     pub rope_tables: Vec<Vec<f32>>,
     pub layers: Vec<LayerShape>,
@@ -224,6 +275,7 @@ impl Config {
             self.partial_rotary_factor.is_none_or(|f| f == 1.0),
             "a partial_rotary_factor other than 1 is not supported"
         );
+        ensure!(self.clip_qkv.is_none(), "clip_qkv is not supported");
         if let Some(quantization) = &self.quantization_config {
             match quantization["quant_method"].as_str() {
                 Some("fp8") => {
@@ -285,7 +337,7 @@ impl Config {
 
         let attention_scale = match model_type {
             "gemma2" | "gemma3_text" => self.query_pre_attn_scalar.unwrap_or(256.0).powf(-0.5),
-            "granite" => self.attention_multiplier.unwrap_or(1.0),
+            "granite" | "granitemoe" => self.attention_multiplier.unwrap_or(1.0),
             _ => (self.head_dim() as f32).powf(-0.5),
         };
         // Gemma 3 has the setting, but its attention doesn't use it.
@@ -318,7 +370,11 @@ impl Config {
                 "sliding_attention" => self.window_size(),
                 _ => None,
             };
-            layers.push(LayerShape { rope_table, window });
+            layers.push(LayerShape {
+                rope_table,
+                window,
+                sparse: self.is_sparse(l),
+            });
         }
 
         Ok(Architecture {
@@ -333,10 +389,68 @@ impl Config {
             residual_scale: self.residual_multiplier.unwrap_or(1.0),
             combined_projections: model_type == "phi3",
             norms_after_blocks: matches!(model_type, "gemma2" | "gemma3_text"),
-            head_norms: matches!(model_type, "qwen3" | "gemma3_text"),
+            head_norms: matches!(model_type, "qwen3" | "gemma3_text" | "qwen3_moe"),
+            full_qk_norms: model_type == "olmoe",
+            experts: self.experts()?,
             rope_tables,
             layers,
         })
+    }
+
+    /// The model's mixture of experts, if it has one.
+    fn experts(&self) -> Result<Option<Experts>> {
+        let model_type = self.model_type.as_str();
+        let naming = match model_type {
+            "qwen3_moe" | "qwen2_moe" | "olmoe" => ExpertNaming::Qwen,
+            "mixtral" => ExpertNaming::Mixtral,
+            "granitemoe" => ExpertNaming::Granite,
+            _ => return Ok(None),
+        };
+        let count = self
+            .num_experts
+            .context("a mixture of experts needs num_experts")?;
+        let top_k = self.num_experts_per_tok.unwrap_or(2);
+        ensure!(
+            (1..=count).contains(&top_k),
+            "num_experts_per_tok must be between 1 and num_experts"
+        );
+        Ok(Some(Experts {
+            count,
+            top_k,
+            hidden: match model_type {
+                "qwen3_moe" | "qwen2_moe" => self
+                    .moe_intermediate_size
+                    .context("moe_intermediate_size is missing")?,
+                _ => self.intermediate_size,
+            },
+            // Mixtral and Granite take the softmax of just the chosen experts' scores, which
+            // comes to the same thing.
+            renormalize: match model_type {
+                "mixtral" | "granitemoe" => true,
+                _ => self.norm_topk_prob.unwrap_or(false),
+            },
+            shared_hidden: match model_type {
+                "qwen2_moe" => self.shared_expert_intermediate_size,
+                _ => None,
+            },
+            naming,
+        }))
+    }
+
+    /// Whether layer `l` has a mixture of experts rather than a plain MLP.
+    fn is_sparse(&self, l: usize) -> bool {
+        match self.model_type.as_str() {
+            "qwen3_moe" | "qwen2_moe" => {
+                let step = self.decoder_sparse_step.unwrap_or(1).max(1);
+                let dense = self
+                    .mlp_only_layers
+                    .as_ref()
+                    .is_some_and(|d| d.contains(&l));
+                !dense && (l + 1).is_multiple_of(step)
+            }
+            "mixtral" | "olmoe" | "granitemoe" => true,
+            _ => false,
+        }
     }
 
     /// `full_attention` or `sliding_attention`.

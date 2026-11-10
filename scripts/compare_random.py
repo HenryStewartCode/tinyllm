@@ -27,7 +27,15 @@ cases = {
     "gemma2-head256": ("gemma2", dict(hidden_size=512, head_dim=256, num_attention_heads=2, num_key_value_heads=1, query_pre_attn_scalar=64, attn_logit_softcapping=None, final_logit_softcapping=None)),
     "gemma3": ("gemma3_text", dict(gemma, sliding_window=9, sliding_window_pattern=2, query_pre_attn_scalar=16)),
     "gemma3-long": ("gemma3_text", dict(gemma, sliding_window=33, sliding_window_pattern=3, query_pre_attn_scalar=64, final_logit_softcapping=3.0)),
+    # Mixtures of experts.
+    "qwen3_moe": ("qwen3_moe", dict(moe_intermediate_size=96, num_experts=8, num_experts_per_tok=2, norm_topk_prob=True, decoder_sparse_step=1, mlp_only_layers=[1])),
+    "mixtral": ("mixtral", dict(num_local_experts=6, num_experts_per_tok=2)),
+    "olmoe": ("olmoe", dict(num_experts=8, num_experts_per_tok=3)),
+    "qwen2_moe": ("qwen2_moe", dict(moe_intermediate_size=96, shared_expert_intermediate_size=192, num_experts=8, num_experts_per_tok=2)),
+    "granitemoe": ("granitemoe", dict(num_local_experts=8, num_experts_per_tok=2, embedding_multiplier=2.0, residual_multiplier=0.5, attention_multiplier=0.1, logits_scaling=2.0)),
 }
+# The GPU doesn't run these yet.
+CPU_ONLY = {"qwen3_moe", "mixtral", "olmoe", "qwen2_moe", "granitemoe"}
 torch.manual_seed(5)
 rng = np.random.default_rng(5)
 lengths = [3, 17, 40, 70]
@@ -66,12 +74,16 @@ for name, (kind, extra) in cases.items():
             a = full(torch.tensor([ids])).logits[0].float().numpy()
             b = half(torch.tensor([ids])).logits[0].float().numpy()
         cpu = ours(path, ids, DEVICE="cpu")
-        g32 = ours(path, ids, DEVICE="cuda", PRECISION="f32")
-        g16 = ours(path, ids, DEVICE="cuda", PRECISION="bf16")
+        if name in CPU_ONLY:
+            g32 = g16 = cpu
+        else:
+            g32 = ours(path, ids, DEVICE="cuda", PRECISION="f32")
+            g16 = ours(path, ids, DEVICE="cuda", PRECISION="bf16")
         d = lambda x: float(np.abs(x - a).max())
         worst = max(worst, d(cpu), d(g32))
         print(f"{name:16} {len(ids):6d} | {d(cpu):9.2e} {d(g32):9.2e} {d(g16):9.2e} {d(b):9.2e} | {np.abs(a).max():6.1f} | {(g16.argmax(-1) == a.argmax(-1)).mean():.0%}")
-    for precision in ["f32", "bf16"]:
-        r = subprocess.run([tool, "invariance", path], capture_output=True, text=True, env={**os.environ, "DEVICE": "cuda", "PRECISION": precision})
-        print(f"    batching, GPU {precision}: {r.stdout.strip() or r.stderr[-300:]}")
+    devices = [("cpu", "f32")] if name in CPU_ONLY else [("cuda", "f32"), ("cuda", "bf16")]
+    for device, precision in devices:
+        r = subprocess.run([tool, "invariance", path], capture_output=True, text=True, env={**os.environ, "DEVICE": device, "PRECISION": precision})
+        print(f"    batching, {device} {precision}: {r.stdout.strip() or r.stderr[-300:]}")
 print("largest difference from 32-bit Hugging Face in 32-bit runs:", worst)
