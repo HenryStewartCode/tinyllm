@@ -37,8 +37,13 @@ fn open(dir: &Path, cache_tokens: usize, max_batch: usize) -> (Box<dyn Backend>,
         } else {
             cuda::Precision::Bf16
         };
+        let quantization = match std::env::var("QUANTIZATION").as_deref() {
+            Ok("int8") => Some(cuda::Quantization::Int8),
+            _ => None,
+        };
         let options = cuda::Options {
             precision,
+            quantization,
             max_batch,
             cache_bytes: Some(bytes),
             host_threads: threads,

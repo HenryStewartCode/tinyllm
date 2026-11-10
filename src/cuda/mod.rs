@@ -66,9 +66,19 @@ pub enum Precision {
     F32,
 }
 
+/// A way of storing weights in fewer bits than they come in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Quantization {
+    /// One signed byte per weight, with a scale for each group of 128 along a row, for the
+    /// matrices inside each layer. The embeddings and output projection stay 16-bit.
+    Int8,
+}
+
 #[derive(Clone, Debug)]
 pub struct Options {
     pub precision: Precision,
+    /// Store the layers' weights in fewer bits (needs 16-bit precision).
+    pub quantization: Option<Quantization>,
     /// The most tokens that will ever be passed to `forward` at once.
     pub max_batch: usize,
     /// The KV cache's size, or `None` to use the memory that's left over.
@@ -86,6 +96,9 @@ struct Matrix {
     bias: Pointer,
     /// Working space for 16-bit multiplication, when `rows` isn't a multiple of 16.
     scratch: Pointer,
+    /// For 8-bit weights, the scale of each group of 128 in each row: weight = byte * scale.
+    /// Null otherwise.
+    scales: Pointer,
 }
 
 struct Layer {
@@ -129,6 +142,9 @@ struct Kernels {
     matmul_bf16_1: Kernel,
     matmul_bf16_2: Kernel,
     matmul_bf16_4: Kernel,
+    matmul_i8_1: Kernel,
+    matmul_i8_2: Kernel,
+    matmul_i8_4: Kernel,
     swiglu_bf16: Kernel,
     geglu_bf16: Kernel,
     rope_store_bf16: Kernel,
@@ -159,6 +175,9 @@ impl Kernels {
             matmul_bf16_1: gpu.kernel(module, "matmul_bf16_1")?,
             matmul_bf16_2: gpu.kernel(module, "matmul_bf16_2")?,
             matmul_bf16_4: gpu.kernel(module, "matmul_bf16_4")?,
+            matmul_i8_1: gpu.kernel(module, "matmul_i8_1")?,
+            matmul_i8_2: gpu.kernel(module, "matmul_i8_2")?,
+            matmul_i8_4: gpu.kernel(module, "matmul_i8_4")?,
             swiglu_bf16: gpu.kernel(module, "swiglu_bf16")?,
             geglu_bf16: gpu.kernel(module, "geglu_bf16")?,
             rope_store_bf16: gpu.kernel(module, "rope_store_bf16")?,
@@ -226,6 +245,7 @@ pub struct CudaBackend {
     gpu: Gpu,
     kernels: Kernels,
     precision: Precision,
+    quantization: Option<Quantization>,
     embeddings: Pointer,
     lm_head: Matrix,
     norm: Pointer,
@@ -323,6 +343,18 @@ impl CudaBackend {
         } else {
             options.precision
         };
+        // 8-bit weights feed the tensor cores, which take 16-bit inputs.
+        let quantization = match (options.quantization, precision) {
+            (Some(_), Precision::F32) => {
+                eprintln!("8-bit weights need 16-bit precision, so they're staying 32-bit.");
+                None
+            }
+            (quantization, _) => quantization,
+        };
+        let options = &Options {
+            quantization,
+            ..options.clone()
+        };
 
         let batch_rows = options.max_batch + PADDING_ROWS;
         let mut num_params = 0;
@@ -392,6 +424,7 @@ impl CudaBackend {
                 dim,
                 batch_rows,
                 1.0,
+                options.quantization,
             )?;
             let o_proj = upload_stacked(
                 &gpu,
@@ -402,6 +435,7 @@ impl CudaBackend {
                 q_dim,
                 batch_rows,
                 architecture.residual_scale,
+                options.quantization,
             )?;
             let gate_up_names = match architecture.combined_projections {
                 true => vec![(format!("{p}.mlp.gate_up_proj"), 2 * hidden_dim)],
@@ -419,6 +453,7 @@ impl CudaBackend {
                 dim,
                 batch_rows,
                 1.0,
+                options.quantization,
             )?;
             let down = upload_stacked(
                 &gpu,
@@ -429,6 +464,7 @@ impl CudaBackend {
                 hidden_dim,
                 batch_rows,
                 architecture.residual_scale,
+                options.quantization,
             )?;
             layers.push(Layer {
                 attn_norm,
@@ -456,6 +492,7 @@ impl CudaBackend {
             dim,
             batch_rows,
             1.0,
+            None,
         )?;
         let lm_head = if st.contains("lm_head.weight") {
             upload_stacked(
@@ -467,6 +504,7 @@ impl CudaBackend {
                 dim,
                 batch_rows,
                 1.0,
+                None,
             )?
         } else {
             // Tied embeddings: the same matrix does both jobs.
@@ -534,6 +572,7 @@ impl CudaBackend {
                 gpu,
                 kernels,
                 precision,
+                quantization,
                 embeddings: embed.data,
                 lm_head,
                 norm,
@@ -1174,6 +1213,32 @@ fn launch_matmul(
     out: Pointer,
     accumulate: bool,
 ) -> Result<()> {
+    if w.scales != Pointer::NULL {
+        let (kernel, groups) = match batch {
+            1..=16 => (kernels.matmul_i8_1, 1),
+            17..=32 => (kernels.matmul_i8_2, 2),
+            _ => (kernels.matmul_i8_4, 4),
+        };
+        return gpu.launch_blocks(
+            kernel,
+            [
+                batch.div_ceil(TILE * groups),
+                w.rows.div_ceil(TILE * WARPS_ACROSS),
+            ],
+            32 * WARPS_ACROSS * groups,
+            &[
+                Arg::Ptr(w.data),
+                Arg::Ptr(w.scales),
+                Arg::Int(w.rows),
+                Arg::Int(w.cols.div_ceil(TILE)),
+                Arg::Ptr(x),
+                Arg::Int(batch),
+                Arg::Ptr(out),
+                Arg::Ptr(w.bias),
+                Arg::Int(accumulate as usize),
+            ],
+        );
+    }
     if precision == Precision::Bf16 {
         let (kernel, groups) = match batch {
             1..=16 => (kernels.matmul_bf16_1, 1),
@@ -1235,10 +1300,10 @@ fn input_buffer(gpu: &Gpu, precision: Precision, rows: usize, cols: usize) -> Re
 
 /// Rearrange row-major bfloat16 values into the tile layout (see `kernels.cu`), padded with zeros
 /// to a whole number of 16-row groups and 16-column chunks.
-fn to_tiles(values: &[u16], rows: usize, cols: usize) -> Vec<u16> {
+fn to_tiles<T: Copy + Default>(values: &[T], rows: usize, cols: usize) -> Vec<T> {
     let chunks = cols.div_ceil(TILE);
     let groups = rows.div_ceil(TILE);
-    let mut tiles = vec![0u16; groups * chunks * TILE * TILE];
+    let mut tiles = vec![T::default(); groups * chunks * TILE * TILE];
     for (row, row_values) in values.chunks_exact(cols).enumerate() {
         for (column, &value) in row_values.iter().enumerate() {
             let tile = (row / TILE) * chunks + column / TILE;
@@ -1260,6 +1325,7 @@ fn upload_stacked(
     cols: usize,
     batch_rows: usize,
     scale: f32,
+    quantization: Option<Quantization>,
 ) -> Result<Matrix> {
     let rows: usize = layers.iter().map(|(_, rows)| rows).sum();
     let padded = rows.div_ceil(BLOCK_ROWS) * BLOCK_ROWS;
@@ -1289,6 +1355,36 @@ fn upload_stacked(
             *v = f32_to_bf16(bf16_to_f32(*v) * scale);
         }
         bias.iter_mut().flatten().for_each(|v| *v *= scale);
+    }
+
+    if quantization == Some(Quantization::Int8) {
+        let values: Vec<f32> = match precision {
+            Precision::F32 => f32_values,
+            Precision::Bf16 => bf16_values.iter().map(|&v| bf16_to_f32(v)).collect(),
+        };
+        let (bytes, scales) = quantize_groups(&values, rows, cols);
+        let tiles = to_lane_tiles(&bytes, rows, cols);
+        let data = gpu.alloc(tiles.len().div_ceil(4))?;
+        gpu.write_now(data, &tiles)?;
+        let scales_device = gpu.alloc(scales.len())?;
+        gpu.write_now(scales_device, &scales)?;
+        let bias = match bias {
+            Some(values) => {
+                let device = gpu.alloc(rows)?;
+                gpu.write_now(device, &values)?;
+                device
+            }
+            None => Pointer::NULL,
+        };
+        let _ = batch_rows;
+        return Ok(Matrix {
+            data,
+            rows,
+            cols,
+            bias,
+            scratch: Pointer::NULL,
+            scales: scales_device,
+        });
     }
 
     let data = match precision {
@@ -1325,7 +1421,65 @@ fn upload_stacked(
         cols,
         bias,
         scratch,
+        scales: Pointer::NULL,
     })
+}
+
+/// Rearrange row-major bytes into 16x16 tiles in the order the 8-bit kernel's lanes read them (see
+/// "8-bit weights" in `kernels.cu`), padded with zeros to whole tiles.
+fn to_lane_tiles(values: &[i8], rows: usize, cols: usize) -> Vec<i8> {
+    let chunks = cols.div_ceil(TILE);
+    let groups = rows.div_ceil(TILE);
+    let mut tiles = vec![0i8; groups * chunks * TILE * TILE];
+    let at = |row: usize, column: usize| -> i8 {
+        match row < rows && column < cols {
+            true => values[row * cols + column],
+            false => 0,
+        }
+    };
+    for group in 0..groups {
+        for chunk in 0..chunks {
+            let tile = &mut tiles[(group * chunks + chunk) * TILE * TILE..][..TILE * TILE];
+            for lane in 0..32 {
+                let (g, t) = (lane / 4, lane % 4);
+                for half in 0..2 {
+                    let row = group * TILE + half * 8 + g;
+                    for (j, k) in [2 * t, 2 * t + 1, 2 * t + 8, 2 * t + 9]
+                        .into_iter()
+                        .enumerate()
+                    {
+                        tile[lane * 8 + half * 4 + j] = at(row, chunk * TILE + k);
+                    }
+                }
+            }
+        }
+    }
+    tiles
+}
+
+/// Weights in a group sharing one scale, for 8-bit weights.
+const QUANT_GROUP: usize = 128;
+
+/// Each row as signed bytes, with a scale for each group of 128 (its largest magnitude over 127)
+/// so that `value ≈ byte * scale`. Scales are `[rows, groups]`.
+fn quantize_groups(values: &[f32], rows: usize, cols: usize) -> (Vec<i8>, Vec<f32>) {
+    let groups = cols.div_ceil(QUANT_GROUP);
+    let mut bytes = vec![0i8; rows * cols];
+    let mut scales = vec![0.0f32; rows * groups];
+    for (r, row) in values.chunks_exact(cols).enumerate() {
+        for (g, group) in row.chunks(QUANT_GROUP).enumerate() {
+            let largest = group.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            let scale = largest / 127.0;
+            scales[r * groups + g] = scale;
+            if scale > 0.0 {
+                let out = &mut bytes[r * cols + g * QUANT_GROUP..][..group.len()];
+                for (byte, &v) in out.iter_mut().zip(group) {
+                    *byte = (v / scale).round().clamp(-127.0, 127.0) as i8;
+                }
+            }
+        }
+    }
+    (bytes, scales)
 }
 
 /// Floats needed for one 16x16 tile for each tile of a `[batch_rows, rows]` output.
@@ -1341,9 +1495,10 @@ impl Backend for CudaBackend {
     }
 
     fn describe(&self) -> String {
-        let weights = match self.precision {
-            Precision::Bf16 => "16-bit",
-            Precision::F32 => "32-bit",
+        let weights = match (self.precision, self.quantization) {
+            (_, Some(Quantization::Int8)) => "8-bit",
+            (Precision::Bf16, None) => "16-bit",
+            (Precision::F32, None) => "32-bit",
         };
         format!("{} (CUDA, {weights} weights)", self.gpu_name)
     }
@@ -1569,6 +1724,95 @@ mod tests {
     }
 
     #[test]
+    fn matmul_with_8_bit_weights_matches_arithmetic() {
+        let Ok(gpu) = Gpu::open() else {
+            return;
+        };
+        gpu.attach().unwrap();
+        let module = gpu.load_kernels(KERNELS_PTX).unwrap();
+        let kernels = Kernels::find(&gpu, &module).unwrap();
+        // Columns past one group of 128 (and not a whole number of them), rows past one tile.
+        for (m, n, batch) in [
+            (16, 16, 1),
+            (40, 144, 17),
+            (33, 300, 3),
+            (64, 256, 64),
+            (7, 129, 2),
+        ] {
+            for (use_bias, accumulate) in [(false, false), (true, true)] {
+                let w_values = pseudo_random(m * n, 11);
+                let x_values = pseudo_random(batch * n, 7);
+                let bias_values = pseudo_random(m, 5);
+                let start_values = pseudo_random(batch * m, 3);
+                let (bytes, scales) = quantize_groups(&w_values, m, n);
+                let groups = n.div_ceil(QUANT_GROUP);
+                let dequantized: Vec<f32> = (0..m * n)
+                    .map(|i| bytes[i] as f32 * scales[(i / n) * groups + (i % n) / QUANT_GROUP])
+                    .collect();
+                let tiles = to_lane_tiles(&bytes, m, n);
+                let data = gpu.alloc(tiles.len().div_ceil(4)).unwrap();
+                gpu.write_now(data, &tiles).unwrap();
+                let scales_device = gpu.alloc(scales.len()).unwrap();
+                gpu.write_now(scales_device, &scales).unwrap();
+                let x16: Vec<u16> = x_values.iter().map(|&v| f32_to_bf16(v)).collect();
+                let rounded_x: Vec<f32> = x16.iter().map(|&h| bf16_to_f32(h)).collect();
+                let x = input_buffer(&gpu, Precision::Bf16, batch + PADDING_ROWS, n).unwrap();
+                gpu.write_now(x, &to_tiles(&x16, batch, n)).unwrap();
+                let bias = match use_bias {
+                    true => {
+                        let device = gpu.alloc(m).unwrap();
+                        gpu.write_now(device, &bias_values).unwrap();
+                        device
+                    }
+                    false => Pointer::NULL,
+                };
+                let out = gpu.alloc((batch + PADDING_ROWS) * m).unwrap();
+                gpu.write_now(out, &start_values).unwrap();
+                let matrix = Matrix {
+                    data,
+                    rows: m,
+                    cols: n,
+                    bias,
+                    scratch: Pointer::NULL,
+                    scales: scales_device,
+                };
+                launch_matmul(
+                    &gpu,
+                    &kernels,
+                    Precision::Bf16,
+                    &matrix,
+                    x,
+                    batch,
+                    out,
+                    accumulate,
+                )
+                .unwrap();
+                let mut result = vec![0.0f32; batch * m];
+                gpu.read(out, &mut result).unwrap();
+                gpu.wait().unwrap();
+                for b in 0..batch {
+                    for r in 0..m {
+                        let mut expected: f64 = (0..n)
+                            .map(|i| dequantized[r * n + i] as f64 * rounded_x[b * n + i] as f64)
+                            .sum();
+                        if use_bias {
+                            expected += bias_values[r] as f64;
+                        }
+                        if accumulate {
+                            expected += start_values[b * m + r] as f64;
+                        }
+                        let got = result[b * m + r] as f64;
+                        assert!(
+                            (got - expected).abs() < 5e-4 * (1.0 + expected.abs()),
+                            "{m}x{n} batch {batch}: [{b}][{r}] = {got}, expected {expected}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn matmul_kernels_match_arithmetic() {
         let Ok(gpu) = Gpu::open() else {
             return;
@@ -1639,6 +1883,7 @@ mod tests {
                         cols: n,
                         bias,
                         scratch,
+                        scales: Pointer::NULL,
                     };
                     launch_matmul(
                         &gpu, &kernels, precision, &matrix, x, batch, out, accumulate,

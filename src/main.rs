@@ -57,6 +57,13 @@ enum ToolParserArg {
     Llama3,
 }
 
+/// How to store weights in fewer bits.
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum QuantizationArg {
+    /// One byte per weight, with a scale per row, for the layers (GPU only for now)
+    Int8,
+}
+
 /// How to guess tokens ahead (speculative decoding).
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum SpeculativeArg {
@@ -139,6 +146,10 @@ struct Args {
     /// Number precision on the GPU
     #[arg(long, value_enum, default_value_t = PrecisionArg::Bf16)]
     precision: PrecisionArg,
+
+    /// Store the layers' weights in fewer bits: less memory, faster steps, a little rounding
+    #[arg(long, value_enum)]
+    quantization: Option<QuantizationArg>,
 
     /// Number of CPU worker threads (default: performance cores minus two)
     #[arg(long)]
@@ -233,6 +244,9 @@ fn main() -> Result<()> {
     };
     let (config, num_params, backend) = if on_gpu {
         let options = cuda::Options {
+            quantization: args.quantization.map(|q| match q {
+                QuantizationArg::Int8 => cuda::Quantization::Int8,
+            }),
             precision: match args.precision {
                 PrecisionArg::Bf16 => cuda::Precision::Bf16,
                 PrecisionArg::F32 => cuda::Precision::F32,

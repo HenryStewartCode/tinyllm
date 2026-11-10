@@ -4,7 +4,7 @@ prompts, and greedy generations, on the CPU (32-bit) and the GPU (16-bit, and 32
 Hugging Face's 32-bit reference runs on the CPU and its 16-bit one on the GPU, one at a time,
 so this works for models that would be too big to hold both on the GPU at once.
 
-usage: compare_checkpoint.py HARNESS MODEL_DIR [--no-gpu] [--no-gpu32]"""
+usage: compare_checkpoint.py HARNESS MODEL_DIR [--no-gpu] [--no-gpu32] [--int8]"""
 import gc, json, os, subprocess, sys, tempfile
 import numpy as np, torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -62,6 +62,8 @@ if use_gpu32:
     runs.append(("GPU 32-bit", dict(DEVICE="cuda", PRECISION="f32")))
 if use_gpu:
     runs.append(("GPU 16-bit", dict(DEVICE="cuda", PRECISION="bf16")))
+if use_gpu and "--int8" in sys.argv:
+    runs.append(("GPU 8-bit", dict(DEVICE="cuda", PRECISION="bf16", QUANTIZATION="int8")))
 worst32 = 0.0
 for p, ids in enumerate(prompts):
     a, greedy = full[p]
@@ -69,7 +71,7 @@ for p, ids in enumerate(prompts):
     for label, env in runs:
         logits, generated = ours(ids, **env)
         diff = float(np.abs(logits - a).max())
-        if "16" not in label:
+        if "16" not in label and "8-bit" not in label:
             worst32 = max(worst32, diff)
         agree = (logits.argmax(-1) == a.argmax(-1)).mean()
         line += f" | {label}: {diff:.1e}, top-1 {agree:.0%}, greedy {same_for(generated, greedy)}/{N_GEN}"

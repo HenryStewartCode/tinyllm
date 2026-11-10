@@ -476,6 +476,118 @@ MATMUL_BF16(1)
 MATMUL_BF16(2)
 MATMUL_BF16(4)
 
+// ---------------------------------------------------------------------------------------------
+// 8-bit weights
+// ---------------------------------------------------------------------------------------------
+// With --quantization int8, each layer's matrices hold one signed byte per weight and a scale for
+// each group of 128 weights along a row: weight = byte * scale. Bytes are exact in bfloat16, so
+// they're widened in registers and multiplied on the tensor cores, and each group's sums are
+// multiplied by its scale as they're added up: half the bytes of 16-bit weights to read per
+// step, for a little rounding.
+//
+// This uses the tensor cores' own instruction (mma.m16n8k16) rather than wmma, because its
+// register layout is documented: the bytes are stored in exactly the order each lane needs them,
+// so a lane reads its 8 bytes of a 16x16 tile in one load, with no trip through shared memory.
+// For the tile of weight rows n = 0..15 and columns k = 0..15, lane l (g = l / 4, t = l % 4)
+// holds, for each half h of the rows, row n = 8h + g at columns 2t, 2t+1, 2t+8 and 2t+9.
+#define I8_LOADS 8 // chunks of 16 columns: one group of 128
+
+__device__ __forceinline__ unsigned bf16_pair(float low, float high) {
+    __nv_bfloat162 pair = __floats2bfloat162_rn(low, high);
+    return *reinterpret_cast<unsigned *>(&pair);
+}
+
+// acc += A (16x16, row-major) * B (16x8, column-major), with bfloat16 inputs.
+__device__ __forceinline__ void mma_bf16(float *acc, const unsigned *a, unsigned b0, unsigned b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, "
+                 "{%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+                 : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+template <int TX>
+__device__ __forceinline__ void matmul_tiles_i8(const signed char *w, const float *scales, int m,
+                                                int chunks, const __nv_bfloat16 *x, int batch,
+                                                float *out, const float *bias, int accumulate) {
+    const int warp = threadIdx.x / WARP, lane = threadIdx.x % WARP;
+    const int x_group = blockIdx.x * TX + warp / WARPS_ACROSS;
+    const int w_group = blockIdx.y * WARPS_ACROSS + warp % WARPS_ACROSS;
+    const int first_row = x_group * TILE, first_column = w_group * TILE;
+    if (first_row >= batch || first_column >= m)
+        return; // this warp only has padding to work on
+    const int g = lane / 4, t = lane % 4;
+
+    // Inputs are 16-bit tiles; as pairs of values, row r of a tile starts at word 8r.
+    const unsigned *x_words =
+        reinterpret_cast<const unsigned *>(x + (size_t)x_group * chunks * TILE_ELEMENTS);
+    const int2 *w_lanes =
+        reinterpret_cast<const int2 *>(w + (size_t)w_group * chunks * TILE_ELEMENTS) + lane;
+    const int groups = (chunks + I8_LOADS - 1) / I8_LOADS;
+    float acc[2][4] = {{0.0f, 0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f, 0.0f}};
+    for (int c = 0; c < chunks; c += I8_LOADS) {
+        const int n = min(I8_LOADS, chunks - c);
+        float part[2][4] = {{0.0f, 0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f, 0.0f}};
+        int2 bytes[I8_LOADS];
+        unsigned a[I8_LOADS][4];
+#pragma unroll
+        for (int i = 0; i < I8_LOADS; i++) {
+            if (i < n) {
+                bytes[i] = w_lanes[(size_t)(c + i) * WARP];
+                const unsigned *tile = x_words + (size_t)(c + i) * (TILE_ELEMENTS / 2);
+                a[i][0] = tile[g * 8 + t];
+                a[i][1] = tile[(g + 8) * 8 + t];
+                a[i][2] = tile[g * 8 + t + 4];
+                a[i][3] = tile[(g + 8) * 8 + t + 4];
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < I8_LOADS; i++) {
+            if (i < n) {
+                const signed char *b = reinterpret_cast<const signed char *>(&bytes[i]);
+                mma_bf16(part[0], a[i], bf16_pair(b[0], b[1]), bf16_pair(b[2], b[3]));
+                mma_bf16(part[1], a[i], bf16_pair(b[4], b[5]), bf16_pair(b[6], b[7]));
+            }
+        }
+        // This lane's weight rows are 8h + 2t and 8h + 2t + 1 of the warp's 16.
+        const int group = c / I8_LOADS;
+        for (int h = 0; h < 2; h++) {
+            for (int j = 0; j < 2; j++) {
+                const int row = min(first_column + h * 8 + 2 * t + j, m - 1);
+                const float scale = scales[(size_t)row * groups + group];
+                acc[h][j] += part[h][j] * scale;
+                acc[h][j + 2] += part[h][j + 2] * scale;
+            }
+        }
+    }
+
+    // Lane (g, t) has rows g and g + 8, and columns 2t and 2t + 1 of each half.
+    for (int h = 0; h < 2; h++) {
+        for (int j = 0; j < 4; j++) {
+            const int row = first_row + g + (j / 2) * 8;
+            const int column = first_column + h * 8 + 2 * t + j % 2;
+            if (column >= m)
+                continue;
+            float value = acc[h][j];
+            if (bias)
+                value += bias[column];
+            float *at = out + (size_t)row * m + column;
+            *at = accumulate ? *at + value : value;
+        }
+    }
+}
+
+// matmul_i8_TX: out[b][m] = dot(w[m], x[b]) (+ bias[m]), added to what's there if `accumulate`,
+// with 8-bit weights in the lane order above and `scales: [m, groups of 128 columns]`.
+#define MATMUL_I8(TX)                                                                          \
+    extern "C" __global__ void matmul_i8_##TX(const signed char *w, const float *scales, int m,  \
+                                              int chunks, const __nv_bfloat16 *x, int batch,   \
+                                              float *out, const float *bias, int accumulate) { \
+        matmul_tiles_i8<TX>(w, scales, m, chunks, x, batch, out, bias, accumulate);            \
+    }
+MATMUL_I8(1)
+MATMUL_I8(2)
+MATMUL_I8(4)
+
 // One block per row, as rope_store, with the keys and values stored 16-bit in the tile layout:
 // the KV pools are `[slots, kv_dim]` matrices, so a page of 16 slots is one group of tiles.
 extern "C" __global__ void rope_store_bf16(float *qkv, int stride, const float *cos_table,
