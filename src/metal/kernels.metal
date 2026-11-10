@@ -81,11 +81,12 @@ inline float sum_of_squares(device const float4 *from, uint dim, threadgroup flo
 }
 
 // One threadgroup per row: out[row] = x[r] / sqrt(mean(x[r]^2) + eps) * weight, where r is `row`,
-// or `rows[row]` when only some rows are wanted.
+// or `rows[row]` when only some rows are wanted, and x's rows are `stride` floats apart.
 struct NormArgs {
     uint dim;
     float eps;
     uint select;
+    uint stride;
 };
 kernel void rmsnorm(device const float *x [[buffer(0)]], device float *out [[buffer(1)]],
                     device const float *weight [[buffer(2)]], device const uint *rows [[buffer(3)]],
@@ -94,7 +95,7 @@ kernel void rmsnorm(device const float *x [[buffer(0)]], device float *out [[buf
                     uint simd [[simdgroup_index_in_threadgroup]],
                     uint lane [[thread_index_in_simdgroup]]) {
     threadgroup float partial[NORM_THREADS / SIMD];
-    device const float4 *from = (device const float4 *)(x + (ulong)(a.select ? rows[row] : row) * a.dim);
+    device const float4 *from = (device const float4 *)(x + (ulong)(a.select ? rows[row] : row) * a.stride);
     const float scale = 1.0f / sqrt(sum_of_squares(from, a.dim, partial, tid, simd, lane) / a.dim + a.eps);
     device float4 *to = (device float4 *)(out + (ulong)row * a.dim);
     device const float4 *w = (device const float4 *)weight;
@@ -111,7 +112,7 @@ kernel void rmsnorm_add(device const float *y [[buffer(0)]], device float *x [[b
                         uint simd [[simdgroup_index_in_threadgroup]],
                         uint lane [[thread_index_in_simdgroup]]) {
     threadgroup float partial[NORM_THREADS / SIMD];
-    device const float4 *from = (device const float4 *)(y + (ulong)row * a.dim);
+    device const float4 *from = (device const float4 *)(y + (ulong)row * a.stride);
     const float scale = 1.0f / sqrt(sum_of_squares(from, a.dim, partial, tid, simd, lane) / a.dim + a.eps);
     device float4 *to = (device float4 *)(x + (ulong)row * a.dim);
     device const float4 *w = (device const float4 *)weight;
@@ -167,6 +168,8 @@ struct MatmulArgs {
     float scale;
     uint accumulate;
     uint has_bias;
+    // How far apart the output's rows are (usually m).
+    uint out_stride;
 };
 
 // How many groups of 8 columns each run has.
@@ -178,7 +181,7 @@ inline void finish_output(device float *out, device const float *bias, constant 
     float value = total * a.scale;
     if (a.has_bias)
         value += bias[m];
-    device float *at = out + (ulong)b * a.m + m;
+    device float *at = out + (ulong)b * a.out_stride + m;
     *at = a.accumulate ? *at + value : value;
 }
 
@@ -612,4 +615,487 @@ kernel void lora_expand(device const float *h [[buffer(0)]], device const float 
     for (uint j = 0; j < args.rank; j++)
         sum += bo[j] * hr[j];
     out[(ulong)row * args.out_dim + o] += sum;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Mixtures of experts
+// ---------------------------------------------------------------------------------------------
+// A token goes through the few experts its router scores best, as on CUDA (see kernels.cu):
+// moe_route picks each row's experts, moe_sort lays out the (row, expert) pairs grouped by
+// expert, each expert's run padded to whole groups of `group_rows` rows, moe_gather copies the
+// rows into that order, the grouped matmuls multiply each group by its expert's weights, and
+// moe_combine adds up each row's results in order of expert. The grouped matmuls are dispatched
+// for as many groups as there could be, and those past the real number stop at once, so the CPU
+// never has to wait to see which experts were chosen.
+#define MAX_TOP_K 16
+#define MAX_EXPERTS 512
+#define MAX_GROUPS 32
+
+struct RouteArgs {
+    uint experts;
+    uint top_k;
+    uint renormalize;
+    // DeepSeek's routing (see `Routing` in config.rs), rather than the softmax's top_k.
+    uint deepseek;
+    uint sigmoid;
+    uint groups;
+    uint top_groups;
+    float scale;
+    uint has_correction;
+};
+
+// One simdgroup per row. The usual routing: the softmax of the scores, the top_k best, weights
+// renormalized to add up to 1 if asked. DeepSeek's: weights from the softmax or from sigmoids,
+// experts chosen by those plus `correction` from the best `top_groups` of `groups` equal groups
+// (scored by their best member, or best two with sigmoids), renormalized if asked, then scaled.
+// Ties go to the lower number. Written in order of expert.
+kernel void moe_route(device const float *scores [[buffer(0)]],
+                      device const float *correction [[buffer(1)]],
+                      device uint *topk_ids [[buffer(2)]], device float *topk_weights [[buffer(3)]],
+                      constant RouteArgs &a [[buffer(4)]],
+                      uint row [[threadgroup_position_in_grid]],
+                      uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float weight[MAX_EXPERTS], choice[MAX_EXPERTS], group_score[MAX_GROUPS];
+    threadgroup uint allowed[MAX_GROUPS];
+    device const float *s = scores + (ulong)row * a.experts;
+    float largest = -INFINITY, sum = 0.0f;
+    if (!a.sigmoid) {
+        for (uint i = lane; i < a.experts; i += SIMD)
+            largest = max(largest, s[i]);
+        largest = simd_max(largest);
+        for (uint i = lane; i < a.experts; i += SIMD)
+            sum += precise::exp(s[i] - largest);
+        sum = simd_sum(sum);
+    }
+    for (uint i = lane; i < a.experts; i += SIMD) {
+        const float w = a.sigmoid ? 1.0f / (1.0f + precise::exp(-s[i])) : precise::exp(s[i] - largest) / sum;
+        weight[i] = w;
+        // The usual routing chooses by the scores themselves.
+        choice[i] = !a.deepseek ? s[i] : a.has_correction ? w + correction[i] : w;
+    }
+    const uint groups = a.deepseek ? a.groups : 1, per_group = a.experts / groups;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint g = lane; g < groups; g += SIMD) {
+        float first = -INFINITY, second = -INFINITY;
+        for (uint i = g * per_group; i < (g + 1) * per_group; i++) {
+            const float c = choice[i];
+            if (c > first) {
+                second = first;
+                first = c;
+            } else if (c > second) {
+                second = c;
+            }
+        }
+        group_score[g] = a.sigmoid ? first + (per_group > 1 ? second : 0.0f) : first;
+        allowed[g] = 0;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0) {
+        for (uint k = 0; k < min(a.deepseek ? a.top_groups : 1, groups); k++) {
+            int best = -1;
+            for (uint g = 0; g < groups; g++)
+                if (!allowed[g] && (best < 0 || group_score[g] > group_score[best]))
+                    best = g;
+            allowed[best] = 1;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint chosen[MAX_TOP_K];
+    float chosen_weight[MAX_TOP_K];
+    float total = 0.0f;
+    for (uint k = 0; k < a.top_k; k++) {
+        float best = -INFINITY;
+        uint best_i = 0xffffffffu;
+        for (uint i = lane; i < a.experts; i += SIMD) {
+            bool taken = !allowed[i / per_group];
+            for (uint j = 0; j < k; j++)
+                taken |= chosen[j] == i;
+            if (!taken && (choice[i] > best || (choice[i] == best && i < best_i))) {
+                best = choice[i];
+                best_i = i;
+            }
+        }
+        for (uint step = SIMD / 2; step > 0; step >>= 1) {
+            const float other = simd_shuffle_xor(best, step);
+            const uint other_i = simd_shuffle_xor(best_i, step);
+            if (other > best || (other == best && other_i < best_i)) {
+                best = other;
+                best_i = other_i;
+            }
+        }
+        chosen[k] = best_i;
+        chosen_weight[k] = weight[best_i];
+        total += chosen_weight[k];
+    }
+    if (lane != 0)
+        return;
+    for (uint k = 1; k < a.top_k; k++) {
+        for (uint j = k; j > 0 && chosen[j - 1] > chosen[j]; j--) {
+            const uint id = chosen[j];
+            chosen[j] = chosen[j - 1];
+            chosen[j - 1] = id;
+            const float w = chosen_weight[j];
+            chosen_weight[j] = chosen_weight[j - 1];
+            chosen_weight[j - 1] = w;
+        }
+    }
+    // DeepSeek's renormalization keeps clear of dividing by 0.
+    const float divisor = a.renormalize ? total + (a.deepseek ? 1e-20f : 0.0f) : 1.0f;
+    for (uint k = 0; k < a.top_k; k++) {
+        topk_ids[row * a.top_k + k] = chosen[k];
+        topk_weights[row * a.top_k + k] = (a.renormalize ? chosen_weight[k] / divisor : chosen_weight[k]) * (a.deepseek ? a.scale : 1.0f);
+    }
+}
+
+// One threadgroup: lay out the (row, expert) pairs grouped by expert, each expert's run padded to
+// a whole number of groups. Each thread takes some experts and finds their pairs in order, so
+// the layout is the same every time. `slot_of[pair]` is where a pair went; `sorted_rows[slot]`
+// is its row (or -1 for padding); `group_expert[group]` is each group's expert.
+struct SortArgs {
+    uint rows;
+    uint top_k;
+    uint experts;
+    uint group_rows;
+};
+kernel void moe_sort(device const uint *topk_ids [[buffer(0)]], device int *sorted_rows [[buffer(1)]],
+                     device uint *slot_of [[buffer(2)]], device uint *group_expert [[buffer(3)]],
+                     device uint *num_groups [[buffer(4)]], constant SortArgs &a [[buffer(5)]],
+                     uint tid [[thread_position_in_threadgroup]],
+                     uint threads [[threads_per_threadgroup]]) {
+    threadgroup uint counts[MAX_EXPERTS], starts[MAX_EXPERTS + 1];
+    const uint pairs = a.rows * a.top_k, size = a.group_rows;
+    for (uint e = tid; e < a.experts; e += threads) {
+        uint count = 0;
+        for (uint i = 0; i < pairs; i++)
+            count += topk_ids[i] == e;
+        counts[e] = count;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        uint at = 0;
+        for (uint e = 0; e < a.experts; e++) {
+            starts[e] = at;
+            at += (counts[e] + size - 1) / size * size;
+        }
+        starts[a.experts] = at;
+        *num_groups = at / size;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint e = tid; e < a.experts; e += threads) {
+        uint at = starts[e];
+        for (uint i = 0; i < pairs; i++) {
+            if (topk_ids[i] == e) {
+                sorted_rows[at] = i / a.top_k;
+                slot_of[i] = at;
+                at++;
+            }
+        }
+        for (; at < starts[e + 1]; at++)
+            sorted_rows[at] = -1;
+        for (uint g = starts[e] / size; g < starts[e + 1] / size; g++)
+            group_expert[g] = e;
+    }
+}
+
+// One threadgroup per slot: copy its row (zeros for padding), `dim` floats.
+struct GatherArgs {
+    uint dim;
+    uint group_rows;
+};
+kernel void moe_gather(device const float4 *x [[buffer(0)]], device const int *sorted_rows [[buffer(1)]],
+                       device const uint *num_groups [[buffer(2)]], device float4 *out [[buffer(3)]],
+                       constant GatherArgs &a [[buffer(4)]], uint slot [[threadgroup_position_in_grid]],
+                       uint tid [[thread_position_in_threadgroup]],
+                       uint threads [[threads_per_threadgroup]]) {
+    if (slot >= *num_groups * a.group_rows)
+        return;
+    const int row = sorted_rows[slot];
+    const uint vectors = a.dim / 4;
+    for (uint i = tid; i < vectors; i += threads)
+        out[(ulong)slot * vectors + i] = row < 0 ? float4(0.0f) : x[(ulong)row * vectors + i];
+}
+
+// moe_matmul_*: matmul_* for each group of rows (8 for vec, MM_BN for mma) and its expert, whose
+// `[m, n]` weights (and biases) follow the expert before's.
+#define MOE_MATMUL_ARGS(W)                                                                         \
+    MATMUL_ARGS(W), device const uint *group_expert [[buffer(5)]],                                 \
+        device const uint *num_groups [[buffer(6)]]
+#define EXPERT_WEIGHTS                                                                             \
+    if (group.y >= *num_groups)                                                                    \
+        return;                                                                                    \
+    const ulong expert = group_expert[group.y];                                                    \
+    device const float *expert_bias = bias + (a.has_bias ? expert * a.m : 0);
+kernel void moe_matmul_vec_bf16(MOE_MATMUL_ARGS(ushort), uint simds [[simdgroups_per_threadgroup]],
+                                uint lane [[thread_index_in_simdgroup]]) {
+    EXPERT_WEIGHTS
+    matmul_vec_rows(w + expert * a.m * a.n, x, out, expert_bias, a, group, simd, simds, lane);
+}
+kernel void moe_matmul_vec_f32(MOE_MATMUL_ARGS(float), uint simds [[simdgroups_per_threadgroup]],
+                               uint lane [[thread_index_in_simdgroup]]) {
+    EXPERT_WEIGHTS
+    matmul_vec_rows(w + expert * a.m * a.n, x, out, expert_bias, a, group, simd, simds, lane);
+}
+kernel void moe_matmul_mma_bf16(MOE_MATMUL_ARGS(ushort), uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float shared[MM_SHARED];
+    EXPERT_WEIGHTS
+    matmul_mma_rows(w + expert * a.m * a.n, x, out, expert_bias, a, shared, group, simd, tid);
+}
+kernel void moe_matmul_mma_f32(MOE_MATMUL_ARGS(float), uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float shared[MM_SHARED];
+    EXPERT_WEIGHTS
+    matmul_mma_rows(w + expert * a.m * a.n, x, out, expert_bias, a, shared, group, simd, tid);
+}
+
+// Each row adds up what its experts made of it, weighted, in order of expert, and adds that to
+// the residual stream.
+struct CombineArgs {
+    uint dim;
+    uint top_k;
+};
+kernel void moe_combine(device const float *down [[buffer(0)]], device const uint *slot_of [[buffer(1)]],
+                        device const float *topk_weights [[buffer(2)]], device float *x [[buffer(3)]],
+                        constant CombineArgs &a [[buffer(4)]],
+                        uint2 group [[threadgroup_position_in_grid]],
+                        uint2 tid [[thread_position_in_threadgroup]],
+                        uint2 threads [[threads_per_threadgroup]]) {
+    const uint row = group.y, i = group.x * threads.x + tid.x;
+    if (i >= a.dim)
+        return;
+    float sum = 0.0f;
+    for (uint k = 0; k < a.top_k; k++)
+        sum += topk_weights[row * a.top_k + k] * down[(ulong)slot_of[row * a.top_k + k] * a.dim + i];
+    x[(ulong)row * a.dim + i] += sum;
+}
+
+// For a shared expert with a gate of its own (Qwen2 MoE): x += sigmoid(gate) * y.
+kernel void add_gated(device const float *y [[buffer(0)]], device const float *gate [[buffer(1)]],
+                      device float *x [[buffer(2)]], constant uint &dim [[buffer(3)]],
+                      uint2 group [[threadgroup_position_in_grid]],
+                      uint2 tid [[thread_position_in_threadgroup]],
+                      uint2 threads [[threads_per_threadgroup]]) {
+    const uint row = group.y, i = group.x * threads.x + tid.x;
+    if (i >= dim)
+        return;
+    const float scale = 1.0f / (1.0f + precise::exp(-gate[row]));
+    x[(ulong)row * dim + i] += scale * y[(ulong)row * dim + i];
+}
+
+// ---------------------------------------------------------------------------------------------
+// DeepSeek's latent attention
+// ---------------------------------------------------------------------------------------------
+// As on CUDA (see kernels.cu): the cache holds each token's normalized latent (`rank` wide) and
+// the rotated part of its keys that all heads share, and each head scores its query against the
+// latent through that head's key matrix (folded into the query by matmul_heads), then expands its
+// blend of latents with its value matrix. Attention is then one key/value head, whose values are
+// the first `rank` elements of its keys.
+
+// matmul_heads_*: matmul_* for each head in turn (the grid's third dimension), with head h's
+// weights, inputs and outputs `w_stride`, `x_stride` and `out_offset` elements after head h - 1's.
+struct HeadArgs {
+    uint w_stride;
+    uint x_stride;
+    uint out_offset;
+};
+#define HEADS_ARGS(W)                                                                              \
+    device const W *w [[buffer(0)]], device const float *x [[buffer(1)]],                          \
+        device float *out [[buffer(2)]], device const float *bias [[buffer(3)]],                   \
+        constant MatmulArgs &a [[buffer(4)]], constant HeadArgs &h [[buffer(5)]],                  \
+        uint3 group3 [[threadgroup_position_in_grid]], uint simd [[simdgroup_index_in_threadgroup]]
+#define HEAD_PARTS(W)                                                                              \
+    const ulong head = group3.z;                                                                   \
+    const uint2 group = group3.xy;                                                                 \
+    device const W *head_w = w + head * h.w_stride;                                                \
+    device const float *head_x = x + head * h.x_stride;                                            \
+    device float *head_out = out + head * h.out_offset;
+kernel void matmul_heads_vec_bf16(HEADS_ARGS(ushort), uint simds [[simdgroups_per_threadgroup]],
+                                  uint lane [[thread_index_in_simdgroup]]) {
+    HEAD_PARTS(ushort)
+    matmul_vec_rows(head_w, head_x, head_out, bias, a, group, simd, simds, lane);
+}
+kernel void matmul_heads_vec_f32(HEADS_ARGS(float), uint simds [[simdgroups_per_threadgroup]],
+                                 uint lane [[thread_index_in_simdgroup]]) {
+    HEAD_PARTS(float)
+    matmul_vec_rows(head_w, head_x, head_out, bias, a, group, simd, simds, lane);
+}
+kernel void matmul_heads_mma_bf16(HEADS_ARGS(ushort), uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float shared[MM_SHARED];
+    HEAD_PARTS(ushort)
+    matmul_mma_rows(head_w, head_x, head_out, bias, a, shared, group, simd, tid);
+}
+kernel void matmul_heads_mma_f32(HEADS_ARGS(float), uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float shared[MM_SHARED];
+    HEAD_PARTS(float)
+    matmul_mma_rows(head_w, head_x, head_out, bias, a, shared, group, simd, tid);
+}
+
+struct LatentArgs {
+    uint n_heads;
+    uint nope;
+    uint rope;
+    uint rank;
+    // How far apart rows of the queries (or of the stacked kv_a outputs) are.
+    uint stride;
+    // Rows of working memory: how far apart one head's part of it is from the next.
+    uint rows;
+    float eps;
+};
+
+// One threadgroup per row: rotate the rotated part of each head's query (`nope` into the head,
+// in adjacent pairs, as DeepSeek lays them out), into its place after the latent part of the
+// attention query (`[rows][heads][rank + rope]`), and copy each head's unrotated part to
+// `q_nope`, `[heads][rows][nope]`, for matmul_heads.
+kernel void latent_queries(device const float *q [[buffer(0)]], device const float *cos_table [[buffer(1)]],
+                           device const float *sin_table [[buffer(2)]], device float *q_nope [[buffer(3)]],
+                           device float *query [[buffer(4)]], constant LatentArgs &a [[buffer(5)]],
+                           uint row [[threadgroup_position_in_grid]],
+                           uint tid [[thread_position_in_threadgroup]],
+                           uint threads [[threads_per_threadgroup]]) {
+    const uint half_rope = a.rope / 2, width = a.nope + a.rope, key = a.rank + a.rope;
+    device const float *queries = q + (ulong)row * a.stride;
+    device const float *c = cos_table + (ulong)row * half_rope;
+    device const float *s = sin_table + (ulong)row * half_rope;
+    for (uint t = tid; t < a.n_heads * half_rope; t += threads) {
+        const uint head = t / half_rope, i = t % half_rope;
+        device const float *pair = queries + head * width + a.nope + 2 * i;
+        const float x0 = pair[0], x1 = pair[1];
+        device float *to = query + ((ulong)row * a.n_heads + head) * key + a.rank + 2 * i;
+        to[0] = x0 * c[i] - x1 * s[i];
+        to[1] = x1 * c[i] + x0 * s[i];
+    }
+    for (uint t = tid; t < a.n_heads * a.nope; t += threads) {
+        const uint head = t / a.nope, i = t % a.nope;
+        q_nope[((ulong)head * a.rows + row) * a.nope + i] = queries[head * width + i];
+    }
+}
+
+// One threadgroup of NORM_THREADS per row: normalize the latent (the first `rank` of the row's
+// kv_a outputs), rotate the keys' shared part that follows it (adjacent pairs), and store both in
+// the row's slot of the cache, `[slots, rank + rope]`.
+kernel void latent_store(device const float *kv [[buffer(0)]], device const float *norm [[buffer(1)]],
+                         device const float *cos_table [[buffer(2)]], device const float *sin_table [[buffer(3)]],
+                         device const uint *write_slots [[buffer(4)]], device float *cache [[buffer(5)]],
+                         constant LatentArgs &a [[buffer(6)]], uint row [[threadgroup_position_in_grid]],
+                         uint tid [[thread_index_in_threadgroup]],
+                         uint simd [[simdgroup_index_in_threadgroup]],
+                         uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float partial[NORM_THREADS / SIMD];
+    device const float *from = kv + (ulong)row * a.stride;
+    const float scale = 1.0f / sqrt(sum_of_squares((device const float4 *)from, a.rank, partial, tid, simd, lane) / a.rank + a.eps);
+    device float *to = cache + (ulong)write_slots[row] * (a.rank + a.rope);
+    for (uint i = tid; i < a.rank; i += NORM_THREADS)
+        to[i] = from[i] * scale * norm[i];
+    const uint half_rope = a.rope / 2;
+    device const float *c = cos_table + (ulong)row * half_rope;
+    device const float *s = sin_table + (ulong)row * half_rope;
+    for (uint i = tid; i < half_rope; i += NORM_THREADS) {
+        const float x0 = from[a.rank + 2 * i], x1 = from[a.rank + 2 * i + 1];
+        to[a.rank + 2 * i] = x0 * c[i] - x1 * s[i];
+        to[a.rank + 2 * i + 1] = x1 * c[i] + x0 * s[i];
+    }
+}
+
+// attention, for the latent cache: one threadgroup of ATT_SIMDS simdgroups per (head, row), the
+// query `[rows][heads][rank + rope]`, every head scoring against the same cached rows and blending
+// their first `rank` elements, into `out`, `[heads][rows][rank]`. As in attention, the positions
+// are split into runs, one per simdgroup, combined in order at the end. Needs rank + rope to be at
+// most 640 and rank at most 512, both multiples of 4, and threadgroup memory for
+// ATT_SIMDS * (rank + 2) floats.
+#define LATENT_KEY_VECS 5
+struct LatentAttnArgs {
+    uint n_heads;
+    uint rank;
+    uint rope;
+    uint rows;
+    float scale;
+};
+kernel void attention_latent(device const float *query [[buffer(0)]], device const float *cache [[buffer(1)]],
+                             device const uint *slots [[buffer(2)]], device const uint *row_offset [[buffer(3)]],
+                             device const uint *row_len [[buffer(4)]], device float *out [[buffer(5)]],
+                             constant LatentAttnArgs &a [[buffer(6)]],
+                             threadgroup float *shared [[threadgroup(0)]],
+                             uint2 group [[threadgroup_position_in_grid]],
+                             uint simd [[simdgroup_index_in_threadgroup]],
+                             uint lane [[thread_index_in_simdgroup]],
+                             uint tid [[thread_index_in_threadgroup]]) {
+    const uint head = group.x, row = group.y;
+    const uint width = a.rank + a.rope, key_vecs = width / 4, value_vecs = a.rank / 4;
+    device const float4 *q_in = (device const float4 *)(query + ((ulong)row * a.n_heads + head) * width);
+    float4 q[LATENT_KEY_VECS], o[HEAD_VECS];
+    for (uint j = 0; j < LATENT_KEY_VECS; j++) {
+        const uint f = lane + SIMD * j;
+        q[j] = f < key_vecs ? q_in[f] : 0.0f;
+    }
+    for (uint j = 0; j < HEAD_VECS; j++)
+        o[j] = 0.0f;
+    const uint len = row_len[row];
+    const uint run = (len + ATT_SIMDS - 1) / ATT_SIMDS;
+    const uint start = simd * run, end = min(start + run, len);
+    device const uint *row_slots = slots + row_offset[row];
+    float running_max = -INFINITY, total = 0.0f;
+    for (uint p = start; p < end; p += ATT_STEP) {
+        // Positions past the end of the run score -infinity, which gives them no weight.
+        ulong at[ATT_STEP];
+        float scores[ATT_STEP];
+        for (uint u = 0; u < ATT_STEP; u++)
+            at[u] = (ulong)row_slots[min(p + u, end - 1)] * width;
+        for (uint u = 0; u < ATT_STEP; u++) {
+            device const float4 *key = (device const float4 *)(cache + at[u]);
+            float partial = 0.0f;
+            for (uint j = 0; j < LATENT_KEY_VECS; j++) {
+                const uint f = lane + SIMD * j;
+                if (f < key_vecs)
+                    partial += dot(q[j], key[f]);
+            }
+            const float score = simd_sum(partial) * a.scale;
+            scores[u] = p + u < end ? score : -INFINITY;
+        }
+        float new_max = running_max;
+        for (uint u = 0; u < ATT_STEP; u++)
+            new_max = max(new_max, scores[u]);
+        const float correction = precise::exp(running_max - new_max);
+        float weights[ATT_STEP];
+        total *= correction;
+        for (uint u = 0; u < ATT_STEP; u++) {
+            weights[u] = precise::exp(scores[u] - new_max);
+            total += weights[u];
+        }
+        for (uint j = 0; j < HEAD_VECS; j++) {
+            const uint f = lane + SIMD * j;
+            if (f < value_vecs) {
+                float4 sum = o[j] * correction;
+                for (uint u = 0; u < ATT_STEP; u++)
+                    sum += weights[u] * ((device const float4 *)(cache + at[u]))[f];
+                o[j] = sum;
+            }
+        }
+        running_max = new_max;
+    }
+    threadgroup float *mine = shared + simd * (a.rank + 2);
+    for (uint j = 0; j < HEAD_VECS; j++) {
+        const uint f = lane + SIMD * j;
+        if (f < value_vecs)
+            ((threadgroup float4 *)(mine + 2))[f] = o[j];
+    }
+    if (lane == 0) {
+        mine[0] = running_max;
+        mine[1] = total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float best = -INFINITY;
+    for (uint s = 0; s < ATT_SIMDS; s++)
+        best = max(best, shared[s * (a.rank + 2)]);
+    float sum = 0.0f;
+    for (uint s = 0; s < ATT_SIMDS; s++) {
+        threadgroup float *theirs = shared + s * (a.rank + 2);
+        sum += theirs[1] * precise::exp(theirs[0] - best);
+    }
+    device float *to = out + ((ulong)head * a.rows + row) * a.rank;
+    for (uint d = tid; d < a.rank; d += ATT_SIMDS * SIMD) {
+        float value = 0.0f;
+        for (uint s = 0; s < ATT_SIMDS; s++) {
+            threadgroup float *theirs = shared + s * (a.rank + 2);
+            value += theirs[2 + d] * precise::exp(theirs[0] - best);
+        }
+        to[d] = value / sum;
+    }
 }

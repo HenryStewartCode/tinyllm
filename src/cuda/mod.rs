@@ -14,7 +14,10 @@ mod api;
 pub use api::{Arg, Gpu, Graph, Kernel, Module, Pointer};
 
 use crate::backend::{Backend, LoadedModel, Logits};
-use crate::config::{Activation, Architecture, Config, ExpertNaming, Experts as ConfigExperts};
+use crate::config::{
+    Activation, Architecture, Config, ExpertNaming, Experts as ConfigExperts, LatentAttention,
+    Routing,
+};
 use crate::lora::{LoraAdapter, LoraPair, Module as LoraModule};
 use crate::model::{LogitUse, Row};
 use crate::pool::Pool;
@@ -58,6 +61,12 @@ const MAX_HEAD_DIM: usize = 16 * 32;
 
 /// GPU memory to leave free when sizing the KV cache by default.
 const RESERVED_BYTES: usize = 1 << 30;
+
+/// `kernels.cu`'s attention_latent has this many warps, each taking at most this many chunks of
+/// a cached row and of its latent.
+const LATENT_WARPS: usize = 4;
+const LATENT_KEY_CHUNKS: usize = 10;
+const LATENT_VALUE_CHUNKS: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Precision {
@@ -127,6 +136,41 @@ struct Layer {
     window: usize,
     /// Each head's attention sink, or null.
     sinks: Pointer,
+    /// DeepSeek's latent attention, which uses `qkv` for its first projections (see
+    /// [`LatentLayer`]) and keeps its cache in here instead of `k_pool` and `v_pool`.
+    latent: Option<LatentLayer>,
+}
+
+/// DeepSeek's latent attention for a layer (see `kernels.cu`). The layer's `qkv` stacks the
+/// projections that take the layer's input: `q_a_proj` (or `q_proj`, when queries have no latent
+/// of their own) and then `kv_a_proj_with_mqa`.
+struct LatentLayer {
+    /// `q_a_layernorm` and `q_b_proj`, when queries go through a latent of their own.
+    q_low: Option<(Pointer, Matrix)>,
+    kv_a_norm: Pointer,
+    /// Each head's key matrix from `kv_b_proj`, transposed: `[heads][rank, nope]`, as tiles.
+    absorb_k: Pointer,
+    /// Each head's value matrix from `kv_b_proj`: `[heads][v, rank]`, as tiles.
+    absorb_v: Pointer,
+    /// The cache: each slot's normalized latent and rotated key part, `[slots, rank + rope]` as
+    /// tiles.
+    pool: Pointer,
+}
+
+/// Working memory for latent attention, each per-head part `[heads][rows, ...]`.
+struct LatentBuffers {
+    /// `q_a_proj`'s outputs, normalized, as tiles (when queries have a latent).
+    q_low: Pointer,
+    /// The queries from `q_b_proj` (when queries have a latent; otherwise they're in `qkv`).
+    q: Pointer,
+    /// Each head's unrotated query part, `[heads][rows, nope]` as tiles.
+    q_nope: Pointer,
+    /// Each head's query through its key matrix, `[heads][rows, rank]`.
+    q_latent: Pointer,
+    /// Each head's blend of latents, `[heads][rows, rank]` as tiles.
+    blended: Pointer,
+    /// That through each head's value matrix, `[heads][rows, v]`.
+    values: Pointer,
 }
 
 enum FeedForward {
@@ -148,6 +192,19 @@ struct Experts {
     /// Each expert's biases for those, `[2 * hidden]` and `[dim]`, if they have them (GPT-OSS).
     gate_up_bias: Pointer,
     down_bias: Pointer,
+    /// What's added to the router's scores to choose experts by (DeepSeek V3), or null.
+    correction: Pointer,
+    /// An expert every token goes through as well, if there is one.
+    shared: Option<SharedExpert>,
+}
+
+/// An expert every token goes through, alongside the ones it's routed to: an MLP like a dense
+/// layer's.
+struct SharedExpert {
+    gate_up: Matrix,
+    down: Matrix,
+    /// Its own gate, `[1, dim]`, if it has one (Qwen2 MoE), whose sigmoid scales its output.
+    gate: Option<Matrix>,
 }
 
 /// Every expert's matrix for one projection, one after another: 16-bit tiles, or MXFP4 in the
@@ -172,6 +229,8 @@ struct MoeBuffers {
     gate_up: Pointer,
     gated: Pointer,
     down: Pointer,
+    /// A shared expert's gate, for each row.
+    shared_gate: Pointer,
 }
 
 struct Kernels {
@@ -224,6 +283,15 @@ struct Kernels {
     moe_swiglu: Kernel,
     moe_geglu: Kernel,
     moe_combine: Kernel,
+    moe_route_grouped: Kernel,
+    add_gated: Kernel,
+    matmul_heads_1: Kernel,
+    matmul_heads_2: Kernel,
+    matmul_heads_4: Kernel,
+    latent_queries: Kernel,
+    latent_store: Kernel,
+    attention_latent: Kernel,
+    heads_to_tiles: Kernel,
 }
 
 impl Kernels {
@@ -271,6 +339,15 @@ impl Kernels {
             moe_swiglu: gpu.kernel(module, "moe_swiglu")?,
             moe_geglu: gpu.kernel(module, "moe_geglu")?,
             moe_combine: gpu.kernel(module, "moe_combine")?,
+            moe_route_grouped: gpu.kernel(module, "moe_route_grouped")?,
+            add_gated: gpu.kernel(module, "add_gated")?,
+            matmul_heads_1: gpu.kernel(module, "matmul_heads_1")?,
+            matmul_heads_2: gpu.kernel(module, "matmul_heads_2")?,
+            matmul_heads_4: gpu.kernel(module, "matmul_heads_4")?,
+            latent_queries: gpu.kernel(module, "latent_queries")?,
+            latent_store: gpu.kernel(module, "latent_store")?,
+            attention_latent: gpu.kernel(module, "attention_latent")?,
+            heads_to_tiles: gpu.kernel(module, "heads_to_tiles")?,
             swiglu_bf16: gpu.kernel(module, "swiglu_bf16")?,
             geglu_bf16: gpu.kernel(module, "geglu_bf16")?,
             rope_store_bf16: gpu.kernel(module, "rope_store_bf16")?,
@@ -358,6 +435,11 @@ pub struct CudaBackend {
     eps: f32,
     max_batch: usize,
     capacity: usize,
+    /// Half of how much of each head RoPE rotates: how many angles each row has in a table.
+    rope_half: usize,
+    /// Rows of working memory, a whole number of 16-row groups: what separates one head's part
+    /// of `latent_buffers` from the next.
+    padded_rows: usize,
 
     x: Pointer,
     xb: Pointer,
@@ -370,6 +452,7 @@ pub struct CudaBackend {
     logits_device: Pointer,
     step_buffer: Pointer,
     moe: Option<MoeBuffers>,
+    latent_buffers: Option<LatentBuffers>,
 
     slot_list_buffer: Growing,
     scratch: Growing,
@@ -446,6 +529,9 @@ impl CudaBackend {
         let vocab_size = config.vocab_size;
         let (q_dim, kv_dim) = (n_heads * head_dim, n_kv_heads * head_dim);
         let architecture = config.architecture()?;
+        let latent = architecture.latent;
+        // What attention's output is: every head's value.
+        let attn_width = latent.map_or(q_dim, |l| n_heads * l.v);
         if head_dim > MAX_HEAD_DIM {
             bail!("head size {head_dim} is too large for the GPU kernels (limit {MAX_HEAD_DIM})");
         }
@@ -456,18 +542,35 @@ impl CudaBackend {
         let kernels = Kernels::find(&gpu, &module)?;
         // 16-bit attention works in tiles: all the query heads sharing a key/value head have to
         // fit in one tile's 16 rows, and heads have to be a whole number of 16-element chunks.
-        let fits_tiles = n_heads / n_kv_heads <= TILE
-            && head_dim.is_multiple_of(TILE)
-            && TILE_CHUNK_COUNTS.contains(&(head_dim / TILE));
-        ensure!(
-            architecture.latent.is_none(),
-            "DeepSeek's latent attention only runs on the CPU so far"
-        );
-        if let Some(experts) = &architecture.experts {
+        let fits_tiles = latent.is_some()
+            || n_heads / n_kv_heads <= TILE
+                && head_dim.is_multiple_of(TILE)
+                && TILE_CHUNK_COUNTS.contains(&(head_dim / TILE));
+        if let Some(l) = latent {
             ensure!(
-                experts.shared_hidden.is_none(),
-                "mixtures of experts with a shared expert only run on the CPU so far"
+                options.precision == Precision::Bf16,
+                "DeepSeek's latent attention needs 16-bit precision on the GPU"
             );
+            ensure!(
+                [l.kv_lora_rank, l.rope, l.nope, l.v, l.q_lora_rank.unwrap_or(0)]
+                    .iter()
+                    .all(|size| size.is_multiple_of(TILE)),
+                "latent attention's sizes have to be multiples of 16 on the GPU"
+            );
+            ensure!(
+                (l.kv_lora_rank + l.rope) / TILE <= LATENT_WARPS * LATENT_KEY_CHUNKS
+                    && l.kv_lora_rank / TILE <= LATENT_WARPS * LATENT_VALUE_CHUNKS,
+                "a latent of {} is too wide for the GPU kernels",
+                l.kv_lora_rank
+            );
+        }
+        if let Some(experts) = &architecture.experts {
+            if let Routing::DeepSeek { groups, .. } = experts.routing {
+                ensure!(
+                    groups <= 32 && experts.count.is_multiple_of(groups),
+                    "the GPU handles at most 32 groups of experts"
+                );
+            }
             ensure!(
                 options.precision == Precision::Bf16,
                 "mixtures of experts need 16-bit precision on the GPU"
@@ -552,9 +655,20 @@ impl CudaBackend {
                     None,
                 )
             };
-            let qkv_names = match architecture.combined_projections {
-                true => vec![(format!("{attn}.qkv_proj"), q_dim + 2 * kv_dim)],
-                false => vec![
+            let qkv_names = match (latent, architecture.combined_projections) {
+                // The projections of the layer's input, which latent attention starts with.
+                (Some(l), _) => vec![
+                    match l.q_lora_rank {
+                        Some(rank) => (format!("{attn}.q_a_proj"), rank),
+                        None => (format!("{attn}.q_proj"), n_heads * (l.nope + l.rope)),
+                    },
+                    (
+                        format!("{attn}.kv_a_proj_with_mqa"),
+                        l.kv_lora_rank + l.rope,
+                    ),
+                ],
+                (None, true) => vec![(format!("{attn}.qkv_proj"), q_dim + 2 * kv_dim)],
+                (None, false) => vec![
                     (format!("{attn}.q_proj"), q_dim),
                     (format!("{attn}.k_proj"), kv_dim),
                     (format!("{attn}.v_proj"), kv_dim),
@@ -577,11 +691,49 @@ impl CudaBackend {
                 precision,
                 &mut num_params,
                 &[(format!("{attn}.o_proj"), dim)],
-                q_dim,
+                attn_width,
                 batch_rows,
                 architecture.residual_scale,
                 options.quantization,
             )?;
+            let latent_layer = match latent {
+                None => None,
+                Some(l) => Some(LatentLayer {
+                    q_low: match l.q_lora_rank {
+                        Some(rank) => Some((
+                            upload_vector(&format!("{attn}.q_a_layernorm.weight"), rank)?,
+                            upload_stacked(
+                                &gpu,
+                                &st,
+                                precision,
+                                &mut num_params,
+                                &[(format!("{attn}.q_b_proj"), n_heads * (l.nope + l.rope))],
+                                rank,
+                                batch_rows,
+                                1.0,
+                                options.quantization,
+                            )?,
+                        )),
+                        None => None,
+                    },
+                    kv_a_norm: upload_vector(
+                        &format!("{attn}.kv_a_layernorm.weight"),
+                        l.kv_lora_rank,
+                    )?,
+                    absorb_k: Pointer::NULL,
+                    absorb_v: Pointer::NULL,
+                    pool: Pointer::NULL,
+                }),
+            };
+            let latent_layer = match latent_layer {
+                Some(mut layer) => {
+                    let l = latent.expect("a latent layer has latent attention");
+                    (layer.absorb_k, layer.absorb_v) =
+                        upload_absorbed(&gpu, &st, &mut num_params, &attn, l, n_heads)?;
+                    Some(layer)
+                }
+                None => None,
+            };
             let feed_forward = match (shape.sparse, &architecture.experts) {
                 (true, Some(spec)) => FeedForward::Sparse(upload_experts(
                     &gpu,
@@ -592,6 +744,7 @@ impl CudaBackend {
                     dim,
                     batch_rows,
                     architecture.residual_scale,
+                    options.quantization,
                 )?),
                 _ => {
                     let gate_up_names = match architecture.combined_projections {
@@ -648,6 +801,7 @@ impl CudaBackend {
                     }
                     false => Pointer::NULL,
                 },
+                latent: latent_layer,
             });
         }
 
@@ -686,10 +840,45 @@ impl CudaBackend {
         let xb = input_buffer(&gpu, precision, rows, dim)?;
         // Also where final hidden states go, for embeddings.
         let added = gpu.alloc(rows * dim)?;
-        let qkv = gpu.alloc(rows * (q_dim + 2 * kv_dim))?;
-        let attn_out = input_buffer(&gpu, precision, rows, q_dim)?;
-        let gate_up = gpu.alloc(rows * 2 * hidden_dim)?;
-        let gated = input_buffer(&gpu, precision, rows, hidden_dim)?;
+        let qkv_width = match latent {
+            Some(l) => {
+                l.q_lora_rank.unwrap_or(n_heads * (l.nope + l.rope)) + l.kv_lora_rank + l.rope
+            }
+            None => q_dim + 2 * kv_dim,
+        };
+        let qkv = gpu.alloc(rows * qkv_width)?;
+        let attn_out = input_buffer(&gpu, precision, rows, attn_width)?;
+        // Room for a shared expert too, which works like a dense MLP.
+        let mlp_width = hidden_dim.max(
+            (architecture.experts.as_ref())
+                .and_then(|spec| spec.shared_hidden)
+                .unwrap_or(0),
+        );
+        let gate_up = gpu.alloc(rows * 2 * mlp_width)?;
+        let gated = input_buffer(&gpu, precision, rows, mlp_width)?;
+        let padded_rows = rows.next_multiple_of(TILE);
+        let latent_buffers = match latent {
+            Some(l) => Some(LatentBuffers {
+                q_low: match l.q_lora_rank {
+                    Some(rank) => input_buffer(&gpu, Precision::Bf16, rows, rank)?,
+                    None => Pointer::NULL,
+                },
+                q: match l.q_lora_rank {
+                    Some(_) => gpu.alloc(rows * n_heads * (l.nope + l.rope))?,
+                    None => Pointer::NULL,
+                },
+                q_nope: input_buffer(&gpu, Precision::Bf16, n_heads * padded_rows, l.nope)?,
+                q_latent: gpu.alloc(n_heads * padded_rows * l.kv_lora_rank)?,
+                blended: input_buffer(
+                    &gpu,
+                    Precision::Bf16,
+                    n_heads * padded_rows,
+                    l.kv_lora_rank,
+                )?,
+                values: gpu.alloc(n_heads * padded_rows * l.v)?,
+            }),
+            None => None,
+        };
         let moe = match &architecture.experts {
             Some(spec) => {
                 let pairs = rows * spec.top_k;
@@ -706,6 +895,7 @@ impl CudaBackend {
                     gate_up: gpu.alloc(slots * 2 * spec.hidden)?,
                     gated: input_buffer(&gpu, Precision::Bf16, slots, spec.hidden)?,
                     down: gpu.alloc(slots * dim)?,
+                    shared_gate: gpu.alloc(rows)?,
                 })
             }
             None => None,
@@ -714,7 +904,8 @@ impl CudaBackend {
         let results_device = gpu.alloc(options.max_batch * 2)?;
         let candidate_values_device = gpu.alloc(options.max_batch * MAX_CANDIDATES)?;
         let candidate_ids_device = gpu.alloc(options.max_batch * MAX_CANDIDATES)?;
-        let rope_slots = 2 * options.max_batch * (head_dim / 2) * architecture.rope_tables.len();
+        let rope_half = config.rope_dim() / 2;
+        let rope_slots = 2 * options.max_batch * rope_half * architecture.rope_tables.len();
         let step_slots = 14 * options.max_batch + rope_slots + 16;
         let step_buffer = gpu.alloc(step_slots)?;
 
@@ -723,7 +914,11 @@ impl CudaBackend {
             Precision::Bf16 => 2,
             Precision::F32 => 4,
         };
-        let kv_bytes_per_token = 2 * config.num_hidden_layers * kv_dim * element_bytes;
+        // Latent attention keeps one latent (and rotated key part) per token instead.
+        let kv_bytes_per_token = match latent {
+            Some(l) => config.num_hidden_layers * (l.kv_lora_rank + l.rope) * 2,
+            None => 2 * config.num_hidden_layers * kv_dim * element_bytes,
+        };
         let cache_bytes = match options.cache_bytes {
             Some(bytes) => bytes,
             None => gpu.free_memory()?.saturating_sub(RESERVED_BYTES),
@@ -738,6 +933,12 @@ impl CudaBackend {
             bail!("not enough GPU memory left for the KV cache");
         }
         for layer in &mut layers {
+            if let (Some(latent_layer), Some(l)) = (&mut layer.latent, latent) {
+                latent_layer.pool = gpu
+                    .alloc((capacity * (l.kv_lora_rank + l.rope)).div_ceil(2))
+                    .context("couldn't allocate the KV cache; try a smaller --cache-mb")?;
+                continue;
+            }
             let elements = (capacity * kv_dim * element_bytes).div_ceil(4);
             layer.k_pool = gpu
                 .alloc(elements)
@@ -776,6 +977,8 @@ impl CudaBackend {
                 eps,
                 max_batch: options.max_batch,
                 capacity,
+                rope_half,
+                padded_rows,
                 x,
                 xb,
                 added,
@@ -784,6 +987,7 @@ impl CudaBackend {
                 gate_up,
                 gated,
                 moe,
+                latent_buffers,
                 logits_device,
                 step_buffer,
                 slot_list_buffer: Growing::default(),
@@ -922,6 +1126,166 @@ impl CudaBackend {
                 Arg::Int(layer.window),
                 Arg::Float(softcap),
                 Arg::Ptr(layer.sinks),
+            ],
+        )
+    }
+
+    /// Queue DeepSeek's latent attention (see `kernels.cu`), from the stacked projections of the
+    /// layer's input in `qkv` to its result in `attn_out`, storing each row's latent in the cache.
+    fn latent_attention(
+        &self,
+        layer: &Layer,
+        latent: &LatentLayer,
+        batch: usize,
+        step: &StepPointers,
+    ) -> Result<()> {
+        let l = self.architecture.latent.expect("a latent layer has latent attention");
+        let buffers = (self.latent_buffers.as_ref()).expect("allocated for latent attention");
+        let (n, rank, rope, nope, v) = (self.n_heads, l.kv_lora_rank, l.rope, l.nope, l.v);
+        let head_width = nope + rope;
+        let q_width = l.q_lora_rank.unwrap_or(n * head_width);
+        let stride = q_width + rank + rope;
+        let rows = self.padded_rows;
+        // Queries straight from the layer's input, or through a latent of their own.
+        let (q, q_stride) = match &latent.q_low {
+            Some((norm, q_b)) => {
+                self.gpu.launch(
+                    self.kernels.rmsnorm_bf16,
+                    [batch, 1],
+                    &[
+                        Arg::Ptr(self.qkv),
+                        Arg::Ptr(buffers.q_low),
+                        Arg::Ptr(*norm),
+                        Arg::Int(q_width),
+                        Arg::Float(self.eps),
+                        Arg::Ptr(Pointer::NULL),
+                        Arg::Int(q_width / TILE),
+                        Arg::Int(stride),
+                    ],
+                )?;
+                self.matmul(q_b, buffers.q_low, batch, buffers.q, false)?;
+                (buffers.q, n * head_width)
+            }
+            None => (self.qkv, stride),
+        };
+        let angles = layer.rope_table * batch * self.rope_half;
+        let (cos, sin) = (step.cos.offset(angles), step.sin.offset(angles));
+        self.gpu.launch(
+            self.kernels.latent_queries,
+            [batch, 1],
+            &[
+                Arg::Ptr(q),
+                Arg::Int(q_stride),
+                Arg::Int(n),
+                Arg::Int(nope),
+                Arg::Int(rope),
+                Arg::Ptr(cos),
+                Arg::Ptr(sin),
+                Arg::Ptr(buffers.q_nope),
+                Arg::Int(rows * nope),
+            ],
+        )?;
+        self.gpu.launch(
+            self.kernels.latent_store,
+            [batch, 1],
+            &[
+                Arg::Ptr(self.qkv.offset(q_width)),
+                Arg::Int(stride),
+                Arg::Int(rank),
+                Arg::Int(rope),
+                Arg::Ptr(latent.kv_a_norm),
+                Arg::Float(self.eps),
+                Arg::Ptr(cos),
+                Arg::Ptr(sin),
+                Arg::Ptr(step.write_slots),
+                Arg::Ptr(latent.pool),
+            ],
+        )?;
+        // Each head's query through its key matrix, to score against latents directly.
+        self.matmul_heads(
+            latent.absorb_k,
+            (rank, nope),
+            buffers.q_nope,
+            batch,
+            buffers.q_latent,
+        )?;
+        let chunks = (rank + rope) / TILE;
+        let tile_bytes = TILE * TILE * 2;
+        let shared = chunks * tile_bytes + LATENT_WARPS * 2 * tile_bytes + tile_bytes + 4 * TILE;
+        self.gpu.launch_with_shared(
+            self.kernels.attention_latent,
+            [batch * n.div_ceil(TILE), 1],
+            32 * LATENT_WARPS,
+            shared,
+            &[
+                Arg::Ptr(buffers.q_latent),
+                Arg::Int(rows * rank),
+                Arg::Ptr(q.offset(nope)),
+                Arg::Int(q_stride),
+                Arg::Int(head_width),
+                Arg::Ptr(latent.pool),
+                Arg::Int(chunks),
+                Arg::Int(rank / TILE),
+                Arg::Ptr(self.slot_list_buffer.data),
+                Arg::Ptr(step.row_offset),
+                Arg::Ptr(step.row_len),
+                Arg::Ptr(step.team_size),
+                Arg::Ptr(buffers.blended),
+                Arg::Int(rows * rank),
+                Arg::Int(n),
+                Arg::Float(self.architecture.attention_scale),
+            ],
+        )?;
+        // Each head's blend of latents through its value matrix, gathered for o_proj.
+        self.matmul_heads(latent.absorb_v, (v, rank), buffers.blended, batch, buffers.values)?;
+        self.gpu.launch(
+            self.kernels.heads_to_tiles,
+            [batch, 1],
+            &[
+                Arg::Ptr(buffers.values),
+                Arg::Int(rows * v),
+                Arg::Int(n),
+                Arg::Int(v),
+                Arg::Ptr(self.attn_out),
+            ],
+        )
+    }
+
+    /// Queue `out_h = W_h x_h` for each head `h`, with `W_h` an `(m, k)` matrix, `x_h` the
+    /// head's `[rows, k]` and `out_h` its `[rows, m]` (all heads' parts `padded_rows` rows apart).
+    fn matmul_heads(
+        &self,
+        w: Pointer,
+        (m, k): (usize, usize),
+        x: Pointer,
+        batch: usize,
+        out: Pointer,
+    ) -> Result<()> {
+        let (kernel, groups) = match batch {
+            1..=16 => (self.kernels.matmul_heads_1, 1),
+            17..=32 => (self.kernels.matmul_heads_2, 2),
+            _ => (self.kernels.matmul_heads_4, 4),
+        };
+        let rows = self.padded_rows;
+        self.gpu.launch_grid(
+            kernel,
+            [
+                batch.div_ceil(TILE * groups),
+                m.div_ceil(TILE * WARPS_ACROSS),
+                self.n_heads,
+            ],
+            32 * WARPS_ACROSS * groups,
+            0,
+            &[
+                Arg::Ptr(w),
+                Arg::Int(m * k),
+                Arg::Int(m),
+                Arg::Int(k / TILE),
+                Arg::Ptr(x),
+                Arg::Int(rows * k),
+                Arg::Int(batch),
+                Arg::Ptr(out),
+                Arg::Int(rows * m),
             ],
         )
     }
@@ -1118,18 +1482,43 @@ impl CudaBackend {
             .expect("a sparse layer has experts");
         let (count, top_k, hidden, dim) = (spec.count, spec.top_k, spec.hidden, self.dim);
         self.matmul(&experts.router, self.xb, batch, moe.scores, false)?;
-        self.gpu.launch(
-            self.kernels.moe_route,
-            [batch, 1],
-            &[
-                Arg::Ptr(moe.scores),
-                Arg::Int(count),
-                Arg::Int(top_k),
-                Arg::Int(spec.renormalize as usize),
-                Arg::Ptr(moe.topk_ids),
-                Arg::Ptr(moe.topk_weights),
-            ],
-        )?;
+        match spec.routing {
+            Routing::Softmax { .. } => self.gpu.launch(
+                self.kernels.moe_route,
+                [batch, 1],
+                &[
+                    Arg::Ptr(moe.scores),
+                    Arg::Int(count),
+                    Arg::Int(top_k),
+                    Arg::Int(spec.renormalize as usize),
+                    Arg::Ptr(moe.topk_ids),
+                    Arg::Ptr(moe.topk_weights),
+                ],
+            )?,
+            Routing::DeepSeek {
+                sigmoid,
+                groups,
+                top_groups,
+                renormalize,
+                scale,
+            } => self.gpu.launch(
+                self.kernels.moe_route_grouped,
+                [batch, 1],
+                &[
+                    Arg::Ptr(moe.scores),
+                    Arg::Int(count),
+                    Arg::Int(top_k),
+                    Arg::Int(renormalize as usize),
+                    Arg::Int(sigmoid as usize),
+                    Arg::Int(groups),
+                    Arg::Int(top_groups),
+                    Arg::Float(scale),
+                    Arg::Ptr(experts.correction),
+                    Arg::Ptr(moe.topk_ids),
+                    Arg::Ptr(moe.topk_weights),
+                ],
+            )?,
+        }
         self.gpu.launch_blocks(
             self.kernels.moe_sort,
             [1, 1],
@@ -1194,6 +1583,42 @@ impl CudaBackend {
                 Arg::Ptr(self.x),
                 Arg::Ptr(moe.topk_ids),
                 Arg::Ptr(experts.down_bias),
+            ],
+        )?;
+        let Some(shared) = &experts.shared else {
+            return Ok(());
+        };
+        // Every row goes through the shared expert as well, as through a dense MLP.
+        let hidden = spec.shared_hidden.expect("a shared expert has a width");
+        self.matmul(&shared.gate_up, self.xb, batch, self.gate_up, false)?;
+        let gated = match self.architecture.activation {
+            Activation::Silu => self.kernels.swiglu_bf16,
+            Activation::Gelu => self.kernels.geglu_bf16,
+        };
+        self.gpu.launch(
+            gated,
+            [batch, hidden.div_ceil(SWIGLU_COLUMNS)],
+            &[
+                Arg::Ptr(self.gate_up),
+                Arg::Ptr(self.gated),
+                Arg::Int(hidden),
+                Arg::Int(hidden / TILE),
+            ],
+        )?;
+        let Some(gate) = &shared.gate else {
+            return self.matmul(&shared.down, self.gated, batch, self.x, true);
+        };
+        // Scaled by its own gate's sigmoid (Qwen2 MoE).
+        self.matmul(gate, self.xb, batch, moe.shared_gate, false)?;
+        self.matmul(&shared.down, self.gated, batch, self.added, false)?;
+        self.gpu.launch(
+            self.kernels.add_gated,
+            [batch, 1],
+            &[
+                Arg::Ptr(self.added),
+                Arg::Ptr(moe.shared_gate),
+                Arg::Int(dim),
+                Arg::Ptr(self.x),
             ],
         )
     }
@@ -1323,6 +1748,7 @@ impl CudaBackend {
             Arg::Float(self.eps),
             Arg::Ptr(select),
             Arg::Int(self.dim.div_ceil(TILE)),
+            Arg::Int(self.dim),
         ];
         match self.precision {
             Precision::Bf16 => self.gpu.launch(self.kernels.rmsnorm_bf16, [rows, 1], &args),
@@ -1334,7 +1760,7 @@ impl CudaBackend {
     /// Returns pointers to the arrays inside the step buffer.
     fn upload_step(&mut self, rows: &[Row]) -> Result<StepPointers> {
         let batch = rows.len();
-        let half = self.head_dim / 2;
+        let half = self.rope_half;
         let step = &mut self.step;
         step.tokens.clear();
         step.write_slots.clear();
@@ -1373,7 +1799,12 @@ impl CudaBackend {
                     .slot_lists
                     .extend(visible.iter().step_by(TILE).map(|&slot| slot / TILE as u32)),
             }
-            let team = TILE / (self.n_heads / self.n_kv_heads);
+            // Query heads that share a key/value head: all of them, with latent attention.
+            let heads_per_kv = match self.architecture.latent {
+                Some(_) => self.n_heads,
+                None => self.n_heads / self.n_kv_heads,
+            };
+            let team = (TILE / heads_per_kv).max(1);
             for (i, row) in rows[r..r + group].iter().enumerate() {
                 let index = r + i;
                 step.team_size.push(match i % team {
@@ -1538,15 +1969,19 @@ impl CudaBackend {
             // Attention block: mix in information from earlier tokens.
             self.rmsnorm(self.x, self.xb, layer.attn_norm, batch, Pointer::NULL)?;
             self.matmul(&layer.qkv, self.xb, batch, self.qkv, false)?;
-            self.lora(l, 0, self.xb, batch, self.qkv, step)?;
-            if let Some((q_weight, k_weight)) = layer.head_norms {
-                match self.architecture.full_qk_norms {
-                    true => self.full_qk_norms(q_weight, k_weight, batch)?,
-                    false => self.head_norms(q_weight, k_weight, batch)?,
+            if let Some(latent) = &layer.latent {
+                self.latent_attention(layer, latent, batch, step)?;
+            } else {
+                self.lora(l, 0, self.xb, batch, self.qkv, step)?;
+                if let Some((q_weight, k_weight)) = layer.head_norms {
+                    match self.architecture.full_qk_norms {
+                        true => self.full_qk_norms(q_weight, k_weight, batch)?,
+                        false => self.head_norms(q_weight, k_weight, batch)?,
+                    }
                 }
+                self.rope_and_store(layer, batch, step)?;
+                self.attention(layer, batch, step)?;
             }
-            self.rope_and_store(layer, batch, step)?;
-            self.attention(layer, batch, step)?;
             self.add_block_output(
                 &layer.o_proj,
                 self.attn_out,
@@ -2238,27 +2673,29 @@ fn upload_experts(
     dim: usize,
     batch_rows: usize,
     residual: f32,
+    quantization: Option<Quantization>,
 ) -> Result<Experts> {
     let h = spec.hidden;
     ensure!(
-        dim.is_multiple_of(TILE) && h.is_multiple_of(TILE),
+        dim.is_multiple_of(TILE)
+            && h.is_multiple_of(TILE)
+            && spec.shared_hidden.unwrap_or(0).is_multiple_of(TILE),
         "experts' sizes have to be multiples of 16 on the GPU"
     );
     let router_name = match spec.naming {
-        ExpertNaming::Qwen => format!("{p}.mlp.gate"),
+        ExpertNaming::Qwen | ExpertNaming::DeepSeek => format!("{p}.mlp.gate"),
         ExpertNaming::Mixtral => format!("{p}.block_sparse_moe.gate"),
         ExpertNaming::Granite => format!("{p}.block_sparse_moe.router.layer"),
         ExpertNaming::GptOss => {
             return upload_gpt_oss_experts(gpu, st, num_params, p, spec, dim, batch_rows);
         }
-        ExpertNaming::DeepSeek => bail!("DeepSeek only runs on the CPU so far"),
     };
     let router = upload_stacked(
         gpu,
         st,
         Precision::Bf16,
         num_params,
-        &[(router_name, spec.count)],
+        &[(router_name.clone(), spec.count)],
         dim,
         batch_rows,
         1.0,
@@ -2275,11 +2712,22 @@ fn upload_experts(
     };
     let mut gate_up: Vec<u16> = Vec::with_capacity(spec.count * 2 * h * dim);
     let mut down: Vec<u16> = Vec::with_capacity(spec.count * dim * h);
-    match spec.naming {
-        ExpertNaming::GptOss | ExpertNaming::DeepSeek => unreachable!("handled above"),
-        ExpertNaming::Granite => {
-            let input_name = format!("{p}.block_sparse_moe.input_linear.weight");
-            let output_name = format!("{p}.block_sparse_moe.output_linear.weight");
+    // Every expert's gate and up projections stacked in one tensor, and every down: Granite's
+    // way, and how transformers 5 saves the others.
+    let stacked = match spec.naming {
+        ExpertNaming::Granite => Some((
+            format!("{p}.block_sparse_moe.input_linear.weight"),
+            format!("{p}.block_sparse_moe.output_linear.weight"),
+        )),
+        ExpertNaming::Mixtral => None,
+        _ => Some((
+            format!("{p}.mlp.experts.gate_up_proj"),
+            format!("{p}.mlp.experts.down_proj"),
+        ))
+        .filter(|(input, _)| st.contains(input)),
+    };
+    match stacked {
+        Some((input_name, output_name)) => {
             let input = st.load_bf16(&input_name, &[spec.count, 2 * h, dim])?;
             let output = st.load_bf16(&output_name, &[spec.count, dim, h])?;
             for e in 0..spec.count {
@@ -2292,13 +2740,15 @@ fn upload_experts(
                 down.extend(to_tiles(&expert_down, dim, h));
             }
         }
-        ExpertNaming::Qwen | ExpertNaming::Mixtral => {
+        None => {
             let (prefix, [gate, up, down_name]) = match spec.naming {
-                ExpertNaming::Qwen => (
+                ExpertNaming::Mixtral => {
+                    (format!("{p}.block_sparse_moe.experts"), ["w1", "w3", "w2"])
+                }
+                _ => (
                     format!("{p}.mlp.experts"),
                     ["gate_proj", "up_proj", "down_proj"],
                 ),
-                _ => (format!("{p}.block_sparse_moe.experts"), ["w1", "w3", "w2"]),
             };
             for e in 0..spec.count {
                 let mut stacked =
@@ -2317,6 +2767,65 @@ fn upload_experts(
         gpu.write_now(device, values)?;
         Ok(device)
     };
+    // DeepSeek V3 chooses experts by their scores plus this.
+    let correction_name = format!("{router_name}.e_score_correction_bias");
+    let correction = match st.contains(&correction_name) {
+        true => {
+            let values = st.load(&correction_name, &[spec.count])?;
+            let device = gpu.alloc(spec.count)?;
+            gpu.write_now(device, &values)?;
+            device
+        }
+        false => Pointer::NULL,
+    };
+    let shared = match spec.shared_hidden {
+        None => None,
+        Some(hidden) => {
+            let prefix = match spec.shared_gated {
+                true => format!("{p}.mlp.shared_expert"),
+                false => format!("{p}.mlp.shared_experts"),
+            };
+            let mut matrix = |names: &[(String, usize)], cols: usize, scale: f32, quantization| {
+                upload_stacked(
+                    gpu,
+                    st,
+                    Precision::Bf16,
+                    num_params,
+                    names,
+                    cols,
+                    batch_rows,
+                    scale,
+                    quantization,
+                )
+            };
+            Some(SharedExpert {
+                gate_up: matrix(
+                    &[
+                        (format!("{prefix}.gate_proj"), hidden),
+                        (format!("{prefix}.up_proj"), hidden),
+                    ],
+                    dim,
+                    1.0,
+                    quantization,
+                )?,
+                down: matrix(
+                    &[(format!("{prefix}.down_proj"), dim)],
+                    hidden,
+                    residual,
+                    quantization,
+                )?,
+                gate: match spec.shared_gated {
+                    true => Some(matrix(
+                        &[(format!("{p}.mlp.shared_expert_gate"), 1)],
+                        dim,
+                        1.0,
+                        None,
+                    )?),
+                    false => None,
+                },
+            })
+        }
+    };
     Ok(Experts {
         router,
         gate_up: ExpertWeights {
@@ -2329,7 +2838,42 @@ fn upload_experts(
         },
         gate_up_bias: Pointer::NULL,
         down_bias: Pointer::NULL,
+        correction,
+        shared,
     })
+}
+
+/// Split a layer's `kv_b_proj` into each head's key matrix, transposed, and value matrix, as
+/// tiles for matmul_heads (see `kernels.cu`): `[heads][rank, nope]` and `[heads][v, rank]`.
+fn upload_absorbed(
+    gpu: &Gpu,
+    st: &SafeTensors,
+    num_params: &mut usize,
+    attn: &str,
+    l: LatentAttention,
+    n_heads: usize,
+) -> Result<(Pointer, Pointer)> {
+    let (rank, per_head) = (l.kv_lora_rank, l.nope + l.v);
+    let kv_b = st.load(&format!("{attn}.kv_b_proj.weight"), &[n_heads * per_head, rank])?;
+    *num_params += kv_b.len();
+    let (mut keys, mut values) = (Vec::new(), Vec::new());
+    for head in kv_b.chunks_exact(per_head * rank) {
+        let mut transposed = vec![0u16; rank * l.nope];
+        for i in 0..l.nope {
+            for c in 0..rank {
+                transposed[c * l.nope + i] = f32_to_bf16(head[i * rank + c]);
+            }
+        }
+        keys.extend(to_tiles(&transposed, rank, l.nope));
+        let value: Vec<u16> = head[l.nope * rank..].iter().map(|&v| f32_to_bf16(v)).collect();
+        values.extend(to_tiles(&value, l.v, rank));
+    }
+    let upload = |values: &[u16]| -> Result<Pointer> {
+        let device = gpu.alloc(values.len().div_ceil(2))?;
+        gpu.write_now(device, values)?;
+        Ok(device)
+    };
+    Ok((upload(&keys)?, upload(&values)?))
 }
 
 /// GPT-OSS's experts (see [`crate::model`]): MXFP4 weights stay 4-bit, in the lane order of 4-bit
@@ -2465,6 +3009,8 @@ fn upload_gpt_oss_experts(
         down,
         gate_up_bias: upload_f32(&gate_up_bias)?,
         down_bias: upload_f32(&down_bias)?,
+        correction: Pointer::NULL,
+        shared: None,
     })
 }
 
@@ -2555,7 +3101,14 @@ impl Backend for CudaBackend {
             matches!(&layer.feed_forward, FeedForward::Sparse(experts) if experts.gate_up.scales != Pointer::NULL)
         });
         let experts = if mxfp4 { ", MXFP4 experts" } else { "" };
-        format!("{} (CUDA, {weights} weights{experts})", self.gpu_name)
+        let latent = match self.architecture.latent {
+            Some(_) => ", latent attention",
+            None => "",
+        };
+        format!(
+            "{} (CUDA, {weights} weights{experts}{latent})",
+            self.gpu_name
+        )
     }
 
     fn forward(&mut self, rows: &[Row]) {
@@ -2592,6 +3145,10 @@ impl Backend for CudaBackend {
     }
 
     fn add_adapter(&mut self, adapter: &LoraAdapter) -> Result<()> {
+        ensure!(
+            self.architecture.latent.is_none(),
+            "LoRA adapters for DeepSeek's latent attention aren't supported"
+        );
         ensure!(
             adapter.layers.len() == self.layers.len(),
             "{}: made for a model with {} layers, not {}",

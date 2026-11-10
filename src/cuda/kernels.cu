@@ -332,11 +332,13 @@ extern "C" __global__ void embed_bf16(const __nv_bfloat16 *embeddings, const int
 // warps, so memory latency sets the speed unless each warp asks for several things at once.
 #define LOAD_AHEAD 4
 
-// As rmsnorm, with the output in tile layout for the next matmul_bf16.
+// As rmsnorm, with the output in tile layout for the next matmul_bf16, and the input's rows
+// `stride` elements apart.
 extern "C" __global__ void rmsnorm_bf16(const float *x, __nv_bfloat16 *out, const float *weight,
-                                        int dim, float eps, const int *rows, int chunks) {
+                                        int dim, float eps, const int *rows, int chunks,
+                                        int stride) {
     const int row = blockIdx.x;
-    const float *from = x + (size_t)(rows ? rows[row] : row) * dim;
+    const float *from = x + (size_t)(rows ? rows[row] : row) * stride;
     float sum = 0;
     for (int i = threadIdx.x; i < dim; i += WARP * LOAD_AHEAD) {
         float value[LOAD_AHEAD];
@@ -1555,3 +1557,364 @@ __device__ __forceinline__ void matmul_tiles_fp4(const unsigned *w, const unsign
 MOE_MATMUL_FP4(1)
 MOE_MATMUL_FP4(2)
 MOE_MATMUL_FP4(4)
+
+// ---------------------------------------------------------------------------------------------
+// DeepSeek's latent attention
+// ---------------------------------------------------------------------------------------------
+// Each token's keys and values come from one latent vector, `rank` wide (512 in DeepSeek V2 and
+// V3), which each head expands with matrices of its own: head h's key is `K_h c` (plus a rotated
+// part that all heads share) and its value `V_h c`. Rather than store every head's key and value
+// (5,120 numbers a token for V2-Lite's 16 heads, 40,960 for V3's 128), the cache holds just the
+// latent and the shared rotated part: 576 numbers. A query `q` scores against the latent through
+// `K_h^T q`, worked out once per query (matmul_heads), and attention's result, a blend of
+// latents, goes through `V_h` afterwards. That's the same arithmetic in a different order, and
+// it makes attention a single key/value head, whose values are the first `rank` elements of
+// its keys.
+
+// matmul_heads_TX: matmul_bf16 for each head in turn (blockIdx.z), with head h's weights, inputs
+// and outputs `w_stride`, `x_stride` and `out_stride` elements after head h - 1's. `m` has to be
+// a multiple of 16.
+#define MATMUL_HEADS(TX)                                                                       \
+    extern "C" __global__ void matmul_heads_##TX(                                              \
+        const __nv_bfloat16 *w, unsigned long long w_stride, int m, int chunks,               \
+        const __nv_bfloat16 *x, unsigned long long x_stride, int batch, float *out,           \
+        unsigned long long out_stride) {                                                       \
+        const size_t head = blockIdx.z;                                                        \
+        matmul_tiles<TX>(w + head * w_stride, m, chunks, x + head * x_stride, batch,          \
+                         out + head * out_stride, nullptr, 0, nullptr);                        \
+    }
+MATMUL_HEADS(1)
+MATMUL_HEADS(2)
+MATMUL_HEADS(4)
+
+// One block per row: rotate the rotated part of each head's query (`nope` elements into the
+// head, in adjacent pairs, as DeepSeek lays them out) in place, and copy each head's unrotated
+// part into a tile-layout matrix of its own for matmul_heads: head h's is `[rows, nope]`, at
+// `head_stride * h`.
+extern "C" __global__ void latent_queries(float *q, int stride, int n_heads, int nope, int rope,
+                                          const float *cos_table, const float *sin_table,
+                                          __nv_bfloat16 *q_nope, unsigned long long head_stride) {
+    const int row = blockIdx.x, lane = threadIdx.x, half = rope / 2, width = nope + rope;
+    float *queries = q + (size_t)row * stride;
+    const float *c = cos_table + (size_t)row * half;
+    const float *s = sin_table + (size_t)row * half;
+    for (int t = lane; t < n_heads * half; t += WARP) {
+        const int i = t % half;
+        float *pair = queries + (t / half) * width + nope + 2 * i;
+        const float a = pair[0], b = pair[1];
+        pair[0] = a * c[i] - b * s[i];
+        pair[1] = b * c[i] + a * s[i];
+    }
+    const int chunks = nope / TILE;
+    for (int t = lane; t < n_heads * nope; t += WARP) {
+        const int head = t / nope, i = t % nope;
+        q_nope[head * head_stride + tile_index(row, i, chunks)] =
+            __float2bfloat16(queries[head * width + i]);
+    }
+}
+
+// One block per row: normalize the latent (the first `rank` of each row's `kv`, rows `stride`
+// apart), rotate the keys' shared part that follows it (adjacent pairs), and store both in the
+// row's slot of the cache, a `[slots, rank + rope]` tile-layout matrix.
+extern "C" __global__ void latent_store(const float *kv, int stride, int rank, int rope,
+                                        const float *norm, float eps, const float *cos_table,
+                                        const float *sin_table, const int *write_slots,
+                                        __nv_bfloat16 *pool) {
+    const int row = blockIdx.x, lane = threadIdx.x, half = rope / 2;
+    const int chunks = (rank + rope) / TILE, slot = write_slots[row];
+    const float *from = kv + (size_t)row * stride;
+    float sum = 0;
+    for (int i = lane; i < rank; i += WARP)
+        sum += from[i] * from[i];
+    const float scale = 1.0f / sqrtf(warp_sum(sum) / rank + eps);
+    for (int i = lane; i < rank; i += WARP)
+        pool[tile_index(slot, i, chunks)] = __float2bfloat16(from[i] * scale * norm[i]);
+    const float *c = cos_table + (size_t)row * half;
+    const float *s = sin_table + (size_t)row * half;
+    for (int i = lane; i < half; i += WARP) {
+        const float a = from[rank + 2 * i], b = from[rank + 2 * i + 1];
+        pool[tile_index(slot, rank + 2 * i, chunks)] = __float2bfloat16(a * c[i] - b * s[i]);
+        pool[tile_index(slot, rank + 2 * i + 1, chunks)] = __float2bfloat16(b * c[i] + a * s[i]);
+    }
+}
+
+// The warps of attention_latent, and the most chunks of a cached row (the latent and the rotated
+// part) and of the latent each one works on: rows up to 640 wide, latents up to 512.
+#define LATENT_WARPS 4
+#define LATENT_KEY_CHUNKS 10
+#define LATENT_VALUE_CHUNKS 8
+
+// Attention over the latent cache, on tensor cores: one key/value head that all `n_heads` query
+// heads share, its keys `chunks` 16-element chunks wide (the latent, then the rotated part) and
+// its values the first `value_chunks` of those (the latent). One block of LATENT_WARPS warps
+// per row and 16 query heads (block = row * head_tiles + head tile). With fewer than 16 heads,
+// consecutive rows of a sequence share a block, as in attention_tiles: `team_sizes[row]` is how
+// many. Tile rows are (row, head) pairs.
+//
+// The warps share out the work. Each multiplies its share of the key chunks for a page's scores,
+// which are then added up in a fixed order, and keeps the running totals of its share of the
+// value chunks. The softmax is the single pass of attention_tiles, without windows, caps or sinks,
+// which DeepSeek doesn't use.
+//
+// `q_latent` holds each head's query through that head's key matrix, `[n_heads, rows, rank]`
+// (`q_head_stride` elements per head), and the rotated part of each head's query is in `q_rope`,
+// rows `q_stride` apart and heads `head_width` apart. The result goes to `out`, each head's
+// `[rows, rank]` in tile layout, `out_head_stride` elements apart.
+extern "C" __global__ void __launch_bounds__(LATENT_WARPS *WARP)
+    attention_latent(const float *q_latent, unsigned long long q_head_stride, const float *q_rope,
+                     int q_stride, int head_width, const __nv_bfloat16 *pool, int chunks,
+                     int value_chunks, const unsigned *page_lists, const int *row_offset,
+                     const int *row_len, const int *team_sizes, __nv_bfloat16 *out,
+                     unsigned long long out_head_stride, int n_heads, float scale) {
+    extern __shared__ __align__(1024) unsigned char latent_smem[];
+    const int warp = threadIdx.x / WARP, lane = threadIdx.x % WARP;
+    const int head_tiles = (n_heads + TILE - 1) / TILE;
+    const int first_row = blockIdx.x / head_tiles, head_tile = blockIdx.x % head_tiles;
+    const int team_size = team_sizes[first_row];
+    if (team_size == 0)
+        return;
+    const int per_tile = min(n_heads, TILE), rank = value_chunks * TILE;
+    const int first_len = row_len[first_row];
+    const int last_page = (first_len + team_size - 2) / TILE;
+    const unsigned *pages = page_lists + row_offset[first_row];
+    // Tile row t is head `head_tile * 16 + t % per_tile` of the team's row `t / per_tile`.
+    const auto valid = [&](int t) {
+        return t / per_tile < team_size && head_tile * TILE + t % per_tile < n_heads;
+    };
+
+    __nv_bfloat16 *q_tiles = (__nv_bfloat16 *)latent_smem;
+    float *partial = (float *)(latent_smem + (size_t)chunks * TILE_ELEMENTS * sizeof(__nv_bfloat16));
+    __nv_bfloat16 *weights = (__nv_bfloat16 *)(partial + LATENT_WARPS * TILE_ELEMENTS);
+    float *inverse = (float *)(weights + TILE_ELEMENTS);
+
+    for (int i = threadIdx.x; i < chunks * TILE_ELEMENTS; i += LATENT_WARPS * WARP) {
+        const int c = i / TILE_ELEMENTS, t = i % TILE_ELEMENTS / TILE, j = i % TILE;
+        float value = 0.0f;
+        if (valid(t)) {
+            const size_t row = first_row + t / per_tile;
+            const int head = head_tile * TILE + t % per_tile;
+            value = c < value_chunks
+                        ? q_latent[head * q_head_stride + row * rank + c * TILE + j]
+                        : q_rope[row * q_stride + (size_t)head * head_width + (c - value_chunks) * TILE + j];
+        }
+        q_tiles[i] = __float2bfloat16(value);
+    }
+    __syncthreads();
+
+    // This warp's chunks of the keys, and of the values.
+    const int key_share = (chunks + LATENT_WARPS - 1) / LATENT_WARPS;
+    const int key_begin = warp * key_share, key_end = min(chunks, key_begin + key_share);
+    const int value_share = (value_chunks + LATENT_WARPS - 1) / LATENT_WARPS;
+    const int value_begin = warp * value_share;
+    const int value_end = min(value_chunks, value_begin + value_share);
+    TileA a[LATENT_KEY_CHUNKS];
+#pragma unroll
+    for (int i = 0; i < LATENT_KEY_CHUNKS; i++)
+        if (key_begin + i < key_end)
+            wmma::load_matrix_sync(a[i], q_tiles + (size_t)(key_begin + i) * TILE_ELEMENTS, TILE);
+    TileTotal totals[LATENT_VALUE_CHUNKS];
+#pragma unroll
+    for (int i = 0; i < LATENT_VALUE_CHUNKS; i++)
+        wmma::fill_fragment(totals[i], 0.0f);
+
+    // This warp looks after the softmax of tile rows warp, warp + LATENT_WARPS, ...
+    constexpr int OWN_ROWS = TILE / LATENT_WARPS;
+    float reference[OWN_ROWS], lane_sum[OWN_ROWS];
+    for (int j = 0; j < OWN_ROWS; j++)
+        lane_sum[j] = 0.0f;
+
+    for (int page = 0; page <= last_page; page++) {
+        const __nv_bfloat16 *tiles = pool + (size_t)pages[page] * chunks * TILE_ELEMENTS;
+        TileTotal total;
+        wmma::fill_fragment(total, 0.0f);
+#pragma unroll
+        for (int i = 0; i < LATENT_KEY_CHUNKS; i++) {
+            if (key_begin + i < key_end) {
+                TileBColumns keys;
+                wmma::load_matrix_sync(keys, tiles + (size_t)(key_begin + i) * TILE_ELEMENTS, TILE);
+                wmma::mma_sync(total, a[i], keys, total);
+            }
+        }
+        wmma::store_matrix_sync(partial + warp * TILE_ELEMENTS, total, TILE, wmma::mem_row_major);
+        __syncthreads();
+
+        for (int j = 0; j < OWN_ROWS; j++) {
+            const int t = warp + j * LATENT_WARPS;
+            float score = 0.0f;
+            if (lane < TILE) {
+                for (int w = 0; w < LATENT_WARPS; w++)
+                    score += partial[w * TILE_ELEMENTS + t * TILE + lane];
+            }
+            const bool seen =
+                lane < TILE && valid(t) && page * TILE + lane < first_len + t / per_tile;
+            // Weights are relative to the best score in the first page (see attention_tiles).
+            if (page == 0)
+                reference[j] = warp_max(seen ? score : -FLT_MAX);
+            float weight = 0.0f;
+            if (seen)
+                weight = expf(fminf((score - reference[j]) * scale, LARGEST_ATTENTION_EXPONENT));
+            const __nv_bfloat16 rounded = __float2bfloat16(weight);
+            if (lane < TILE)
+                weights[t * TILE + lane] = rounded;
+            lane_sum[j] += __bfloat162float(rounded);
+        }
+        __syncthreads();
+
+        TileA weight_tile;
+        wmma::load_matrix_sync(weight_tile, weights, TILE);
+#pragma unroll
+        for (int i = 0; i < LATENT_VALUE_CHUNKS; i++) {
+            if (value_begin + i < value_end) {
+                TileBRows values;
+                wmma::load_matrix_sync(values, tiles + (size_t)(value_begin + i) * TILE_ELEMENTS,
+                                       TILE);
+                wmma::mma_sync(totals[i], weight_tile, values, totals[i]);
+            }
+        }
+    }
+
+    for (int j = 0; j < OWN_ROWS; j++) {
+        const float sum = warp_sum(lane_sum[j]);
+        if (lane == 0)
+            inverse[warp + j * LATENT_WARPS] = sum > 0.0f ? 1.0f / sum : 0.0f;
+    }
+    __syncthreads();
+    float *staging = partial + warp * TILE_ELEMENTS;
+#pragma unroll
+    for (int i = 0; i < LATENT_VALUE_CHUNKS; i++) {
+        if (value_begin + i >= value_end)
+            continue;
+        wmma::store_matrix_sync(staging, totals[i], TILE, wmma::mem_row_major);
+        __syncwarp();
+        for (int e = lane; e < TILE_ELEMENTS; e += WARP) {
+            const int t = e / TILE;
+            if (valid(t)) {
+                const int row = first_row + t / per_tile, head = head_tile * TILE + t % per_tile;
+                out[head * out_head_stride +
+                    tile_index(row, (value_begin + i) * TILE + e % TILE, value_chunks)] =
+                    __float2bfloat16(staging[e] * inverse[t]);
+            }
+        }
+        __syncwarp();
+    }
+}
+
+// One block per row: gather each head's `width` outputs (`[n_heads, rows, width]`, `head_stride`
+// elements per head) into the row of a `[rows, n_heads * width]` tile-layout matrix.
+extern "C" __global__ void heads_to_tiles(const float *x, unsigned long long head_stride,
+                                          int n_heads, int width, __nv_bfloat16 *out) {
+    const int row = blockIdx.x, chunks = n_heads * width / TILE;
+    for (int i = threadIdx.x; i < n_heads * width; i += WARP)
+        out[tile_index(row, i, chunks)] =
+            __float2bfloat16(x[(i / width) * head_stride + (size_t)row * width + i % width]);
+}
+
+// One warp per row, for DeepSeek's routing (see `Routing` in config.rs): weights from the
+// softmax of the scores, or from their sigmoids; experts chosen by those plus `correction` (if
+// there is one), from the best `top_groups` of `groups` equal groups, each scored by its best
+// member (softmax) or its best two (sigmoids); the top_k best of those, renormalized if asked,
+// then all multiplied by `scale`. Ties go to the lower number. Written in order of expert.
+#define MAX_GROUPS 32
+extern "C" __global__ void moe_route_grouped(const float *scores, int experts, int top_k,
+                                             int renormalize, int sigmoid, int groups,
+                                             int top_groups, float scale,
+                                             const float *correction, int *topk_ids,
+                                             float *topk_weights) {
+    __shared__ float weight[MAX_EXPERTS], choice[MAX_EXPERTS], group_score[MAX_GROUPS];
+    __shared__ int allowed[MAX_GROUPS];
+    const int row = blockIdx.x, lane = threadIdx.x;
+    const float *s = scores + (size_t)row * experts;
+    float max = -FLT_MAX, sum = 0.0f;
+    if (!sigmoid) {
+        for (int i = lane; i < experts; i += WARP)
+            max = fmaxf(max, s[i]);
+        max = warp_max(max);
+        for (int i = lane; i < experts; i += WARP)
+            sum += expf(s[i] - max);
+        sum = warp_sum(sum);
+    }
+    for (int i = lane; i < experts; i += WARP) {
+        const float w = sigmoid ? 1.0f / (1.0f + expf(-s[i])) : expf(s[i] - max) / sum;
+        weight[i] = w;
+        choice[i] = correction ? w + correction[i] : w;
+    }
+    __syncwarp();
+    const int per_group = experts / groups;
+    for (int g = lane; g < groups; g += WARP) {
+        float first = -FLT_MAX, second = -FLT_MAX;
+        for (int i = g * per_group; i < (g + 1) * per_group; i++) {
+            const float c = choice[i];
+            if (c > first) {
+                second = first;
+                first = c;
+            } else if (c > second) {
+                second = c;
+            }
+        }
+        group_score[g] = sigmoid ? first + (per_group > 1 ? second : 0.0f) : first;
+        allowed[g] = 0;
+    }
+    __syncwarp();
+    if (lane == 0) {
+        for (int k = 0; k < min(top_groups, groups); k++) {
+            int best = -1;
+            for (int g = 0; g < groups; g++)
+                if (!allowed[g] && (best < 0 || group_score[g] > group_score[best]))
+                    best = g;
+            allowed[best] = 1;
+        }
+    }
+    __syncwarp();
+    int chosen[MAX_TOP_K];
+    float chosen_weight[MAX_TOP_K];
+    float total = 0.0f;
+    for (int k = 0; k < top_k; k++) {
+        float best = -FLT_MAX;
+        int best_i = 0x7fffffff;
+        for (int i = lane; i < experts; i += WARP) {
+            bool taken = !allowed[i / per_group];
+            for (int j = 0; j < k; j++)
+                taken |= chosen[j] == i;
+            if (!taken && (choice[i] > best || (choice[i] == best && i < best_i))) {
+                best = choice[i];
+                best_i = i;
+            }
+        }
+        for (int step = WARP / 2; step > 0; step >>= 1) {
+            const float other = __shfl_xor_sync(0xffffffffu, best, step);
+            const int other_i = __shfl_xor_sync(0xffffffffu, best_i, step);
+            if (other > best || (other == best && other_i < best_i)) {
+                best = other;
+                best_i = other_i;
+            }
+        }
+        chosen[k] = best_i;
+        chosen_weight[k] = weight[best_i];
+        total += chosen_weight[k];
+    }
+    if (lane != 0)
+        return;
+    for (int k = 1; k < top_k; k++) {
+        for (int j = k; j > 0 && chosen[j - 1] > chosen[j]; j--) {
+            const int id = chosen[j];
+            chosen[j] = chosen[j - 1];
+            chosen[j - 1] = id;
+            const float w = chosen_weight[j];
+            chosen_weight[j] = chosen_weight[j - 1];
+            chosen_weight[j - 1] = w;
+        }
+    }
+    for (int k = 0; k < top_k; k++) {
+        const float w = renormalize ? chosen_weight[k] / (total + 1e-20f) : chosen_weight[k];
+        topk_ids[row * top_k + k] = chosen[k];
+        topk_weights[row * top_k + k] = w * scale;
+    }
+}
+
+// One block per row, for a shared expert with a gate of its own (Qwen2 MoE): x += sigmoid(gate) * y.
+extern "C" __global__ void add_gated(const float *y, const float *gate, int dim, float *x) {
+    const int row = blockIdx.x;
+    const float scale = 1.0f / (1.0f + expf(-gate[row]));
+    for (int i = threadIdx.x; i < dim; i += WARP)
+        x[(size_t)row * dim + i] += scale * y[(size_t)row * dim + i];
+}

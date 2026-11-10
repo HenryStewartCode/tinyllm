@@ -381,10 +381,35 @@ impl Gpu {
         self.launch_with(kernel, grid, 32, shared_bytes, args)
     }
 
+    /// `launch`, with `threads` threads per block and `shared_bytes` of on-chip memory.
+    pub fn launch_with_shared(
+        &self,
+        kernel: Kernel,
+        grid: [usize; 2],
+        threads: usize,
+        shared_bytes: usize,
+        args: &[Arg],
+    ) -> Result<()> {
+        self.launch_with(kernel, grid, threads, shared_bytes, args)
+    }
+
     fn launch_with(
         &self,
         kernel: Kernel,
         grid: [usize; 2],
+        threads: usize,
+        shared_bytes: usize,
+        args: &[Arg],
+    ) -> Result<()> {
+        self.launch_grid(kernel, [grid[0], grid[1], 1], threads, shared_bytes, args)
+    }
+
+    /// Launch `kernel` over a grid of blocks in three dimensions, with `threads` threads per
+    /// block and `shared_bytes` of on-chip memory.
+    pub fn launch_grid(
+        &self,
+        kernel: Kernel,
+        grid: [usize; 3],
         threads: usize,
         shared_bytes: usize,
         args: &[Arg],
@@ -408,7 +433,7 @@ impl Gpu {
                 kernel.0,
                 grid[0] as c_uint,
                 grid[1] as c_uint,
-                1,
+                grid[2] as c_uint,
                 threads as c_uint,
                 1,
                 1,

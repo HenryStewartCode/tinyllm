@@ -142,9 +142,11 @@ On an M1 Max with Qwen3-0.6B, in tokens per second:
 | CPU, 4 threads | 65 | 186 | 200 | | 280 |
 | Apple GPU | 126 | 374 | 851 | 1,016 | 2,200–2,700 |
 
-Mixtures of experts and `--quantization int8` don't run on Metal yet; with `--device auto` such a
-model runs on the CPU instead. The KV cache is 32-bit, and its size comes from `--cache-mb` as on
-the CPU.
+Mixtures of experts run on Metal too (all the families below except GPT-OSS), and so does DeepSeek's
+latent attention: with 64 GB of memory, the real DeepSeek-V2-Lite-Chat (16B parameters, 31 GB)
+runs on the GPU of an M1 Max. GPT-OSS and `--quantization int8` don't run on Metal yet; with
+`--device auto` such a model runs on the CPU instead. The KV cache is 32-bit, and its size comes
+from `--cache-mb` as on the CPU.
 
 ## Serving
 
@@ -228,8 +230,8 @@ an empty one to turn thinking off, is noticed from how the prompt ends. The Anth
 
 ### Mixtures of experts
 
-Qwen3-MoE, Mixtral, OLMoE and Granite MoE run on the CPU and the GPU, and Qwen2-MoE (with its
-shared expert) on the CPU. A router scores the experts for each token, which goes through its best
+Qwen3-MoE, Mixtral, OLMoE, Granite MoE and Qwen2-MoE (with its shared expert) run on the CPU, the
+NVIDIA GPU and the Apple GPU. A router scores the experts for each token, which goes through its best
 few. Rows are grouped by expert, so each expert's weights are read once per step for all the rows
 it has; on the GPU, choosing, grouping, multiplying and adding up all happen in kernels whose
 launches don't depend on which experts were chosen, so CUDA graphs can still replay a step. Each
@@ -239,12 +241,26 @@ experts' weights 16-bit.
 On an RTX 2000 Ada, Granite 3.1's 1B mixture (400M parameters active per token) generates 159
 tokens/s for one request and 4,314 for 128 at once.
 
-DeepSeek V2 and V3 run on the CPU so far: their multi-head latent attention (each token's keys and
-values expanded from one small latent vector, with a rotated part shared across heads, and queries
-through a latent of their own in V3), and their experts, chosen among the best groups of experts
-(by softmax in V2; by sigmoid plus a learned correction in V3), with shared experts every token
-goes through and dense first layers. The KV cache keeps the expanded keys and values, not yet the
-latent, which would be far smaller.
+DeepSeek V2 and V3 run on the CPU, the NVIDIA GPU and the Apple GPU: their multi-head latent
+attention (each token's keys and values expanded from one small latent vector, with a rotated part
+shared across heads, and queries through a latent of their own in V3), and their experts, chosen
+among the best groups of experts (by softmax in V2; by sigmoid plus a learned correction in V3),
+with shared experts every token goes through and dense first layers. On the GPUs the KV cache keeps
+just the latent and the rotated part, as SGLang does: 576 numbers a token per layer, where every
+head's keys and values would be 5,120 (DeepSeek-V2-Lite) or 40,960 (V3). Each head's query goes
+through that head's key matrix first, so it scores against the latent directly, and attention's
+blend of latents goes through the head's value matrix afterwards. The CPU keeps the expanded keys
+and values.
+
+The full DeepSeek-V2-Lite is 31 GB, too big for the 16 GB RTX 2000 Ada, so its speed there was
+measured on a model of the same width with random weights and 8 of its 27 layers
+(`scripts/make_random_checkpoint.py`), against SGLang 0.5.23 on the same shape (`--load-format
+dummy`), 128 tokens per request, total tokens per second:
+
+| Concurrent requests | 1 | 4 | 16 | 64 |
+|---|---|---|---|---|
+| tinyllm | 96 | 204 | 427 | 1,269 |
+| SGLang | 110 | 223 | 442 | 1,358 |
 
 ### GPT-OSS
 
@@ -572,7 +588,7 @@ Checked against Hugging Face `transformers` (float32) and `tokenizers`:
 - **Every architecture:** random-weight models built by `transformers` for Llama, Qwen3 (with and
   without sliding windows), Mistral with a window, Phi-3, Granite, SmolLM3, Gemma, Gemma 2 (with
   soft-capping, and with 256-wide heads) and Gemma 3 (alternating sliding and global layers) match
-  to within 4e-4 on the CPU and the GPU in 32 bits, and batching never changes a result. So do
+  to within 8e-4 on the CPU and the GPU in 32 bits, and batching never changes a result. So do
   models with YaRN's longer-context RoPE scaling (as Qwen's long-context configurations and
   DeepSeek use it, including `mscale`), to within 2.5e-7, with prompts well past the original
   context. So do
@@ -581,8 +597,13 @@ Checked against Hugging Face `transformers` (float32) and `tokenizers`:
 - **Reranking:** Qwen3-Reranker-0.6B's scores through `/v1/rerank` are the same as its model
   card's code with `transformers` gives, to six decimal places.
 - **DeepSeek:** random-weight V2 (group-limited softmax routing) and V3 (query latent, sigmoid
-  routing with a correction, YaRN with `mscale`) models match `transformers` to within 3.3e-7 on
-  the CPU, and batching changes nothing.
+  routing with a correction, YaRN with `mscale`) models match `transformers` to within 4.8e-7 on
+  the CPU, and on the NVIDIA GPU in 16 bits as closely as `transformers`' own 16-bit mode; so do
+  V2 with 24 heads (more than one 16-row tile) and a V3 of dense layers only, which shows latent
+  attention alone (largest difference 6e-3, against 7.9e-3 for `transformers` in 16 bits). The
+  Apple GPU matches the CPU to within 4.3e-7 on all of them, and on the real
+  DeepSeek-V2-Lite-Chat to within 1.2e-4 (logits up to 71), with 32-token greedy generations
+  identical. Batching changes nothing on any device.
 - **GPT-OSS:** a random-weight model with sinks, alternating windows, YaRN and the clamped
   activation matches `transformers` to within 2.1e-7 on the CPU, and on the GPU in 16 bits as
   closely as `transformers`' own 16-bit mode. Its experts packed in MXFP4 (`scripts/make_mxfp4.py`)
@@ -618,7 +639,10 @@ Checked against Hugging Face `transformers` (float32) and `tokenizers`:
   identical), and the NVIDIA GPU in 16 bits as closely as 16-bit weights usually do. Batching
   changes nothing. Through the server (`scripts/lora_test.py`), requests mixing two adapters and
   none get exactly the replies they get alone, and an adapter never reuses another's cached prompt.
-- **Apple GPU:** the random-weight models of every dense architecture above match `transformers`
+- **Apple GPU:** the random-weight mixtures of experts (Qwen3-MoE, Qwen2-MoE, Mixtral, OLMoE,
+  Granite MoE) match the CPU to within 2e-7, with greedy generations identical and batching
+  changing nothing.
+- **Apple GPU, dense models:** the random-weight models of every dense architecture above match `transformers`
   as closely as the CPU does (within 2.5e-7 for the Llama-style ones, 5.4e-4 for Gemma 2 with
   256-wide heads, where the CPU is at 5.9e-4). On Qwen3-0.6B, Qwen2.5-0.5B and SmolLM2-135M the
   logits match the CPU's to within 1e-4 to 6e-4, and 32-token greedy generations are identical.
@@ -672,12 +696,12 @@ missing is breadth, and the last 10–20% of single-stream speed.
 | GPU execution | yes | **one NVIDIA GPU**, or an Apple GPU through Metal; no AMD. Slightly slower for one stream, faster under load: see [Performance](#performance) |
 | Reusable compiled batches (CUDA graphs) | yes | yes, for batches of up to 64 |
 | Scheduling overlapped with the GPU's work | yes | not needed so far: scheduling, sampling and streaming take 0–3% of each step with up to 256 requests at once (Qwen2.5-0.5B on the RTX 2000 Ada), and the GPU is busy 96% of the time. `/metrics` shows the split as `tinyllm_forward_seconds_total` |
-| Quantized weights | yes: FP8, INT8, AWQ, GPTQ, GGUF, bitsandbytes, MXFP4 and more | FP8 and 4-bit AWQ/GPTQ checkpoints, and 8-bit integers, on the NVIDIA GPU (the CPU and Apple GPU unpack quantized checkpoints to 32 bits); bfloat16 weights stay 16-bit on the CPU. **No GGUF, bitsandbytes, MXFP4, or GPTQ with 8 bits** |
+| Quantized weights | yes: FP8, INT8, AWQ, GPTQ, GGUF, bitsandbytes, MXFP4 and more | FP8 and 4-bit AWQ/GPTQ checkpoints, 8-bit integers, and GPT-OSS's MXFP4 experts, on the NVIDIA GPU (the CPU and Apple GPU unpack quantized checkpoints); bfloat16 weights stay 16-bit on the CPU. **No GGUF, bitsandbytes, or GPTQ with 8 bits** |
 | Tool calling, with `tool_choice` and strict schemas | yes, with parsers for many model families | yes, for the families that run here: Qwen and Hermes, Mistral, Llama 3, and GPT-OSS's harmony messages |
 | Reasoning parsers, thinking budgets | yes, for many families | yes, for `<think>` models (Qwen3, SmolLM3, DeepSeek-R1 and others) and GPT-OSS's harmony channels (budgets for `<think>` models only) |
 | Speculative decoding | yes: EAGLE, MTP, draft models, n-grams | draft models and n-grams, with replies exactly as without it. **No EAGLE or MTP** |
 | LoRA adapters | yes, mixed in batches, loaded and unloaded while running | yes, mixed in batches, chosen by `model` or `lora_path`, loaded and unloaded while running (unloading doesn't free their memory yet) |
-| Architectures | many | Llama-style (Llama, Mistral, Qwen2/3, SmolLM2/3, Phi-3, Granite, Gemma 1–3) and mixtures of experts (Qwen3-MoE, Qwen2-MoE, Mixtral, OLMoE, Granite MoE, GPT-OSS, and DeepSeek V2/V3 with latent attention, on the CPU so far). **No hybrid attention models (Qwen3-Next, Jamba)** |
+| Architectures | many | Llama-style (Llama, Mistral, Qwen2/3, SmolLM2/3, Phi-3, Granite, Gemma 1–3) and mixtures of experts (Qwen3-MoE, Qwen2-MoE, Mixtral, OLMoE, Granite MoE, GPT-OSS, and DeepSeek V2/V3, with only the latent in the cache on the GPUs: 3–13% behind SGLang on DeepSeek-V2-Lite's shape). GPT-OSS doesn't run on the Apple GPU yet. **No hybrid attention models (Qwen3-Next, Jamba)** |
 | Sliding-window attention, logit soft-capping | yes | yes |
 | Embedding models | yes | yes, with last-token pooling |
 | Rerank models | yes | yes, rerankers that judge with "yes" and "no" (Qwen3-Reranker); **no** cross-encoders with classification heads (BERT-style) |
@@ -685,8 +709,8 @@ missing is breadth, and the last 10–20% of single-stream speed.
 | Multi-GPU, multi-node, router | yes | **no** |
 | The SGL frontend language (`gen`, `select`, `fork`) | yes | **no** |
 
-Biggest gaps first, the plan is: DeepSeek on the GPUs (and keeping its latent in the cache), then
-EAGLE-style speculative decoding.
+Biggest gaps first, the plan is: EAGLE-style speculative decoding (and DeepSeek's multi-token
+prediction), then GPT-OSS on the Apple GPU and closing the gap with SGLang on DeepSeek.
 
 Other limitations: only BPE tokenizers are supported (not SentencePiece Unigram or WordPiece,
 though that covers the Llama family), embeddings only use last-token pooling, and sliding windows

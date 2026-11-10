@@ -316,10 +316,15 @@ impl Encoder {
 
     /// Run `groups` threadgroups of `threads` threads each.
     pub fn dispatch(&self, groups: [usize; 2], threads: usize) {
+        self.dispatch_3d([groups[0], groups[1], 1], threads);
+    }
+
+    /// `dispatch`, over a grid of threadgroups in three dimensions.
+    pub fn dispatch_3d(&self, groups: [usize; 3], threads: usize) {
         let groups = Size {
             width: groups[0],
             height: groups[1],
-            depth: 1,
+            depth: groups[2],
         };
         let threads = Size {
             width: threads,

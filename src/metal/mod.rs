@@ -10,12 +10,15 @@
 mod api;
 
 use crate::backend::{Backend, LoadedModel, Logits};
-use crate::config::{Activation, Architecture, Config};
+use crate::config::{
+    Activation, Architecture, Config, ExpertNaming, Experts as ConfigExperts, LatentAttention,
+    Routing,
+};
 use crate::lora::{LoraAdapter, LoraPair, Module};
 use crate::model::{LogitUse, Row};
 use crate::pool::Pool;
 use crate::safetensors::SafeTensors;
-use anyhow::{Result, ensure};
+use anyhow::{Result, bail, ensure};
 use api::{Buffer, Device, Encoder, Library, Pipeline};
 use std::cell::Cell;
 use std::path::Path;
@@ -74,6 +77,38 @@ struct NormArgs {
     dim: u32,
     eps: f32,
     select: u32,
+    /// How far apart the input's rows are.
+    stride: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct HeadArgs {
+    w_stride: u32,
+    x_stride: u32,
+    out_offset: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LatentArgs {
+    n_heads: u32,
+    nope: u32,
+    rope: u32,
+    rank: u32,
+    stride: u32,
+    rows: u32,
+    eps: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LatentAttnArgs {
+    n_heads: u32,
+    rank: u32,
+    rope: u32,
+    rows: u32,
+    scale: f32,
 }
 
 #[repr(C)]
@@ -95,6 +130,8 @@ struct MatmulArgs {
     scale: f32,
     accumulate: u32,
     has_bias: u32,
+    /// How far apart the output's rows are (usually `m`).
+    out_stride: u32,
 }
 
 #[repr(C)]
@@ -145,6 +182,43 @@ struct LogitArgs {
     softcap: f32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RouteArgs {
+    experts: u32,
+    top_k: u32,
+    renormalize: u32,
+    deepseek: u32,
+    sigmoid: u32,
+    groups: u32,
+    top_groups: u32,
+    scale: f32,
+    has_correction: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SortArgs {
+    rows: u32,
+    top_k: u32,
+    experts: u32,
+    group_rows: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GatherArgs {
+    dim: u32,
+    group_rows: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CombineArgs {
+    dim: u32,
+    top_k: u32,
+}
+
 struct Kernels {
     embed_bf16: Pipeline,
     embed_f32: Pipeline,
@@ -161,6 +235,22 @@ struct Kernels {
     finish_logits: Pipeline,
     lora_shrink: Pipeline,
     lora_expand: Pipeline,
+    moe_route: Pipeline,
+    moe_sort: Pipeline,
+    moe_gather: Pipeline,
+    moe_matmul_vec_bf16: Pipeline,
+    moe_matmul_vec_f32: Pipeline,
+    moe_matmul_mma_bf16: Pipeline,
+    moe_matmul_mma_f32: Pipeline,
+    moe_combine: Pipeline,
+    add_gated: Pipeline,
+    matmul_heads_vec_bf16: Pipeline,
+    matmul_heads_vec_f32: Pipeline,
+    matmul_heads_mma_bf16: Pipeline,
+    matmul_heads_mma_f32: Pipeline,
+    latent_queries: Pipeline,
+    latent_store: Pipeline,
+    attention_latent: Pipeline,
 }
 
 impl Kernels {
@@ -182,6 +272,22 @@ impl Kernels {
             finish_logits: get("finish_logits")?,
             lora_shrink: get("lora_shrink")?,
             lora_expand: get("lora_expand")?,
+            moe_route: get("moe_route")?,
+            moe_sort: get("moe_sort")?,
+            moe_gather: get("moe_gather")?,
+            moe_matmul_vec_bf16: get("moe_matmul_vec_bf16")?,
+            moe_matmul_vec_f32: get("moe_matmul_vec_f32")?,
+            moe_matmul_mma_bf16: get("moe_matmul_mma_bf16")?,
+            moe_matmul_mma_f32: get("moe_matmul_mma_f32")?,
+            moe_combine: get("moe_combine")?,
+            add_gated: get("add_gated")?,
+            matmul_heads_vec_bf16: get("matmul_heads_vec_bf16")?,
+            matmul_heads_vec_f32: get("matmul_heads_vec_f32")?,
+            matmul_heads_mma_bf16: get("matmul_heads_mma_bf16")?,
+            matmul_heads_mma_f32: get("matmul_heads_mma_f32")?,
+            latent_queries: get("latent_queries")?,
+            latent_store: get("latent_store")?,
+            attention_latent: get("attention_latent")?,
         })
     }
 }
@@ -208,16 +314,65 @@ struct Layer {
     /// Normalizes what attention adds to the residual stream, if the model does that.
     norm_after_attn: Option<Buffer>,
     mlp_norm: Buffer,
-    /// gate_proj and up_proj as one matrix, for the same reason as `qkv`.
-    gate_up: Matrix,
-    down: Matrix,
+    feed_forward: FeedForward,
     /// The same as `norm_after_attn`, for the MLP.
     norm_after_mlp: Option<Buffer>,
+    /// With latent attention, `k_pool` is the cache of latents and `v_pool` is unused.
     k_pool: Buffer,
     v_pool: Buffer,
     rope_table: usize,
     /// How many tokens it can see.
     window: usize,
+    /// DeepSeek's latent attention, which uses `qkv` for the projections of the layer's input.
+    latent: Option<LatentLayer>,
+}
+
+/// DeepSeek's latent attention for a layer (see `kernels.metal`). The layer's `qkv` stacks
+/// `q_a_proj` (or `q_proj`, when queries have no latent of their own) and `kv_a_proj_with_mqa`.
+struct LatentLayer {
+    /// `q_a_layernorm` and `q_b_proj`, when queries go through a latent of their own.
+    q_low: Option<(Buffer, Matrix)>,
+    kv_a_norm: Buffer,
+    /// Each head's key matrix from `kv_b_proj`, transposed, `rows` being one head's:
+    /// `[heads][rank, nope]`.
+    absorb_k: Matrix,
+    /// Each head's value matrix: `[heads][v, rank]`.
+    absorb_v: Matrix,
+}
+
+/// Working memory for latent attention, sized for the workspace's rows.
+struct LatentBuffers {
+    /// `q_a_proj`'s outputs, normalized, `[rows, q_lora_rank]` (when queries have a latent).
+    q_low: Buffer,
+    /// The queries from `q_b_proj`, `[rows, heads * (nope + rope)]` (likewise).
+    q: Buffer,
+    /// Each head's unrotated query part, `[heads][rows, nope]`.
+    q_nope: Buffer,
+    /// Attention's queries, `[rows][heads][rank + rope]`.
+    query: Buffer,
+    /// Each head's blend of latents, `[heads][rows, rank]`.
+    blended: Buffer,
+}
+
+enum FeedForward {
+    /// gate_proj and up_proj as one matrix, for the same reason as `qkv`, then down_proj.
+    Dense { gate_up: Matrix, down: Matrix },
+    Sparse(Box<Experts>),
+}
+
+/// A layer's mixture of experts (see "Mixtures of experts" in `kernels.metal`).
+struct Experts {
+    router: Matrix,
+    /// Every expert's gate_proj and up_proj stacked, one expert after another, `rows` being one
+    /// expert's: `[experts][2 * hidden, dim]`.
+    gate_up: Matrix,
+    /// Every expert's down_proj: `[experts][dim, hidden]`.
+    down: Matrix,
+    /// What's added to the router's scores to choose experts by (DeepSeek V3).
+    correction: Option<Buffer>,
+    /// An expert every token goes through as well, like a dense MLP: gate_up, down, and its own
+    /// gate (`[1, dim]`, Qwen2 MoE) if it has one.
+    shared: Option<(Matrix, Matrix, Option<Matrix>)>,
 }
 
 /// The sizes the working memory depends on.
@@ -227,9 +382,47 @@ struct Shape {
     q_dim: usize,
     kv_dim: usize,
     hidden_dim: usize,
+    /// The widest MLP: a dense layer's, or a shared expert's.
+    mlp_width: usize,
     /// Half a head, the length of a row of RoPE rotations.
     half: usize,
     rope_tables: usize,
+    /// For mixtures of experts: how many, how many per token, and their hidden width.
+    experts: Option<(usize, usize, usize)>,
+    heads: usize,
+    /// The projections of a layer's input, stacked, and attention's output.
+    qkv_width: usize,
+    attn_width: usize,
+    latent: Option<LatentAttention>,
+}
+
+/// Rows a mixture of experts' grouped matmuls go through, at most, for `rows` rows: each expert's
+/// rows, padded to whole groups of `MM_BN` (the larger of the two kernels' groups).
+fn moe_slots(rows: usize, (count, top_k, _): (usize, usize, usize)) -> usize {
+    (rows * top_k + count * (MM_BN - 1)).next_multiple_of(MM_BN)
+}
+
+/// Working memory for mixtures of experts.
+struct MoeBuffers {
+    /// The router's scores `[rows, experts]`.
+    scores: Buffer,
+    /// Each row's experts and their weights `[rows, top_k]`.
+    topk_ids: Buffer,
+    topk_weights: Buffer,
+    /// Where each (row, expert) pair went in expert order.
+    slot_of: Buffer,
+    /// The row in each slot, or -1 for padding.
+    sorted_rows: Buffer,
+    /// Each group's expert, and how many groups there are.
+    group_expert: Buffer,
+    num_groups: Buffer,
+    /// The rows in expert order, and what the experts make of them.
+    x: Buffer,
+    gate_up: Buffer,
+    gated: Buffer,
+    down: Buffer,
+    /// A shared expert's gate for each row.
+    shared_gate: Buffer,
 }
 
 /// Working memory for a batch of up to `rows` rows. A bigger batch gets a bigger one.
@@ -263,20 +456,58 @@ struct Workspace {
     /// RoPE rotations for each row's position `[tables, batch, half]`.
     cos: Buffer,
     sin: Buffer,
+    moe: Option<MoeBuffers>,
+    latent: Option<LatentBuffers>,
 }
 
 impl Workspace {
     fn new(device: &Device, shape: Shape, rows: usize) -> Result<Self> {
         let floats = |count: usize| device.buffer(rows * count * 4);
+        let moe = match shape.experts {
+            None => None,
+            Some(spec @ (count, top_k, hidden)) => {
+                let slots = moe_slots(rows, spec);
+                let buffer = |count: usize| device.buffer(count * 4);
+                Some(MoeBuffers {
+                    scores: floats(count)?,
+                    topk_ids: floats(top_k)?,
+                    topk_weights: floats(top_k)?,
+                    slot_of: floats(top_k)?,
+                    sorted_rows: buffer(slots)?,
+                    group_expert: buffer(slots / VEC_BATCH)?,
+                    num_groups: buffer(1)?,
+                    x: buffer(slots * shape.dim)?,
+                    gate_up: buffer(slots * 2 * hidden)?,
+                    gated: buffer(slots * hidden)?,
+                    down: buffer(slots * shape.dim)?,
+                    shared_gate: floats(1)?,
+                })
+            }
+        };
+        let latent = match shape.latent {
+            None => None,
+            Some(l) => {
+                let n = shape.heads;
+                Some(LatentBuffers {
+                    q_low: floats(l.q_lora_rank.unwrap_or(1))?,
+                    q: floats(l.q_lora_rank.map_or(1, |_| n * (l.nope + l.rope)))?,
+                    q_nope: floats(n * l.nope)?,
+                    query: floats(n * (l.kv_lora_rank + l.rope))?,
+                    blended: floats(n * l.kv_lora_rank)?,
+                })
+            }
+        };
         Ok(Self {
+            moe,
+            latent,
             rows,
             x: floats(shape.dim)?,
             xb: floats(shape.dim)?,
             added: floats(shape.dim)?,
-            qkv: floats(shape.q_dim + 2 * shape.kv_dim)?,
-            attn_out: floats(shape.q_dim)?,
-            gate_up: floats(2 * shape.hidden_dim)?,
-            gated: floats(shape.hidden_dim)?,
+            qkv: floats(shape.qkv_width)?,
+            attn_out: floats(shape.attn_width)?,
+            gate_up: floats(2 * shape.mlp_width)?,
+            gated: floats(shape.mlp_width)?,
             tokens: floats(1)?,
             write_slots: floats(1)?,
             row_offset: floats(1)?,
@@ -392,6 +623,174 @@ impl Loader<'_> {
     }
 }
 
+/// Split `kv_b_proj` (`[heads][nope + v, rank]`) into each head's key matrix, transposed
+/// (`[heads][rank, nope]`), and value matrix (`[heads][v, rank]`).
+fn split_absorbed<T: Copy>(kv_b: &[T], l: LatentAttention) -> (Vec<T>, Vec<T>) {
+    let rank = l.kv_lora_rank;
+    let (mut keys, mut values) = (Vec::with_capacity(kv_b.len()), Vec::with_capacity(kv_b.len()));
+    for head in kv_b.chunks_exact((l.nope + l.v) * rank) {
+        for c in 0..rank {
+            keys.extend((0..l.nope).map(|i| head[i * rank + c]));
+        }
+        values.extend_from_slice(&head[l.nope * rank..]);
+    }
+    (keys, values)
+}
+
+impl Loader<'_> {
+    /// A layer's `kv_b_proj`, as each head's key and value matrices (see [`LatentLayer`]).
+    fn absorbed(&self, attn: &str, l: LatentAttention, n_heads: usize) -> Result<(Matrix, Matrix)> {
+        let name = format!("{attn}.kv_b_proj.weight");
+        let shape = [n_heads * (l.nope + l.v), l.kv_lora_rank];
+        let bf16 = self.st.dtype(&name) == Some("BF16");
+        let (keys, values) = match bf16 {
+            true => {
+                let (keys, values) = split_absorbed(&self.st.load_bf16(&name, &shape)?, l);
+                (self.upload(&keys)?, self.upload(&values)?)
+            }
+            false => {
+                let (keys, values) = split_absorbed(&self.st.load(&name, &shape)?, l);
+                (self.upload(&keys)?, self.upload(&values)?)
+            }
+        };
+        self.params.set(self.params.get() + shape[0] * shape[1]);
+        let matrix = |data, rows, cols| Matrix {
+            data,
+            bf16,
+            rows,
+            cols,
+            bias: None,
+            scale: 1.0,
+        };
+        Ok((
+            matrix(keys, l.kv_lora_rank, l.nope),
+            matrix(values, l.v, l.kv_lora_rank),
+        ))
+    }
+
+    /// A layer's mixture of experts, with layer prefix `p` (see [`Experts`]).
+    fn experts(&self, p: &str, spec: &ConfigExperts, dim: usize, scale: f32) -> Result<Experts> {
+        let (count, h) = (spec.count, spec.hidden);
+        let router_name = match spec.naming {
+            ExpertNaming::Qwen | ExpertNaming::DeepSeek => format!("{p}.mlp.gate"),
+            ExpertNaming::Mixtral => format!("{p}.block_sparse_moe.gate"),
+            ExpertNaming::Granite => format!("{p}.block_sparse_moe.router.layer"),
+            ExpertNaming::GptOss => bail!("GPT-OSS's experts don't run on Metal yet"),
+        };
+        let router = self.matrix(&[(router_name.clone(), count)], dim, 1.0)?;
+        // Every expert's gate and up projections in one tensor, and every down: Granite's way,
+        // and how transformers 5 saves the others. Otherwise each expert's are named.
+        let stacked = match spec.naming {
+            ExpertNaming::Granite => Some((
+                format!("{p}.block_sparse_moe.input_linear.weight"),
+                format!("{p}.block_sparse_moe.output_linear.weight"),
+            )),
+            ExpertNaming::Mixtral => None,
+            _ => Some((
+                format!("{p}.mlp.experts.gate_up_proj"),
+                format!("{p}.mlp.experts.down_proj"),
+            ))
+            .filter(|(input, _)| self.st.contains(input)),
+        };
+        let (prefix, [gate, up, down]) = match spec.naming {
+            ExpertNaming::Mixtral => (format!("{p}.block_sparse_moe.experts"), ["w1", "w3", "w2"]),
+            _ => (
+                format!("{p}.mlp.experts"),
+                ["gate_proj", "up_proj", "down_proj"],
+            ),
+        };
+        // (tensor, rows, cols) in the order they're stacked.
+        let (gate_up_parts, down_parts): (Vec<(String, usize, usize)>, Vec<_>) = match &stacked {
+            Some((input, output)) => (
+                vec![(input.clone(), count * 2 * h, dim)],
+                vec![(output.clone(), count * dim, h)],
+            ),
+            None => (
+                (0..count)
+                    .flat_map(|e| {
+                        [gate, up].map(|name| (format!("{prefix}.{e}.{name}.weight"), h, dim))
+                    })
+                    .collect(),
+                (0..count)
+                    .map(|e| (format!("{prefix}.{e}.{down}.weight"), dim, h))
+                    .collect(),
+            ),
+        };
+        let stack = |parts: &[(String, usize, usize)], rows: usize, cols: usize, scale: f32| {
+            let bf16 = parts.iter().all(|(name, _, _)| self.st.dtype(name) == Some("BF16"));
+            let total: usize = parts.iter().map(|(_, rows, _)| rows).sum();
+            let data = self.device.buffer(total * cols * if bf16 { 2 } else { 4 })?;
+            let mut at = 0;
+            for (name, part_rows, part_cols) in parts {
+                // A stacked tensor is `[experts, rows, cols]`.
+                let shape = match stacked.is_some() {
+                    true => vec![count, part_rows / count, *part_cols],
+                    false => vec![*part_rows, *part_cols],
+                };
+                let range = at * cols..(at + part_rows) * cols;
+                match bf16 {
+                    true => {
+                        // SAFETY: the GPU hasn't seen this buffer yet.
+                        let memory = unsafe { data.slice_mut::<u16>() };
+                        memory[range].copy_from_slice(&self.st.load_bf16(name, &shape)?);
+                    }
+                    false => {
+                        // SAFETY: as above.
+                        let memory = unsafe { data.slice_mut::<f32>() };
+                        memory[range].copy_from_slice(&self.st.load(name, &shape)?);
+                    }
+                }
+                at += part_rows;
+            }
+            self.params.set(self.params.get() + total * cols);
+            Ok::<_, anyhow::Error>(Matrix {
+                data,
+                bf16,
+                rows,
+                cols,
+                bias: None,
+                scale,
+            })
+        };
+        let correction_name = format!("{router_name}.e_score_correction_bias");
+        let correction = match self.st.contains(&correction_name) {
+            true => Some(self.upload(&self.st.load(&correction_name, &[count])?)?),
+            false => None,
+        };
+        let shared = match spec.shared_hidden {
+            None => None,
+            Some(hidden) => {
+                let prefix = match spec.shared_gated {
+                    true => format!("{p}.mlp.shared_expert"),
+                    false => format!("{p}.mlp.shared_experts"),
+                };
+                Some((
+                    self.matrix(
+                        &[
+                            (format!("{prefix}.gate_proj"), hidden),
+                            (format!("{prefix}.up_proj"), hidden),
+                        ],
+                        dim,
+                        1.0,
+                    )?,
+                    self.matrix(&[(format!("{prefix}.down_proj"), dim)], hidden, scale)?,
+                    match spec.shared_gated {
+                        true => Some(self.matrix(&[(format!("{p}.mlp.shared_expert_gate"), 1)], dim, 1.0)?),
+                        false => None,
+                    },
+                ))
+            }
+        };
+        Ok(Experts {
+            router,
+            gate_up: stack(&gate_up_parts, 2 * h, dim, 1.0)?,
+            down: stack(&down_parts, dim, h, scale)?,
+            correction,
+            shared,
+        })
+    }
+}
+
 pub struct MetalBackend {
     device: Device,
     kernels: Kernels,
@@ -455,18 +854,43 @@ impl MetalBackend {
     pub fn load(dir: &Path, options: &Options) -> Result<LoadedModel<Self>> {
         let config = Config::load(dir)?;
         let architecture = config.architecture()?;
-        ensure!(
-            architecture.experts.is_none(),
-            "mixtures of experts don't run on Metal yet"
-        );
+        if let Some(spec) = &architecture.experts {
+            ensure!(
+                spec.glu.is_none() && spec.naming != ExpertNaming::GptOss,
+                "GPT-OSS's experts don't run on Metal yet"
+            );
+            ensure!(
+                spec.top_k <= 16 && spec.count <= 512,
+                "the Metal kernels handle at most 512 experts and 16 per token"
+            );
+            if let Routing::DeepSeek { groups, .. } = spec.routing {
+                ensure!(
+                    groups <= 32 && spec.count.is_multiple_of(groups),
+                    "the Metal kernels handle at most 32 groups of experts"
+                );
+            }
+            ensure!(
+                [spec.hidden, spec.shared_hidden.unwrap_or(0)]
+                    .iter()
+                    .all(|width| width.is_multiple_of(8)),
+                "the Metal kernels need experts' widths that are multiples of 8"
+            );
+        }
         ensure!(
             !architecture.attention_sinks,
             "attention sinks (GPT-OSS) don't run on Metal yet"
         );
-        ensure!(
-            architecture.latent.is_none(),
-            "DeepSeek's latent attention doesn't run on Metal yet"
-        );
+        let latent = architecture.latent;
+        if let Some(l) = latent {
+            ensure!(
+                l.kv_lora_rank <= 512
+                    && l.kv_lora_rank + l.rope <= 640
+                    && [l.kv_lora_rank, l.rope, l.nope, l.v, l.q_lora_rank.unwrap_or(0)]
+                        .iter()
+                        .all(|size| size.is_multiple_of(8)),
+                "the Metal kernels need a latent of at most 512 and sizes in multiples of 8"
+            );
+        }
         let dim = config.hidden_size;
         let n_heads = config.num_attention_heads;
         let n_kv_heads = config.n_kv_heads();
@@ -535,7 +959,7 @@ impl MetalBackend {
                 // Elsewhere this name means the norm in front of the MLP.
                 false => (None, norm("post_attention_layernorm")?, None),
             };
-            let (qkv_names, gate_up_names) = match architecture.combined_projections {
+            let (mut qkv_names, gate_up_names) = match architecture.combined_projections {
                 true => (
                     vec![(format!("{attn}.qkv_proj"), q_dim + 2 * kv_dim)],
                     vec![(format!("{p}.mlp.gate_up_proj"), 2 * hidden_dim)],
@@ -552,25 +976,69 @@ impl MetalBackend {
                     ],
                 ),
             };
+            // Latent attention starts with the projections of the layer's input.
+            let latent_layer = match latent {
+                None => None,
+                Some(l) => {
+                    qkv_names = vec![
+                        match l.q_lora_rank {
+                            Some(rank) => (format!("{attn}.q_a_proj"), rank),
+                            None => (format!("{attn}.q_proj"), n_heads * (l.nope + l.rope)),
+                        },
+                        (format!("{attn}.kv_a_proj_with_mqa"), l.kv_lora_rank + l.rope),
+                    ];
+                    let (absorb_k, absorb_v) = loader.absorbed(&attn, l, n_heads)?;
+                    Some(LatentLayer {
+                        q_low: match l.q_lora_rank {
+                            Some(rank) => Some((
+                                loader.norm(&format!("{attn}.q_a_layernorm.weight"), rank, false)?,
+                                loader.matrix(
+                                    &[(format!("{attn}.q_b_proj"), n_heads * (l.nope + l.rope))],
+                                    rank,
+                                    1.0,
+                                )?,
+                            )),
+                            None => None,
+                        },
+                        kv_a_norm: loader.norm(
+                            &format!("{attn}.kv_a_layernorm.weight"),
+                            l.kv_lora_rank,
+                            false,
+                        )?,
+                        absorb_k,
+                        absorb_v,
+                    })
+                }
+            };
+            let attn_width = latent.map_or(q_dim, |l| n_heads * l.v);
+            let feed_forward = match (shape.sparse, &architecture.experts) {
+                (true, Some(spec)) => {
+                    FeedForward::Sparse(Box::new(loader.experts(&p, spec, dim, residual)?))
+                }
+                _ => FeedForward::Dense {
+                    gate_up: loader.matrix(&gate_up_names, dim, 1.0)?,
+                    down: loader.matrix(
+                        &[(format!("{p}.mlp.down_proj"), dim)],
+                        hidden_dim,
+                        residual,
+                    )?,
+                },
+            };
             layers.push(Layer {
                 attn_norm: norm("input_layernorm")?,
                 qkv: loader.matrix(&qkv_names, dim, 1.0)?,
                 head_norms,
-                o_proj: loader.matrix(&[(format!("{attn}.o_proj"), dim)], q_dim, residual)?,
+                o_proj: loader.matrix(&[(format!("{attn}.o_proj"), dim)], attn_width, residual)?,
                 norm_after_attn,
                 mlp_norm,
-                gate_up: loader.matrix(&gate_up_names, dim, 1.0)?,
-                down: loader.matrix(
-                    &[(format!("{p}.mlp.down_proj"), dim)],
-                    hidden_dim,
-                    residual,
-                )?,
+                feed_forward,
                 norm_after_mlp,
                 // Allocated below, once the weights' size is known.
                 k_pool: device.buffer(0)?,
                 v_pool: device.buffer(0)?,
                 rope_table: shape.rope_table,
                 window: shape.window.unwrap_or(u32::MAX as usize),
+                latent: latent_layer,
             });
         }
         let embed = loader.matrix(&[("model.embed_tokens".into(), vocab_size)], dim, 1.0)?;
@@ -587,10 +1055,13 @@ impl MetalBackend {
             + lm_head.as_ref().map_or(0, weight_bytes)
             + (layers.iter())
                 .map(|l| {
-                    [&l.qkv, &l.o_proj, &l.gate_up, &l.down]
-                        .map(weight_bytes)
-                        .iter()
-                        .sum::<usize>()
+                    let mlp = match &l.feed_forward {
+                        FeedForward::Dense { gate_up, down } => [gate_up, down].map(weight_bytes),
+                        FeedForward::Sparse(experts) => {
+                            [&experts.gate_up, &experts.down].map(weight_bytes)
+                        }
+                    };
+                    weight_bytes(&l.qkv) + weight_bytes(&l.o_proj) + mlp.iter().sum::<usize>()
                 })
                 .sum::<usize>();
         let room = device
@@ -606,20 +1077,41 @@ impl MetalBackend {
             }
             false => options.cache_bytes,
         };
-        let kv_bytes_per_token = 2 * layers.len() * kv_dim * 4;
+        // Latent attention keeps each token's latent and rotated key part instead.
+        let kv_bytes_per_token = match latent {
+            Some(l) => layers.len() * (l.kv_lora_rank + l.rope) * 4,
+            None => 2 * layers.len() * kv_dim * 4,
+        };
         let capacity = (cache_bytes / kv_bytes_per_token).clamp(16, u32::MAX as usize);
         for layer in &mut layers {
-            layer.k_pool = device.buffer(capacity * kv_dim * 4)?;
-            layer.v_pool = device.buffer(capacity * kv_dim * 4)?;
+            match latent {
+                Some(l) => layer.k_pool = device.buffer(capacity * (l.kv_lora_rank + l.rope) * 4)?,
+                None => {
+                    layer.k_pool = device.buffer(capacity * kv_dim * 4)?;
+                    layer.v_pool = device.buffer(capacity * kv_dim * 4)?;
+                }
+            }
         }
 
+        let experts = architecture.experts.as_ref();
         let shape = Shape {
             dim,
             q_dim,
             kv_dim,
             hidden_dim,
-            half: head_dim / 2,
+            mlp_width: hidden_dim.max(experts.and_then(|spec| spec.shared_hidden).unwrap_or(0)),
+            half: config.rope_dim() / 2,
             rope_tables: architecture.rope_tables.len(),
+            experts: experts.map(|spec| (spec.count, spec.top_k, spec.hidden)),
+            heads: n_heads,
+            qkv_width: match latent {
+                Some(l) => {
+                    l.q_lora_rank.unwrap_or(n_heads * (l.nope + l.rope)) + l.kv_lora_rank + l.rope
+                }
+                None => q_dim + 2 * kv_dim,
+            },
+            attn_width: latent.map_or(q_dim, |l| n_heads * l.v),
+            latent,
         };
         let ws = Workspace::new(&device, shape, 16)?;
         Ok(LoadedModel {
@@ -842,16 +1334,20 @@ impl MetalBackend {
                 self.matmul(e, &layer.qkv, &ws.xb, &ws.qkv, batch, false);
                 self.lora(e, step, l, 0, &ws.xb, &ws.qkv);
             }
-            if let Some((q_weight, k_weight)) = &layer.head_norms
-                && on(Part::Norms)
-            {
-                self.head_norms(e, q_weight, k_weight, batch);
-            }
-            if on(Part::Rope) {
-                self.rope_and_store(e, layer, batch);
-            }
-            if on(Part::Attention) {
-                self.attention(e, layer, batch);
+            if let Some(latent) = &layer.latent {
+                self.latent_attention(e, layer, latent, batch, &on);
+            } else {
+                if let Some((q_weight, k_weight)) = &layer.head_norms
+                    && on(Part::Norms)
+                {
+                    self.head_norms(e, q_weight, k_weight, batch);
+                }
+                if on(Part::Rope) {
+                    self.rope_and_store(e, layer, batch);
+                }
+                if on(Part::Attention) {
+                    self.attention(e, layer, batch);
+                }
             }
             if on(Part::Matmuls) {
                 self.add_block_output(
@@ -868,39 +1364,24 @@ impl MetalBackend {
             if on(Part::Norms) {
                 self.rmsnorm(e, &ws.x, &ws.xb, &layer.mlp_norm, batch, false);
             }
+            let (gate_up, down) = match &layer.feed_forward {
+                FeedForward::Dense { gate_up, down } => (gate_up, down),
+                FeedForward::Sparse(experts) => {
+                    self.experts(e, experts, batch, &on);
+                    continue;
+                }
+            };
             if on(Part::Matmuls) {
-                self.matmul(e, &layer.gate_up, &ws.xb, &ws.gate_up, batch, false);
+                self.matmul(e, gate_up, &ws.xb, &ws.gate_up, batch, false);
                 self.lora(e, step, l, 2, &ws.xb, &ws.gate_up);
             }
-            if !on(Part::Other) {
-                if on(Part::Matmuls) {
-                    self.add_block_output(
-                        e,
-                        &layer.down,
-                        &ws.gated,
-                        batch,
-                        layer.norm_after_mlp.as_ref(),
-                        (step, l, 3),
-                    );
-                }
-                continue;
+            if on(Part::Other) {
+                self.gated(e, &ws.gate_up, &ws.gated, down.cols, batch);
             }
-            e.set_pipeline(&k.gated);
-            e.set_buffer(0, &ws.gate_up, 0);
-            e.set_buffer(1, &ws.gated, 0);
-            e.set_bytes(
-                2,
-                &GatedArgs {
-                    hidden: shape.hidden_dim as u32,
-                    gelu: (self.architecture.activation == Activation::Gelu) as u32,
-                },
-            );
-            let threads = threads(&k.gated, ROW_THREADS);
-            e.dispatch([shape.hidden_dim.div_ceil(threads), batch], threads);
             if on(Part::Matmuls) {
                 self.add_block_output(
                     e,
-                    &layer.down,
+                    down,
                     &ws.gated,
                     batch,
                     layer.norm_after_mlp.as_ref(),
@@ -943,6 +1424,379 @@ impl MetalBackend {
         }
     }
 
+    /// Queue DeepSeek's latent attention (see `kernels.metal`), from the stacked projections of
+    /// the layer's input in `ws.qkv` to its result in `ws.attn_out`, storing each row's latent in
+    /// the cache.
+    fn latent_attention(
+        &self,
+        e: &Encoder,
+        layer: &Layer,
+        latent: &LatentLayer,
+        batch: usize,
+        on: &dyn Fn(Part) -> bool,
+    ) {
+        let l = self.architecture.latent.expect("a latent layer has latent attention");
+        let (ws, k) = (&self.ws, &self.kernels);
+        let b = ws.latent.as_ref().expect("allocated for latent attention");
+        let (n, rank, rope, nope, v) = (self.n_heads, l.kv_lora_rank, l.rope, l.nope, l.v);
+        let q_width = l.q_lora_rank.unwrap_or(n * (nope + rope));
+        let stride = q_width + rank + rope;
+        let args = |stride: usize| LatentArgs {
+            n_heads: n as u32,
+            nope: nope as u32,
+            rope: rope as u32,
+            rank: rank as u32,
+            stride: stride as u32,
+            rows: ws.rows as u32,
+            eps: self.eps,
+        };
+        // Queries straight from the layer's input, or through a latent of their own.
+        let (q, q_stride) = match &latent.q_low {
+            Some((norm, q_b)) => {
+                if on(Part::Norms) {
+                    e.set_pipeline(&k.rmsnorm);
+                    e.set_buffer(0, &ws.qkv, 0);
+                    e.set_buffer(1, &b.q_low, 0);
+                    e.set_buffer(2, norm, 0);
+                    e.set_buffer(3, &ws.logit_rows, 0);
+                    e.set_bytes(
+                        4,
+                        &NormArgs {
+                            dim: q_width as u32,
+                            eps: self.eps,
+                            select: 0,
+                            stride: stride as u32,
+                        },
+                    );
+                    e.dispatch([batch, 1], NORM_THREADS);
+                }
+                if on(Part::Matmuls) {
+                    self.matmul(e, q_b, &b.q_low, &b.q, batch, false);
+                }
+                (&b.q, n * (nope + rope))
+            }
+            None => (&ws.qkv, stride),
+        };
+        if on(Part::Rope) {
+            let table = layer.rope_table * batch * self.shape.half * 4;
+            e.set_pipeline(&k.latent_queries);
+            e.set_buffer(0, q, 0);
+            e.set_buffer(1, &ws.cos, table);
+            e.set_buffer(2, &ws.sin, table);
+            e.set_buffer(3, &b.q_nope, 0);
+            e.set_buffer(4, &b.query, 0);
+            e.set_bytes(5, &args(q_stride));
+            e.dispatch([batch, 1], threads(&k.latent_queries, ROW_THREADS));
+            e.set_pipeline(&k.latent_store);
+            e.set_buffer(0, &ws.qkv, q_width * 4);
+            e.set_buffer(1, &latent.kv_a_norm, 0);
+            e.set_buffer(2, &ws.cos, table);
+            e.set_buffer(3, &ws.sin, table);
+            e.set_buffer(4, &ws.write_slots, 0);
+            e.set_buffer(5, &layer.k_pool, 0);
+            e.set_bytes(6, &args(stride));
+            e.dispatch([batch, 1], NORM_THREADS);
+        }
+        // Each head's query through its key matrix, to score against latents directly.
+        let key = rank + rope;
+        if on(Part::Matmuls) {
+            self.matmul_heads(e, &latent.absorb_k, &b.q_nope, &b.query, batch, (n * key, key));
+        }
+        if on(Part::Attention) {
+            e.set_pipeline(&k.attention_latent);
+            e.set_buffer(0, &b.query, 0);
+            e.set_buffer(1, &layer.k_pool, 0);
+            e.set_buffer(2, &self.slot_lists, 0);
+            e.set_buffer(3, &ws.row_offset, 0);
+            e.set_buffer(4, &ws.row_len, 0);
+            e.set_buffer(5, &b.blended, 0);
+            e.set_bytes(
+                6,
+                &LatentAttnArgs {
+                    n_heads: n as u32,
+                    rank: rank as u32,
+                    rope: rope as u32,
+                    rows: ws.rows as u32,
+                    scale: self.architecture.attention_scale,
+                },
+            );
+            e.set_threadgroup_memory(0, ATT_SIMDS * (rank + 2) * 4);
+            e.dispatch([n, batch], ATT_SIMDS * SIMD);
+        }
+        // Each head's blend of latents through its value matrix, into its place in attn_out.
+        if on(Part::Matmuls) {
+            self.matmul_heads(e, &latent.absorb_v, &b.blended, &ws.attn_out, batch, (n * v, v));
+        }
+    }
+
+    /// Queue `out_h = W_h x_h` for each head `h`, with `W_h` one head's `w` (the heads' matrices
+    /// one after another), `x_h` its `[rows, cols]` part of `x` (the heads' parts `ws.rows` rows
+    /// apart), and `out_h` its columns of `out`, whose rows are `out_stride` apart and whose heads
+    /// are `head_offset` columns apart.
+    fn matmul_heads(
+        &self,
+        e: &Encoder,
+        w: &Matrix,
+        x: &Buffer,
+        out: &Buffer,
+        batch: usize,
+        (out_stride, head_offset): (usize, usize),
+    ) {
+        let k = &self.kernels;
+        let tiles = w.rows.div_ceil(MM_BM) * batch.div_ceil(MM_BN) * self.n_heads;
+        let mma = batch >= MMA_MIN_BATCH && tiles >= MMA_MIN_TILES;
+        let (pipeline, groups, threads) = match (mma, w.bf16) {
+            (false, bf16) => {
+                let pipeline = match bf16 {
+                    true => &k.matmul_heads_vec_bf16,
+                    false => &k.matmul_heads_vec_f32,
+                };
+                let threads = threads(pipeline, VEC_THREADS);
+                let rows_per_group = threads / SIMD * VEC_ROWS;
+                let groups = [w.rows.div_ceil(rows_per_group), batch.div_ceil(VEC_BATCH)];
+                (pipeline, groups, threads)
+            }
+            (true, bf16) => {
+                let pipeline = match bf16 {
+                    true => &k.matmul_heads_mma_bf16,
+                    false => &k.matmul_heads_mma_f32,
+                };
+                (pipeline, [w.rows.div_ceil(MM_BM), batch.div_ceil(MM_BN)], MM_THREADS)
+            }
+        };
+        e.set_pipeline(pipeline);
+        e.set_buffer(0, &w.data, 0);
+        e.set_buffer(1, x, 0);
+        e.set_buffer(2, out, 0);
+        e.set_buffer(3, &w.data, 0);
+        e.set_bytes(
+            4,
+            &MatmulArgs {
+                m: w.rows as u32,
+                n: w.cols as u32,
+                batch: batch as u32,
+                scale: w.scale,
+                accumulate: 0,
+                has_bias: 0,
+                out_stride: out_stride as u32,
+            },
+        );
+        e.set_bytes(
+            5,
+            &HeadArgs {
+                w_stride: (w.rows * w.cols) as u32,
+                x_stride: (self.ws.rows * w.cols) as u32,
+                out_offset: head_offset as u32,
+            },
+        );
+        e.dispatch_3d([groups[0], groups[1], self.n_heads], threads);
+    }
+
+    /// Queue `out = act(gate) * up` for `rows` rows of `gate_up`, `hidden` wide.
+    fn gated(&self, e: &Encoder, gate_up: &Buffer, out: &Buffer, hidden: usize, rows: usize) {
+        let k = &self.kernels;
+        e.set_pipeline(&k.gated);
+        e.set_buffer(0, gate_up, 0);
+        e.set_buffer(1, out, 0);
+        e.set_bytes(
+            2,
+            &GatedArgs {
+                hidden: hidden as u32,
+                gelu: (self.architecture.activation == Activation::Gelu) as u32,
+            },
+        );
+        let threads = threads(&k.gated, ROW_THREADS);
+        e.dispatch([hidden.div_ceil(threads), rows], threads);
+    }
+
+    /// Queue a mixture of experts for the normalized inputs in `ws.xb`, adding what each row's
+    /// experts make of it, weighted (and what any shared expert does), to `ws.x`.
+    fn experts(&self, e: &Encoder, experts: &Experts, batch: usize, on: &dyn Fn(Part) -> bool) {
+        let (ws, k) = (&self.ws, &self.kernels);
+        let moe = ws.moe.as_ref().expect("allocated for a mixture of experts");
+        let spec = (self.architecture.experts.as_ref()).expect("a sparse layer has experts");
+        let (count, top_k, hidden, dim) = (spec.count, spec.top_k, spec.hidden, self.shape.dim);
+        // Experts with many rows each go through the tiled kernel, in groups of its size.
+        let mma = batch * top_k >= MMA_MIN_BATCH * count;
+        let group_rows = if mma { MM_BN } else { VEC_BATCH };
+        let slots = (batch * top_k + count * (group_rows - 1)).next_multiple_of(group_rows);
+        if on(Part::Matmuls) {
+            self.matmul(e, &experts.router, &ws.xb, &moe.scores, batch, false);
+        }
+        if on(Part::Other) {
+            let (deepseek, sigmoid, groups, top_groups, renormalize, scale) = match spec.routing {
+                Routing::Softmax { .. } => (false, false, 1, 1, spec.renormalize, 1.0),
+                Routing::DeepSeek {
+                    sigmoid,
+                    groups,
+                    top_groups,
+                    renormalize,
+                    scale,
+                } => (true, sigmoid, groups, top_groups, renormalize, scale),
+            };
+            e.set_pipeline(&k.moe_route);
+            e.set_buffer(0, &moe.scores, 0);
+            e.set_buffer(1, experts.correction.as_ref().unwrap_or(&moe.scores), 0);
+            e.set_buffer(2, &moe.topk_ids, 0);
+            e.set_buffer(3, &moe.topk_weights, 0);
+            e.set_bytes(
+                4,
+                &RouteArgs {
+                    experts: count as u32,
+                    top_k: top_k as u32,
+                    renormalize: renormalize as u32,
+                    deepseek: deepseek as u32,
+                    sigmoid: sigmoid as u32,
+                    groups: groups as u32,
+                    top_groups: top_groups as u32,
+                    scale,
+                    has_correction: experts.correction.is_some() as u32,
+                },
+            );
+            e.dispatch([batch, 1], SIMD);
+
+            e.set_pipeline(&k.moe_sort);
+            e.set_buffer(0, &moe.topk_ids, 0);
+            e.set_buffer(1, &moe.sorted_rows, 0);
+            e.set_buffer(2, &moe.slot_of, 0);
+            e.set_buffer(3, &moe.group_expert, 0);
+            e.set_buffer(4, &moe.num_groups, 0);
+            e.set_bytes(
+                5,
+                &SortArgs {
+                    rows: batch as u32,
+                    top_k: top_k as u32,
+                    experts: count as u32,
+                    group_rows: group_rows as u32,
+                },
+            );
+            e.dispatch([1, 1], threads(&k.moe_sort, ROW_THREADS));
+
+            e.set_pipeline(&k.moe_gather);
+            e.set_buffer(0, &ws.xb, 0);
+            e.set_buffer(1, &moe.sorted_rows, 0);
+            e.set_buffer(2, &moe.num_groups, 0);
+            e.set_buffer(3, &moe.x, 0);
+            e.set_bytes(
+                4,
+                &GatherArgs {
+                    dim: dim as u32,
+                    group_rows: group_rows as u32,
+                },
+            );
+            e.dispatch([slots, 1], threads(&k.moe_gather, 2 * SIMD));
+        }
+        if on(Part::Matmuls) {
+            self.moe_matmul(e, &experts.gate_up, &moe.x, &moe.gate_up, slots, mma);
+        }
+        if on(Part::Other) {
+            self.gated(e, &moe.gate_up, &moe.gated, hidden, slots);
+        }
+        if on(Part::Matmuls) {
+            self.moe_matmul(e, &experts.down, &moe.gated, &moe.down, slots, mma);
+        }
+        if on(Part::Other) {
+            e.set_pipeline(&k.moe_combine);
+            e.set_buffer(0, &moe.down, 0);
+            e.set_buffer(1, &moe.slot_of, 0);
+            e.set_buffer(2, &moe.topk_weights, 0);
+            e.set_buffer(3, &ws.x, 0);
+            e.set_bytes(
+                4,
+                &CombineArgs {
+                    dim: dim as u32,
+                    top_k: top_k as u32,
+                },
+            );
+            let threads = threads(&k.moe_combine, ROW_THREADS);
+            e.dispatch([dim.div_ceil(threads), batch], threads);
+        }
+        // Every row goes through a shared expert as well, as through a dense MLP.
+        let Some((gate_up, down, gate)) = &experts.shared else {
+            return;
+        };
+        if on(Part::Matmuls) {
+            self.matmul(e, gate_up, &ws.xb, &ws.gate_up, batch, false);
+        }
+        if on(Part::Other) {
+            self.gated(e, &ws.gate_up, &ws.gated, down.cols, batch);
+        }
+        let Some(gate) = gate else {
+            if on(Part::Matmuls) {
+                self.matmul(e, down, &ws.gated, &ws.x, batch, true);
+            }
+            return;
+        };
+        // Scaled by its own gate's sigmoid (Qwen2 MoE).
+        if on(Part::Matmuls) {
+            self.matmul(e, gate, &ws.xb, &moe.shared_gate, batch, false);
+            self.matmul(e, down, &ws.gated, &ws.added, batch, false);
+        }
+        if on(Part::Other) {
+            e.set_pipeline(&k.add_gated);
+            e.set_buffer(0, &ws.added, 0);
+            e.set_buffer(1, &moe.shared_gate, 0);
+            e.set_buffer(2, &ws.x, 0);
+            e.set_bytes(3, &(dim as u32));
+            let threads = threads(&k.add_gated, ROW_THREADS);
+            e.dispatch([dim.div_ceil(threads), batch], threads);
+        }
+    }
+
+    /// Queue `out = W_e x` for each group of rows of `x` (whose rows are in expert order, `slots`
+    /// of them at most) and its expert `e`, with the experts' weights one after another in `w`.
+    fn moe_matmul(
+        &self,
+        e: &Encoder,
+        w: &Matrix,
+        x: &Buffer,
+        out: &Buffer,
+        slots: usize,
+        mma: bool,
+    ) {
+        let k = &self.kernels;
+        let moe = (self.ws.moe.as_ref()).expect("allocated for a mixture of experts");
+        let (pipeline, groups, threads) = match (mma, w.bf16) {
+            (false, bf16) => {
+                let pipeline = match bf16 {
+                    true => &k.moe_matmul_vec_bf16,
+                    false => &k.moe_matmul_vec_f32,
+                };
+                let threads = threads(pipeline, VEC_THREADS);
+                let rows_per_group = threads / SIMD * VEC_ROWS;
+                let groups = [w.rows.div_ceil(rows_per_group), slots / VEC_BATCH];
+                (pipeline, groups, threads)
+            }
+            (true, bf16) => {
+                let pipeline = match bf16 {
+                    true => &k.moe_matmul_mma_bf16,
+                    false => &k.moe_matmul_mma_f32,
+                };
+                (pipeline, [w.rows.div_ceil(MM_BM), slots / MM_BN], MM_THREADS)
+            }
+        };
+        e.set_pipeline(pipeline);
+        e.set_buffer(0, &w.data, 0);
+        e.set_buffer(1, x, 0);
+        e.set_buffer(2, out, 0);
+        e.set_buffer(3, w.bias.as_ref().unwrap_or(&w.data), 0);
+        e.set_bytes(
+            4,
+            &MatmulArgs {
+                m: w.rows as u32,
+                n: w.cols as u32,
+                batch: slots as u32,
+                scale: w.scale,
+                accumulate: 0,
+                has_bias: w.bias.is_some() as u32,
+                out_stride: w.rows as u32,
+            },
+        );
+        e.set_buffer(5, &moe.group_expert, 0);
+        e.set_buffer(6, &moe.num_groups, 0);
+        e.dispatch(groups, threads);
+    }
+
     /// Queue `out = W x` for `batch` rows of `x`, or `out += W x` if `accumulate`.
     fn matmul(
         &self,
@@ -983,6 +1837,7 @@ impl MetalBackend {
                 dim: self.shape.dim as u32,
                 eps: self.eps,
                 select: select as u32,
+                stride: self.shape.dim as u32,
             },
         );
         e.dispatch([rows, 1], NORM_THREADS);
@@ -1015,6 +1870,7 @@ impl MetalBackend {
                 dim: self.shape.dim as u32,
                 eps: self.eps,
                 select: 0,
+                stride: self.shape.dim as u32,
             },
         );
         e.dispatch([batch, 1], NORM_THREADS);
@@ -1306,6 +2162,7 @@ fn encode_matmul(
             scale: w.scale,
             accumulate: accumulate as u32,
             has_bias: w.bias.is_some() as u32,
+            out_stride: w.rows as u32,
         },
     );
     e.dispatch(groups, threads);
@@ -1361,12 +2218,26 @@ impl Backend for MetalBackend {
 
     fn add_adapter(&mut self, adapter: &LoraAdapter) -> Result<()> {
         ensure!(
+            self.architecture.latent.is_none(),
+            "LoRA adapters for DeepSeek's latent attention aren't supported"
+        );
+        ensure!(
             adapter.layers.len() == self.layers.len(),
             "{}: made for a model with {} layers, not {}",
             adapter.name,
             adapter.layers.len(),
             self.layers.len()
         );
+        for (l, layer) in self.layers.iter().enumerate() {
+            let changes_mlp = [Module::Gate, Module::Up, Module::Down]
+                .iter()
+                .any(|&m| adapter.layers[l][m as usize].is_some());
+            ensure!(
+                !(changes_mlp && matches!(layer.feed_forward, FeedForward::Sparse(_))),
+                "{}: adapters for mixtures of experts' MLPs aren't supported",
+                adapter.name
+            );
+        }
         self.adapters.push(adapter.layers.clone());
         self.upload_adapters()
     }

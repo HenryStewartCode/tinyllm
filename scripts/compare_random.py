@@ -41,19 +41,33 @@ cases = {
     "gpt_oss": ("gpt_oss", dict(head_dim=32, num_local_experts=8, num_experts_per_tok=2, sliding_window=9)),
     # DeepSeek's latent attention, with its experts chosen by group (V2: softmax, best one per
     # group; V3: sigmoids plus a correction, best two per group), shared experts, dense first layers.
-    "deepseek_v2": ("deepseek_v2", dict(q_lora_rank=None, kv_lora_rank=32, qk_nope_head_dim=16, qk_rope_head_dim=8, v_head_dim=16,
+    "deepseek_v2": ("deepseek_v2", dict(q_lora_rank=None, kv_lora_rank=32, qk_nope_head_dim=16, qk_rope_head_dim=16, v_head_dim=16,
                                         n_routed_experts=8, num_experts_per_tok=2, n_shared_experts=2, moe_intermediate_size=64,
                                         first_k_dense_replace=1, topk_method="group_limited_greedy", n_group=2, topk_group=1,
                                         routed_scaling_factor=1.5, num_key_value_heads=8)),
-    "deepseek_v3": ("deepseek_v3", dict(q_lora_rank=64, kv_lora_rank=32, qk_nope_head_dim=16, qk_rope_head_dim=8, v_head_dim=16,
+    "deepseek_v3": ("deepseek_v3", dict(q_lora_rank=64, kv_lora_rank=32, qk_nope_head_dim=16, qk_rope_head_dim=16, v_head_dim=16,
                                         n_routed_experts=8, num_experts_per_tok=2, n_shared_experts=1, moe_intermediate_size=64,
                                         first_k_dense_replace=1, n_group=4, topk_group=2, routed_scaling_factor=2.5, num_key_value_heads=8,
                                         rope_scaling={"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 16,
                                                       "mscale": 1.0, "mscale_all_dim": 1.0, "beta_fast": 32, "beta_slow": 1})),
+    # More heads than one 16-row tile holds (24: a full tile and a part), a wider latent, and V2's
+    # plain greedy choice of experts.
+    "deepseek_v2-heads": ("deepseek_v2", dict(hidden_size=384, num_attention_heads=24, num_key_value_heads=24, q_lora_rank=None, kv_lora_rank=64,
+                                              qk_nope_head_dim=32, qk_rope_head_dim=16, v_head_dim=32, n_routed_experts=8,
+                                              num_experts_per_tok=3, n_shared_experts=1, moe_intermediate_size=64, first_k_dense_replace=2,
+                                              topk_method="greedy", routed_scaling_factor=1.0,
+                                              rope_scaling={"rope_type": "yarn", "factor": 8.0, "original_max_position_embeddings": 16,
+                                                            "mscale": 0.707, "mscale_all_dim": 0.707, "beta_fast": 32, "beta_slow": 1})),
+    # Latent attention alone: dense layers only, so that no choice of experts can tip one way on
+    # one device and the other way on another.
+    "deepseek_v3-dense": ("deepseek_v3", dict(q_lora_rank=64, kv_lora_rank=32, qk_nope_head_dim=16, qk_rope_head_dim=16, v_head_dim=16,
+                                              n_routed_experts=8, num_experts_per_tok=2, n_shared_experts=1, moe_intermediate_size=64,
+                                              first_k_dense_replace=6, num_key_value_heads=8)),
 }
-# The GPU doesn't run these yet, or only in 16 bits.
-CPU_ONLY = {"qwen2_moe", "deepseek_v2", "deepseek_v3"}
-BF16_ONLY = {"qwen3_moe", "mixtral", "olmoe", "granitemoe", "gpt_oss"}
+# The GPU runs these only in 16 bits.
+CPU_ONLY = set()
+BF16_ONLY = {"qwen3_moe", "mixtral", "olmoe", "granitemoe", "gpt_oss", "qwen2_moe", "deepseek_v2", "deepseek_v3",
+             "deepseek_v2-heads", "deepseek_v3-dense"}
 torch.manual_seed(5)
 rng = np.random.default_rng(5)
 lengths = [3, 17, 40, 70]
