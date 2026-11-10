@@ -71,6 +71,9 @@ pub struct Config {
     #[serde(default, deserialize_with = "present")]
     final_logit_softcapping: Option<Option<f32>>,
 
+    /// How the checkpoint's weights are quantized, if they are.
+    quantization_config: Option<Value>,
+
     // Granite.
     attention_multiplier: Option<f32>,
     logits_scaling: Option<f32>,
@@ -221,6 +224,21 @@ impl Config {
             self.partial_rotary_factor.is_none_or(|f| f == 1.0),
             "a partial_rotary_factor other than 1 is not supported"
         );
+        if let Some(quantization) = &self.quantization_config {
+            match quantization["quant_method"].as_str() {
+                Some("fp8") => {
+                    let block = &quantization["weight_block_size"];
+                    ensure!(
+                        block.is_null() || *block == serde_json::json!([128, 128]),
+                        "FP8 checkpoints need 128x128 weight blocks, not {block}"
+                    );
+                }
+                method => bail!(
+                    "{} quantization isn't supported yet (FP8 checkpoints with 128x128 blocks are)",
+                    method.unwrap_or("this kind of")
+                ),
+            }
+        }
         self.architecture()?;
         Ok(())
     }

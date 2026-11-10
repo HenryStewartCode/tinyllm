@@ -17,7 +17,7 @@ use crate::backend::{Backend, LoadedModel, Logits};
 use crate::config::{Activation, Architecture, Config};
 use crate::model::{LogitUse, Row};
 use crate::pool::Pool;
-use crate::safetensors::{SafeTensors, bf16_to_f32, f32_to_bf16};
+use crate::safetensors::{FP8_BLOCK, SafeTensors, bf16_to_f32, f32_to_bf16};
 use anyhow::{Context, Result, bail};
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -99,6 +99,8 @@ struct Matrix {
     /// For 8-bit weights, the scale of each group of 128 in each row: weight = byte * scale.
     /// Null otherwise.
     scales: Pointer,
+    /// 8-bit weights are floats (e4m3) rather than integers.
+    fp8: bool,
 }
 
 struct Layer {
@@ -145,6 +147,9 @@ struct Kernels {
     matmul_i8_1: Kernel,
     matmul_i8_2: Kernel,
     matmul_i8_4: Kernel,
+    matmul_f8_1: Kernel,
+    matmul_f8_2: Kernel,
+    matmul_f8_4: Kernel,
     swiglu_bf16: Kernel,
     geglu_bf16: Kernel,
     rope_store_bf16: Kernel,
@@ -178,6 +183,9 @@ impl Kernels {
             matmul_i8_1: gpu.kernel(module, "matmul_i8_1")?,
             matmul_i8_2: gpu.kernel(module, "matmul_i8_2")?,
             matmul_i8_4: gpu.kernel(module, "matmul_i8_4")?,
+            matmul_f8_1: gpu.kernel(module, "matmul_f8_1")?,
+            matmul_f8_2: gpu.kernel(module, "matmul_f8_2")?,
+            matmul_f8_4: gpu.kernel(module, "matmul_f8_4")?,
             swiglu_bf16: gpu.kernel(module, "swiglu_bf16")?,
             geglu_bf16: gpu.kernel(module, "geglu_bf16")?,
             rope_store_bf16: gpu.kernel(module, "rope_store_bf16")?,
@@ -1214,10 +1222,13 @@ fn launch_matmul(
     accumulate: bool,
 ) -> Result<()> {
     if w.scales != Pointer::NULL {
-        let (kernel, groups) = match batch {
-            1..=16 => (kernels.matmul_i8_1, 1),
-            17..=32 => (kernels.matmul_i8_2, 2),
-            _ => (kernels.matmul_i8_4, 4),
+        let (kernel, groups) = match (batch, w.fp8) {
+            (1..=16, false) => (kernels.matmul_i8_1, 1),
+            (17..=32, false) => (kernels.matmul_i8_2, 2),
+            (_, false) => (kernels.matmul_i8_4, 4),
+            (1..=16, true) => (kernels.matmul_f8_1, 1),
+            (17..=32, true) => (kernels.matmul_f8_2, 2),
+            (_, true) => (kernels.matmul_f8_4, 4),
         };
         return gpu.launch_blocks(
             kernel,
@@ -1329,6 +1340,58 @@ fn upload_stacked(
 ) -> Result<Matrix> {
     let rows: usize = layers.iter().map(|(_, rows)| rows).sum();
     let padded = rows.div_ceil(BLOCK_ROWS) * BLOCK_ROWS;
+    // FP8 checkpoints keep their 8-bit floats, with each block scale repeated down its rows.
+    let all_fp8 = layers
+        .iter()
+        .all(|(name, _)| st.dtype(&format!("{name}.weight")) == Some("F8_E4M3"));
+    if all_fp8 && precision == Precision::Bf16 {
+        let groups = cols.div_ceil(QUANT_GROUP);
+        let (mut bytes, mut scales) = (Vec::with_capacity(rows * cols), Vec::new());
+        let mut bias: Option<Vec<f32>> = None;
+        let mut row = 0;
+        for (name, count) in layers {
+            let (values, blocks) = st
+                .load_fp8(&format!("{name}.weight"), &[*count, cols])?
+                .expect("checked above");
+            bytes.extend(values);
+            for r in 0..*count {
+                let blocks = &blocks[(r / FP8_BLOCK) * groups..][..groups];
+                scales.extend(blocks.iter().map(|s| s * scale));
+            }
+            *num_params += count * cols;
+            let bias_name = format!("{name}.bias");
+            if st.contains(&bias_name) {
+                let values = st.load(&bias_name, &[*count])?;
+                bias.get_or_insert_with(|| vec![0.0; rows])[row..row + count]
+                    .copy_from_slice(&values);
+            }
+            row += count;
+        }
+        bias.iter_mut().flatten().for_each(|v| *v *= scale);
+        let tiles = to_lane_tiles(&bytes, rows, cols);
+        let data = gpu.alloc(tiles.len().div_ceil(4))?;
+        gpu.write_now(data, &tiles)?;
+        let scales_device = gpu.alloc(scales.len())?;
+        gpu.write_now(scales_device, &scales)?;
+        let bias = match bias {
+            Some(values) => {
+                let device = gpu.alloc(rows)?;
+                gpu.write_now(device, &values)?;
+                device
+            }
+            None => Pointer::NULL,
+        };
+        let _ = batch_rows;
+        return Ok(Matrix {
+            data,
+            rows,
+            cols,
+            bias,
+            scratch: Pointer::NULL,
+            scales: scales_device,
+            fp8: true,
+        });
+    }
     let mut bias: Option<Vec<f32>> = None;
     let mut f32_values: Vec<f32> = Vec::new();
     let mut bf16_values: Vec<u16> = Vec::new();
@@ -1384,6 +1447,7 @@ fn upload_stacked(
             bias,
             scratch: Pointer::NULL,
             scales: scales_device,
+            fp8: false,
         });
     }
 
@@ -1422,19 +1486,20 @@ fn upload_stacked(
         bias,
         scratch,
         scales: Pointer::NULL,
+        fp8: false,
     })
 }
 
 /// Rearrange row-major bytes into 16x16 tiles in the order the 8-bit kernel's lanes read them (see
 /// "8-bit weights" in `kernels.cu`), padded with zeros to whole tiles.
-fn to_lane_tiles(values: &[i8], rows: usize, cols: usize) -> Vec<i8> {
+fn to_lane_tiles<T: Copy + Default>(values: &[T], rows: usize, cols: usize) -> Vec<T> {
     let chunks = cols.div_ceil(TILE);
     let groups = rows.div_ceil(TILE);
-    let mut tiles = vec![0i8; groups * chunks * TILE * TILE];
-    let at = |row: usize, column: usize| -> i8 {
+    let mut tiles = vec![T::default(); groups * chunks * TILE * TILE];
+    let at = |row: usize, column: usize| -> T {
         match row < rows && column < cols {
             true => values[row * cols + column],
-            false => 0,
+            false => T::default(),
         }
     };
     for group in 0..groups {
@@ -1496,6 +1561,7 @@ impl Backend for CudaBackend {
 
     fn describe(&self) -> String {
         let weights = match (self.precision, self.quantization) {
+            _ if self.layers.first().is_some_and(|l| l.qkv.fp8) => "8-bit float",
             (_, Some(Quantization::Int8)) => "8-bit",
             (Precision::Bf16, None) => "16-bit",
             (Precision::F32, None) => "32-bit",
@@ -1775,6 +1841,7 @@ mod tests {
                     bias,
                     scratch: Pointer::NULL,
                     scales: scales_device,
+                    fp8: false,
                 };
                 launch_matmul(
                     &gpu,
@@ -1884,6 +1951,7 @@ mod tests {
                         bias,
                         scratch,
                         scales: Pointer::NULL,
+                        fp8: false,
                     };
                     launch_matmul(
                         &gpu, &kernels, precision, &matrix, x, batch, out, accumulate,

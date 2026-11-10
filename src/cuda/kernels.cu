@@ -505,8 +505,28 @@ __device__ __forceinline__ void mma_bf16(float *acc, const unsigned *a, unsigned
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
 
-template <int TX>
-__device__ __forceinline__ void matmul_tiles_i8(const signed char *w, const float *scales, int m,
+// A weight byte's value as bfloat16 bits: a signed integer, or (FP8) a float with 4 exponent and
+// 3 mantissa bits, as in FP8 checkpoints. Either way it's exact in bfloat16, so these are just
+// the top halves of the f32s, built with integer operations.
+template <bool FP8> __device__ __forceinline__ unsigned bf16_bits(unsigned b);
+template <> __device__ __forceinline__ unsigned bf16_bits<false>(unsigned b) {
+    return __float_as_uint((float)(signed char)b) >> 16;
+}
+template <> __device__ __forceinline__ unsigned bf16_bits<true>(unsigned b) {
+    const unsigned rest = b & 0x7f;
+    // Normal numbers just move their exponent from a bias of 7 to 127; ones below normal are
+    // mantissa * 2^-9.
+    const unsigned magnitude = rest >= 8 ? (rest << 4) + (120u << 7)
+                                         : __float_as_uint((float)rest * (1.0f / 512.0f)) >> 16;
+    return magnitude | ((b & 0x80) << 8);
+}
+
+template <bool FP8> __device__ __forceinline__ unsigned bf16_pair_of(unsigned low, unsigned high) {
+    return bf16_bits<FP8>(low) | (bf16_bits<FP8>(high) << 16);
+}
+
+template <int TX, bool FP8>
+__device__ __forceinline__ void matmul_tiles_q8(const unsigned char *w, const float *scales, int m,
                                                 int chunks, const __nv_bfloat16 *x, int batch,
                                                 float *out, const float *bias, int accumulate) {
     const int warp = threadIdx.x / WARP, lane = threadIdx.x % WARP;
@@ -543,9 +563,11 @@ __device__ __forceinline__ void matmul_tiles_i8(const signed char *w, const floa
 #pragma unroll
         for (int i = 0; i < I8_LOADS; i++) {
             if (i < n) {
-                const signed char *b = reinterpret_cast<const signed char *>(&bytes[i]);
-                mma_bf16(part[0], a[i], bf16_pair(b[0], b[1]), bf16_pair(b[2], b[3]));
-                mma_bf16(part[1], a[i], bf16_pair(b[4], b[5]), bf16_pair(b[6], b[7]));
+                const unsigned low = bytes[i].x, high = bytes[i].y;
+                mma_bf16(part[0], a[i], bf16_pair_of<FP8>(low & 255, (low >> 8) & 255),
+                         bf16_pair_of<FP8>((low >> 16) & 255, low >> 24));
+                mma_bf16(part[1], a[i], bf16_pair_of<FP8>(high & 255, (high >> 8) & 255),
+                         bf16_pair_of<FP8>((high >> 16) & 255, high >> 24));
             }
         }
         // This lane's weight rows are 8h + 2t and 8h + 2t + 1 of the warp's 16.
@@ -578,15 +600,18 @@ __device__ __forceinline__ void matmul_tiles_i8(const signed char *w, const floa
 
 // matmul_i8_TX: out[b][m] = dot(w[m], x[b]) (+ bias[m]), added to what's there if `accumulate`,
 // with 8-bit weights in the lane order above and `scales: [m, groups of 128 columns]`.
-#define MATMUL_I8(TX)                                                                          \
-    extern "C" __global__ void matmul_i8_##TX(const signed char *w, const float *scales, int m,  \
-                                              int chunks, const __nv_bfloat16 *x, int batch,   \
-                                              float *out, const float *bias, int accumulate) { \
-        matmul_tiles_i8<TX>(w, scales, m, chunks, x, batch, out, bias, accumulate);            \
+#define MATMUL_Q8(NAME, TX, FP8)                                                               \
+    extern "C" __global__ void NAME##_##TX(const unsigned char *w, const float *scales, int m,   \
+                                           int chunks, const __nv_bfloat16 *x, int batch,      \
+                                           float *out, const float *bias, int accumulate) {    \
+        matmul_tiles_q8<TX, FP8>(w, scales, m, chunks, x, batch, out, bias, accumulate);       \
     }
-MATMUL_I8(1)
-MATMUL_I8(2)
-MATMUL_I8(4)
+MATMUL_Q8(matmul_i8, 1, false)
+MATMUL_Q8(matmul_i8, 2, false)
+MATMUL_Q8(matmul_i8, 4, false)
+MATMUL_Q8(matmul_f8, 1, true)
+MATMUL_Q8(matmul_f8, 2, true)
+MATMUL_Q8(matmul_f8, 4, true)
 
 // One block per row, as rope_store, with the keys and values stored 16-bit in the tile layout:
 // the KV pools are `[slots, kv_dim]` matrices, so a page of 16 slots is one group of tiles.

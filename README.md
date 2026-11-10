@@ -70,6 +70,33 @@ and agrees with a 32-bit reference run as closely as the CPU does.
 On the GPU, the KV cache is organized in pages of 16 tokens, and only whole pages are shared
 between requests, so a cached prompt can have up to 15 more tokens to recompute than on the CPU.
 
+### Quantized weights
+
+Fewer bytes per weight means less memory, and since each step's time goes mostly on reading the
+weights, faster generation:
+
+- **FP8 checkpoints** (such as `Qwen/Qwen3-0.6B-FP8` and other models published that way, with
+  `weight_block_size: [128, 128]`) load as they are. The GPU keeps the 8-bit floats, widening them
+  inside the matrix kernel; the CPU turns them into 32-bit numbers.
+- **`--quantization int8`** stores each layer's weights in one byte, with a scale for every 128
+  along a row, on the GPU. The embeddings and output projection stay 16-bit.
+
+Both use the tensor cores' `mma` instruction directly, with the bytes stored in the order each lane
+reads them. On an RTX 2000 Ada, tokens per second:
+
+| | 1 request | 8 at once | 32 at once |
+|---|---|---|---|
+| Phi-3 mini, 16-bit / 8-bit | 26 / 44 | 202 / 339 | 728 / 1,033 |
+| SmolLM3 3B, 16-bit / 8-bit | 31 / 50 | 243 / 382 | 851 / 1,181 |
+| Qwen3 0.6B, 16-bit / 8-bit / FP8 checkpoint | 136 / 173 / 159 | 928 / 1,142 / 1,087 | 2,328 / 2,583 / 2,319 |
+
+Prompts in big batches are slower than with 16-bit weights, since there the work is arithmetic
+rather than reading. With 8-bit weights Phi-3 mini's greedy generations matched 32-bit
+`transformers` for all 32 tokens on all three test prompts, and its largest logit difference (6)
+was a little more than `transformers`' own 16-bit mode (5). Small models are more sensitive:
+Qwen2.5-0.5B and Qwen3-0.6B differ by up to 4-5. The FP8 checkpoint's results on the GPU match
+the CPU's, which uses exactly the checkpoint's values, as closely as 16-bit weights do.
+
 The compiled kernels are in [`src/cuda/kernels.ptx`](src/cuda/kernels.ptx). To change them, edit
 [`kernels.cu`](src/cuda/kernels.cu) and run [`build_kernels.sh`](src/cuda/build_kernels.sh), which
 does need the CUDA toolkit.
@@ -253,6 +280,7 @@ cargo run --release -- -m models/Qwen2.5-0.5B-Instruct --chat --system "You are 
 | `--tool-call-parser P` | auto | how `--serve` reads tool calls (see [Tool calling](#tool-calling)) |
 | `--device D` | auto | `auto`, `cuda` or `cpu` |
 | `--precision P` | bf16 | on a GPU, `bf16` (16-bit weights) or `f32` |
+| `--quantization Q` | | `int8`: 8-bit weights for the layers, on a GPU (see [Quantized weights](#quantized-weights)) |
 | `--system TEXT` | template's own | system prompt for `--chat` |
 | `-n, --max-tokens N` | 256 | tokens to generate per reply (command line only) |
 | `-t, --temperature T` | 0.7 | 0 = greedy (always the most likely token) |
@@ -470,7 +498,7 @@ missing is breadth, and the last 10–20% of single-stream speed.
 | Prometheus metrics | yes | yes |
 | GPU execution | yes | **one NVIDIA GPU**; no AMD or Apple. Slightly slower for one stream, faster under load: see [Performance](#performance) |
 | Reusable compiled batches (CUDA graphs) | yes | yes, for batches of up to 64 |
-| Quantized weights (bf16, int8, GGUF) | yes | **bf16 on GPU only**, f32 on the CPU |
+| Quantized weights | yes: FP8, INT8, AWQ, GPTQ, GGUF, bitsandbytes, MXFP4 and more | FP8 checkpoints and 8-bit integers on the GPU; bfloat16 weights stay 16-bit on the CPU. **No 4-bit, AWQ, GPTQ or GGUF** |
 | Tool calling, with `tool_choice` and strict schemas | yes, with parsers for many model families | yes, for the families that run here: Qwen and Hermes, Mistral, Llama 3 |
 | Reasoning parsers, thinking budgets | yes, for many families | yes, for `<think>` models (Qwen3, SmolLM3, DeepSeek-R1 and others) |
 | Speculative decoding | yes: EAGLE, MTP, draft models, n-grams | n-grams only, with replies exactly as without it |
@@ -481,8 +509,8 @@ missing is breadth, and the last 10–20% of single-stream speed.
 | Multi-GPU, multi-node, router | yes | **no** |
 | The SGL frontend language (`gen`, `select`, `fork`) | yes | **no** |
 
-Biggest gaps first, the plan is: quantized weights, mixture-of-experts models, overlapping CPU
-scheduling with GPU work, a Metal backend for Apple GPUs, LoRA adapters, then draft-model
+Biggest gaps first, the plan is: mixture-of-experts models, overlapping CPU scheduling with GPU
+work, a Metal backend for Apple GPUs, LoRA adapters, 4-bit weights (AWQ/GPTQ), then draft-model
 speculative decoding.
 
 Other limitations: only BPE tokenizers are supported (not SentencePiece Unigram or WordPiece,

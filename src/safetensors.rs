@@ -94,8 +94,20 @@ impl SafeTensors {
             .map(|entry| entry.info.dtype.as_str())
     }
 
-    /// Read tensor `name`, check that it has the expected `shape`, and convert it to f32.
+    /// Read tensor `name`, check that it has the expected `shape`, and convert it to f32. Weights
+    /// stored as 8-bit floats come out multiplied by their block scales.
     pub fn load(&self, name: &str, shape: &[usize]) -> Result<Vec<f32>> {
+        if let Some((bytes, scales)) = self.load_fp8(name, shape)? {
+            let (rows, cols) = (shape[0], shape[1]);
+            let column_blocks = cols.div_ceil(FP8_BLOCK);
+            return Ok((0..rows * cols)
+                .map(|i| {
+                    let (row, column) = (i / cols, i % cols);
+                    let scale = scales[(row / FP8_BLOCK) * column_blocks + column / FP8_BLOCK];
+                    e4m3_to_f32(bytes[i]) * scale
+                })
+                .collect());
+        }
         let (bytes, dtype) = self.read(name, shape)?;
         let halves = || halves(&bytes);
         Ok(match dtype {
@@ -111,9 +123,36 @@ impl SafeTensors {
         })
     }
 
+    /// For a `[rows, cols]` weight stored as 8-bit floats (e4m3, as in Qwen's and DeepSeek's FP8
+    /// checkpoints), its bytes and the scale of each 128x128 block, `[row blocks, column blocks]`:
+    /// weight = value * scale. `None` for weights stored any other way.
+    pub fn load_fp8(&self, name: &str, shape: &[usize]) -> Result<Option<(Vec<u8>, Vec<f32>)>> {
+        if self.dtype(name) != Some("F8_E4M3") {
+            return Ok(None);
+        }
+        ensure!(
+            shape.len() == 2,
+            "tensor {name}: 8-bit floats only for matrices"
+        );
+        let (bytes, _) = self.read(name, shape)?;
+        let scale_name = format!("{name}_scale_inv");
+        let blocks = [shape[0].div_ceil(FP8_BLOCK), shape[1].div_ceil(FP8_BLOCK)];
+        let scales = self
+            .load(&scale_name, &blocks)
+            .with_context(|| format!("{name} needs 128x128 block scales in {scale_name}"))?;
+        Ok(Some((bytes, scales)))
+    }
+
     /// Read tensor `name` as bfloat16. Tensors stored that way come through exactly; others are
     /// rounded.
     pub fn load_bf16(&self, name: &str, shape: &[usize]) -> Result<Vec<u16>> {
+        if self.dtype(name) == Some("F8_E4M3") {
+            return Ok(self
+                .load(name, shape)?
+                .into_iter()
+                .map(f32_to_bf16)
+                .collect());
+        }
         let (bytes, dtype) = self.read(name, shape)?;
         Ok(match dtype {
             "BF16" => halves(&bytes).collect(),
@@ -145,6 +184,7 @@ impl SafeTensors {
         let elem_size = match info.dtype.as_str() {
             "F32" => 4,
             "F16" | "BF16" => 2,
+            "F8_E4M3" => 1,
             other => bail!("tensor {name}: unsupported dtype {other}"),
         };
         let [begin, end] = info.data_offsets;
@@ -194,6 +234,24 @@ fn halves(bytes: &[u8]) -> impl Iterator<Item = u16> + '_ {
 }
 
 /// Round to the nearest bfloat16, ties to even.
+/// The block size of 8-bit float weights' scales.
+pub const FP8_BLOCK: usize = 128;
+
+/// An 8-bit float with 4 exponent bits and 3 mantissa bits, the "fn" kind with no infinities.
+pub fn e4m3_to_f32(byte: u8) -> f32 {
+    let (exponent, mantissa) = ((byte >> 3) & 15, byte & 7);
+    let magnitude = match exponent {
+        0 => mantissa as f32 / 512.0,
+        15 if mantissa == 7 => f32::NAN,
+        _ => (8 + mantissa) as f32 * 2f32.powi(exponent as i32 - 10),
+    };
+    if byte & 128 != 0 {
+        -magnitude
+    } else {
+        magnitude
+    }
+}
+
 pub fn f32_to_bf16(x: f32) -> u16 {
     let bits = x.to_bits();
     if x.is_nan() {
@@ -224,6 +282,17 @@ pub fn f16_to_f32(x: u16) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn e4m3_decodes() {
+        assert_eq!(e4m3_to_f32(0x00), 0.0);
+        assert_eq!(e4m3_to_f32(0x38), 1.0); // exponent 7, the bias
+        assert_eq!(e4m3_to_f32(0xB8), -1.0);
+        assert_eq!(e4m3_to_f32(0x7E), 448.0); // the largest
+        assert_eq!(e4m3_to_f32(0x01), 1.0 / 512.0); // the smallest, below normal
+        assert_eq!(e4m3_to_f32(0x3C), 1.5);
+        assert!(e4m3_to_f32(0x7F).is_nan());
+    }
 
     #[test]
     fn rounding_to_bfloat16() {
