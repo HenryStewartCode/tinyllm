@@ -6,7 +6,7 @@ and fast structured output, behind OpenAI-, Anthropic- and Ollama-compatible API
 Llama-style models (Llama 2/3, Qwen2.5, Qwen3, Mistral, SmolLM2/3, Phi-3, Granite, Gemma 1–3,
 TinyLlama), mixtures of experts (Qwen3-MoE, Mixtral, OLMoE, Granite MoE, Qwen2-MoE), reasoning
 models, and embedding models straight from Hugging Face checkpoints, on
-NVIDIA GPUs or on the CPU, with no ML framework underneath. Everything from weight loading and
+NVIDIA GPUs, Apple GPUs or the CPU, with no ML framework underneath. Everything from weight loading and
 tokenization to the GPU and SIMD kernels and the HTTP server is here, in about 18,000 lines
 including tests. See [How it compares with SGLang](#how-it-compares-with-sglang) for what's still
 missing.
@@ -103,6 +103,32 @@ the CPU's, which uses exactly the checkpoint's values, as closely as 16-bit weig
 The compiled kernels are in [`src/cuda/kernels.ptx`](src/cuda/kernels.ptx). To change them, edit
 [`kernels.cu`](src/cuda/kernels.cu) and run [`build_kernels.sh`](src/cuda/build_kernels.sh), which
 does need the CUDA toolkit.
+
+### Apple GPUs
+
+On a Mac, tinyllm uses the GPU through Metal, which every Mac has, so there's nothing to install:
+the kernels ([`kernels.metal`](src/metal/kernels.metal)) are compiled from source when it starts.
+`--device auto` picks it (after an NVIDIA GPU, which a Mac won't have), and `--device metal` asks
+for it. The GPU shares memory with the CPU, so nothing is copied back and forth: the CPU reads the
+logits where the GPU left them.
+
+Weights stay as they're stored (bfloat16 or 32-bit) and all the arithmetic is 32-bit, as on the
+CPU, so the two agree closely: within 1e-4 on Qwen3-0.6B's logits, and every random-weight
+architecture matches `transformers` as closely as the CPU does. Results don't depend on batching
+either. Apple's 8×8 simdgroup matrix instructions turn out to add their products with one fused
+multiply-add after another, so the tiled kernel used for big batches and the simple one used for
+small ones add every dot product in exactly the same order.
+
+On an M1 Max with Qwen3-0.6B, in tokens per second:
+
+| | 1 request | 8 at once | 32 at once | 64 at once | Reading a prompt |
+|---|---|---|---|---|---|
+| CPU, 4 threads | 65 | 186 | 200 | | 280 |
+| Apple GPU | 126 | 374 | 851 | 1,016 | 2,200–2,700 |
+
+Mixtures of experts and `--quantization int8` don't run on Metal yet; with `--device auto` such a
+model runs on the CPU instead. The KV cache is 32-bit, and its size comes from `--cache-mb` as on
+the CPU.
 
 ## Serving
 
@@ -294,7 +320,7 @@ cargo run --release -- -m models/Qwen2.5-0.5B-Instruct --chat --system "You are 
 | `--host`, `--port` | 127.0.0.1, 8000 | where `--serve` listens |
 | `--reasoning-parser P` | auto | `auto`, `none`, `qwen3` or `deepseek-r1`: how `--serve` finds a reasoning model's thinking |
 | `--tool-call-parser P` | auto | how `--serve` reads tool calls (see [Tool calling](#tool-calling)) |
-| `--device D` | auto | `auto`, `cuda` or `cpu` |
+| `--device D` | auto | `auto`, `cuda`, `metal` or `cpu` |
 | `--precision P` | bf16 | on a GPU, `bf16` (16-bit weights) or `f32` |
 | `--quantization Q` | | `int8`: 8-bit weights for the layers, on a GPU (see [Quantized weights](#quantized-weights)) |
 | `--system TEXT` | template's own | system prompt for `--chat` |
@@ -358,6 +384,8 @@ What makes it a server rather than a loop:
   for every token, a request sampled by temperature alone gets its token drawn on the GPU (adding
   Gumbel noise to the scores and taking the largest is the same as sampling from them); with
   top-k or top-p, the GPU first narrows each row to the tokens still in contention.
+- **Apple GPU execution** ([`metal/`](src/metal/mod.rs)). The same steps again, through Metal's
+  Objective-C API called directly from Rust, with buffers the CPU and GPU share.
 
 | File | What it does |
 |---|---|
@@ -472,6 +500,12 @@ Checked against Hugging Face `transformers` (float32) and `tokenizers`:
   diverge where two tokens are nearly tied.
 - **GPU batching:** logits are bit-identical whether a sequence runs alone or batched, in both
   precisions, tensor cores included (24 million compared in each, none different).
+- **Apple GPU:** the random-weight models of every dense architecture above match `transformers`
+  as closely as the CPU does (within 2.5e-7 for the Llama-style ones, 5.4e-4 for Gemma 2 with
+  256-wide heads, where the CPU is at 5.9e-4). On Qwen3-0.6B, Qwen2.5-0.5B and SmolLM2-135M the
+  logits match the CPU's to within 1e-4 to 6e-4, and 32-token greedy generations are identical.
+  Batching changes nothing (18 million logits compared), the reasoning, Anthropic and Ollama tests
+  pass through the server, and speculative decoding gives the same 20 replies as without it.
 - **Tokenizer:** identical token ids for 25 tricky strings (unicode, emoji, CJK, code, numbers,
   whitespace runs, special tokens), with and without special tokens, for five tokenizer styles:
   SmolLM2, Qwen2.5, Llama 3.2, TinyLlama (SentencePiece-style with byte fallback) and Mistral
@@ -517,7 +551,7 @@ missing is breadth, and the last 10–20% of single-stream speed.
 | Model's own Jinja chat templates | yes | yes |
 | Deterministic results across batch shapes | optional | always |
 | Prometheus metrics | yes | yes |
-| GPU execution | yes | **one NVIDIA GPU**; no AMD or Apple. Slightly slower for one stream, faster under load: see [Performance](#performance) |
+| GPU execution | yes | **one NVIDIA GPU**, or an Apple GPU through Metal; no AMD. Slightly slower for one stream, faster under load: see [Performance](#performance) |
 | Reusable compiled batches (CUDA graphs) | yes | yes, for batches of up to 64 |
 | Quantized weights | yes: FP8, INT8, AWQ, GPTQ, GGUF, bitsandbytes, MXFP4 and more | FP8 checkpoints and 8-bit integers on the GPU; bfloat16 weights stay 16-bit on the CPU. **No 4-bit, AWQ, GPTQ or GGUF** |
 | Tool calling, with `tool_choice` and strict schemas | yes, with parsers for many model families | yes, for the families that run here: Qwen and Hermes, Mistral, Llama 3 |
@@ -530,9 +564,8 @@ missing is breadth, and the last 10–20% of single-stream speed.
 | Multi-GPU, multi-node, router | yes | **no** |
 | The SGL frontend language (`gen`, `select`, `fork`) | yes | **no** |
 
-Biggest gaps first, the plan is: overlapping CPU scheduling with GPU work, a Metal backend for
-Apple GPUs, LoRA adapters, 4-bit weights (AWQ/GPTQ), DeepSeek's attention (MLA), then
-draft-model speculative decoding.
+Biggest gaps first, the plan is: overlapping CPU scheduling with GPU work, LoRA adapters, 4-bit
+weights (AWQ/GPTQ), DeepSeek's attention (MLA), then draft-model speculative decoding.
 
 Other limitations: only BPE tokenizers are supported (not SentencePiece Unigram or WordPiece,
 though that covers the Llama family), embeddings only use last-token pooling, and sliding windows

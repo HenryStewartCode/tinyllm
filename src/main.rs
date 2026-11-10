@@ -14,6 +14,7 @@ use tinyllm::cuda::{self, CudaBackend};
 use tinyllm::engine::{
     self, EngineConfig, EngineHandle, Event, GenerateParams, Request, Speculative,
 };
+use tinyllm::metal::{self, MetalBackend};
 use tinyllm::reasoning::ReasoningFormat;
 use tinyllm::sampler::SamplingParams;
 use tinyllm::server::{self, SamplingDefaults, Server};
@@ -23,10 +24,12 @@ use tinyllm::tools::ToolFormat;
 /// What to run the model on.
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Device {
-    /// An NVIDIA GPU if there is one, otherwise the CPU
+    /// An NVIDIA GPU if there is one, then an Apple GPU, otherwise the CPU
     Auto,
     Cpu,
     Cuda,
+    /// An Apple GPU (Macs only)
+    Metal,
 }
 
 /// How precisely the GPU does its matrix multiplications.
@@ -167,8 +170,8 @@ struct Args {
     #[arg(long)]
     batch_size: Option<usize>,
 
-    /// Memory for the KV cache, in MiB (default on CPU: a quarter of RAM, at most 8 GiB, of which
-    /// only the part in use is committed; on GPU: all that's left after loading the weights)
+    /// Memory for the KV cache, in MiB (default on CPU and Apple GPUs: a quarter of RAM, at most
+    /// 8 GiB; on an NVIDIA GPU: all that's left after loading the weights)
     #[arg(long)]
     cache_mb: Option<usize>,
 
@@ -211,10 +214,11 @@ fn main() -> Result<()> {
     let tokenizer = Arc::new(Tokenizer::load(&args.model)?);
     let device = match args.device {
         Device::Auto if CudaBackend::available() => Device::Cuda,
+        Device::Auto if MetalBackend::available() => Device::Metal,
         Device::Auto => Device::Cpu,
         chosen => chosen,
     };
-    let on_gpu = device == Device::Cuda;
+    let on_gpu = device != Device::Cpu;
     // On a GPU the threads only choose tokens between steps, so use what's there.
     let threads = args
         .threads
@@ -242,7 +246,16 @@ fn main() -> Result<()> {
         } = CpuBackend::load(&args.model, threads, bytes)?;
         Ok((config, num_params, Box::new(backend)))
     };
-    let (config, num_params, backend) = if on_gpu {
+    let fallback = |err: anyhow::Error| -> Result<(Config, usize, Box<dyn Backend>)> {
+        match args.device {
+            Device::Auto => {
+                eprintln!("Can't use the GPU, so falling back to the CPU: {err:#}");
+                cpu(cache_bytes)
+            }
+            _ => Err(err),
+        }
+    };
+    let (config, num_params, backend) = if device == Device::Cuda {
         let options = cuda::Options {
             quantization: args.quantization.map(|q| match q {
                 QuantizationArg::Int8 => cuda::Quantization::Int8,
@@ -261,11 +274,23 @@ fn main() -> Result<()> {
                 num_params,
                 backend,
             }) => (config, num_params, Box::new(backend) as Box<dyn Backend>),
-            Err(err) if args.device == Device::Auto => {
-                eprintln!("Can't use the GPU, so falling back to the CPU: {err:#}");
-                cpu(cache_bytes)?
-            }
-            Err(err) => return Err(err),
+            Err(err) => fallback(err)?,
+        }
+    } else if device == Device::Metal {
+        if args.quantization.is_some() {
+            eprintln!("8-bit weights are only on NVIDIA GPUs so far; using the weights as stored.");
+        }
+        let options = metal::Options {
+            cache_bytes: cache_bytes.unwrap_or_else(|| default_cache_mb() << 20),
+            host_threads: threads,
+        };
+        match MetalBackend::load(&args.model, &options) {
+            Ok(LoadedModel {
+                config,
+                num_params,
+                backend,
+            }) => (config, num_params, Box::new(backend) as Box<dyn Backend>),
+            Err(err) => fallback(err)?,
         }
     } else {
         cpu(cache_bytes)?
@@ -292,7 +317,7 @@ fn main() -> Result<()> {
             SpeculativeArg::Ngram => Some(Speculative {
                 draft_tokens: args.speculative_num_draft_tokens,
                 // Past this many rows a batch stops being nearly free.
-                max_draft_rows: if on_gpu { 64 } else { 16 },
+                max_draft_rows: if device == Device::Cuda { 64 } else { 16 },
             }),
         },
     };

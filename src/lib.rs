@@ -19,6 +19,7 @@
 //! | [`grammar`]     | structured output from JSON schemas, regexes and EBNF              |
 //! | [`backend`]     | what a device has to provide; the CPU implementation               |
 //! | [`cuda`]        | running the model on NVIDIA GPUs                                   |
+//! | [`metal`]       | running the model on Apple GPUs                                    |
 //! | [`model`]       | the transformer's batched forward pass on the CPU                  |
 //! | [`ops`]         | numeric kernels                                                    |
 //! | [`pool`]        | fork-join thread pool for very short parallel sections             |
@@ -38,6 +39,8 @@ pub mod config;
 pub mod cuda;
 pub mod engine;
 pub mod grammar;
+#[cfg_attr(not(target_os = "macos"), path = "metal/unsupported.rs")]
+pub mod metal;
 pub mod model;
 pub mod ops;
 pub mod pool;

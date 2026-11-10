@@ -6,6 +6,7 @@ use std::time::Instant;
 use tinyllm::backend::{Backend, CpuBackend, LoadedModel, Logits};
 use tinyllm::config::Config;
 use tinyllm::cuda::{self, CudaBackend};
+use tinyllm::metal::{self, MetalBackend};
 use tinyllm::model::{LogitUse, Row};
 use tinyllm::tokenizer::Tokenizer;
 
@@ -24,7 +25,7 @@ fn env_usize(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-/// A backend chosen by the DEVICE environment variable (cpu or cuda).
+/// A backend chosen by the DEVICE environment variable (cpu, cuda or metal).
 fn open(dir: &Path, cache_tokens: usize, max_batch: usize) -> (Box<dyn Backend>, Config) {
     let threads = env_usize("THREADS", 4);
     let config = Config::load(dir).unwrap();
@@ -49,6 +50,13 @@ fn open(dir: &Path, cache_tokens: usize, max_batch: usize) -> (Box<dyn Backend>,
             host_threads: threads,
         };
         let LoadedModel { backend, .. } = CudaBackend::load(dir, &options).unwrap();
+        Box::new(backend)
+    } else if device == "metal" {
+        let options = metal::Options {
+            cache_bytes: bytes,
+            host_threads: threads,
+        };
+        let LoadedModel { backend, .. } = MetalBackend::load(dir, &options).unwrap();
         Box::new(backend)
     } else {
         let LoadedModel { backend, .. } = CpuBackend::load(dir, threads, bytes).unwrap();
@@ -104,6 +112,35 @@ fn main() {
                 for v in l {
                     f.write_all(&v.to_le_bytes()).unwrap();
                 }
+            }
+        }
+        // Where a Metal step's time goes: `profile MODEL CONTEXT BATCH`, each row of the batch
+        // being the next token of its own sequence of CONTEXT tokens.
+        "profile" => {
+            let dir = Path::new(&args[2]);
+            let context: usize = args[3].parse().unwrap();
+            let batch: usize = args[4].parse().unwrap();
+            let config = Config::load(dir).unwrap();
+            let kv_dim = config.n_kv_heads() * config.head_dim();
+            let options = metal::Options {
+                cache_bytes: batch * (context + 1) * 2 * config.num_hidden_layers * kv_dim * 4,
+                host_threads: 4,
+            };
+            let LoadedModel { mut backend, .. } = MetalBackend::load(dir, &options).unwrap();
+            let slots: Vec<Vec<u32>> = (0..batch)
+                .map(|b| ((b * context) as u32..((b + 1) * context) as u32).collect())
+                .collect();
+            let rows: Vec<Row> = slots
+                .iter()
+                .map(|slots| Row {
+                    token: 100,
+                    slots,
+                    want_logits: true,
+                    sampling: LogitUse::All,
+                })
+                .collect();
+            for (name, seconds) in backend.profile(&rows).unwrap() {
+                println!("{name:12} {:8.3} ms", seconds * 1e3);
             }
         }
         // Greedy generation one token at a time.
