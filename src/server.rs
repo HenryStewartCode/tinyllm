@@ -106,6 +106,7 @@ pub fn serve(server: Server, address: &str) -> Result<()> {
     let router = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
+        .route("/v1/embeddings", post(embeddings))
         .route("/v1/models", get(models))
         .route("/generate", post(generate))
         .route("/v1/messages", post(anthropic::messages))
@@ -116,12 +117,19 @@ pub fn serve(server: Server, address: &str) -> Result<()> {
         .route("/api/show", post(ollama::show))
         .route("/api/ps", get(ollama::ps))
         .route("/api/version", get(ollama::version))
+        .route("/api/embed", post(ollama::embed))
+        .route("/api/embeddings", post(ollama::embeddings))
         .route("/", get(|| async { "tinyllm is running" }))
         .route("/health", get(|| async { StatusCode::OK }))
         .route("/metrics", get(metrics))
         .route("/get_model_info", get(model_info))
         .route("/get_server_info", get(server_info))
         .route("/flush_cache", post(flush_cache))
+        .route("/health_generate", get(health_generate))
+        .route("/tokenize", post(tokenize))
+        .route("/v1/tokenize", post(tokenize))
+        .route("/detokenize", post(detokenize))
+        .route("/v1/detokenize", post(detokenize))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(CorsLayer::permissive())
         .with_state(app);
@@ -432,6 +440,7 @@ impl App {
             grammar_triggers: Vec::new(),
             keep_tokens: Vec::new(),
             thinking: None,
+            embed: false,
         })
     }
 
@@ -681,6 +690,7 @@ async fn collect(
                 results[index].stop_string = stop_string;
                 usage.add(index, &u);
             }
+            Event::Embedding(_) => {}
             Event::Error(message) => return Err(ApiError::invalid(message)),
         }
     }
@@ -1063,6 +1073,7 @@ fn stream_events(job: StreamJob) -> impl Stream<Item = Result<Bytes, Infallible>
                     out.push(sse(&chunk));
                 }
             }
+            Event::Embedding(_) => {}
             Event::Error(message) => {
                 out.push(sse(&ApiError::invalid(message).body()));
             }
@@ -1405,6 +1416,7 @@ async fn generate(State(app): State<Arc<App>>, body: Bytes) -> Result<Response, 
                     Event::Done { reason, usage, .. } => {
                         sse(&json!({ "text": text, "meta_info": meta(&usage, Some(reason), &id) }))
                     }
+                    Event::Embedding(_) => unreachable!("only embedding requests get these"),
                     Event::Error(message) => sse(&ApiError::invalid(message).body()),
                 };
                 Some((chunk, (receiver, text)))
@@ -1426,6 +1438,7 @@ async fn generate(State(app): State<Arc<App>>, body: Bytes) -> Result<Response, 
                     &json!({ "text": text, "meta_info": meta(&usage, Some(reason), &id) }),
                 ));
             }
+            Event::Embedding(_) => {}
             Event::Error(message) => return Err(ApiError::invalid(message)),
         }
     }
@@ -1472,6 +1485,256 @@ async fn server_info(State(app): State<Arc<App>>) -> Response {
 async fn flush_cache(State(app): State<Arc<App>>) -> Response {
     app.server.engine.flush_cache();
     (StatusCode::OK, "Cache flushed.\n").into_response()
+}
+
+/// The ways `/v1/embeddings` allows input to be written.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum EmbeddingInput {
+    Text(String),
+    Texts(Vec<String>),
+    Tokens(Vec<u32>),
+    TokenLists(Vec<Vec<u32>>),
+}
+
+#[derive(Deserialize)]
+struct EmbeddingRequest {
+    input: EmbeddingInput,
+    #[serde(default)]
+    encoding_format: Option<String>,
+    #[serde(default)]
+    dimensions: Option<usize>,
+}
+
+/// Embed each prompt: the final hidden state of its last token, cut to `dimensions` if given
+/// (for models trained to allow that), and scaled to length 1. They run as one batch. Returns
+/// the vectors and how many tokens they took.
+async fn embed(
+    app: &App,
+    prompts: &[Vec<u32>],
+    dimensions: Option<usize>,
+) -> Result<(Vec<Vec<f32>>, usize), ApiError> {
+    let limit = app.context_limit();
+    let mut receivers = Vec::with_capacity(prompts.len());
+    for tokens in prompts {
+        if tokens.is_empty() {
+            return Err(ApiError::invalid("an input is empty"));
+        }
+        if tokens.len() >= limit {
+            return Err(ApiError {
+                status: StatusCode::BAD_REQUEST,
+                message: format!(
+                    "an input is {} tokens, but this model's context limit is {limit}",
+                    tokens.len()
+                ),
+                kind: "invalid_request_error",
+                code: Some("context_length_exceeded"),
+            });
+        }
+        let params = GenerateParams {
+            embed: true,
+            max_tokens: 1,
+            ..Default::default()
+        };
+        receivers.push(
+            app.start(tokens, &params, 1)
+                .pop()
+                .expect("one was started"),
+        );
+    }
+    let mut vectors = Vec::with_capacity(prompts.len());
+    let mut tokens = 0;
+    for mut receiver in receivers {
+        let mut vector = None;
+        while let Some(event) = receiver.recv().await {
+            match event {
+                Event::Embedding(hidden) => vector = Some(hidden),
+                Event::Done { usage, .. } => {
+                    tokens += usage.prompt_tokens;
+                    break;
+                }
+                Event::Error(message) => return Err(ApiError::invalid(message)),
+                Event::Text { .. } => {}
+            }
+        }
+        let mut vector = vector.ok_or_else(|| ApiError::internal("no embedding came back"))?;
+        if let Some(dimensions) = dimensions {
+            if dimensions == 0 || dimensions > vector.len() {
+                return Err(ApiError::invalid(format!(
+                    "dimensions must be between 1 and {}",
+                    vector.len()
+                )));
+            }
+            vector.truncate(dimensions);
+        }
+        let length = vector.iter().map(|v| v * v).sum::<f32>().sqrt();
+        if length > 0.0 {
+            vector.iter_mut().for_each(|v| *v /= length);
+        }
+        vectors.push(vector);
+    }
+    Ok((vectors, tokens))
+}
+
+/// Standard base64, as OpenAI's `encoding_format: "base64"` sends vectors.
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |n, (i, &b)| n | (b as u32) << (16 - 8 * i));
+        for i in 0..4 {
+            match i <= chunk.len() {
+                true => out.push(ALPHABET[(n >> (18 - 6 * i) & 63) as usize] as char),
+                false => out.push('='),
+            }
+        }
+    }
+    out
+}
+
+/// OpenAI's `/v1/embeddings`.
+async fn embeddings(State(app): State<Arc<App>>, body: Bytes) -> Result<Response, ApiError> {
+    let request: EmbeddingRequest = parse_body(&body)?;
+    let tokenizer = &app.server.tokenizer;
+    let prompts: Vec<Vec<u32>> = prepare(|| {
+        Ok(match &request.input {
+            EmbeddingInput::Text(text) => vec![tokenizer.encode(text, true)],
+            EmbeddingInput::Texts(texts) => {
+                texts.iter().map(|t| tokenizer.encode(t, true)).collect()
+            }
+            EmbeddingInput::Tokens(tokens) => vec![tokens.clone()],
+            EmbeddingInput::TokenLists(lists) => lists.clone(),
+        })
+    })?;
+    if prompts.is_empty() {
+        return Err(ApiError::invalid("input must not be empty"));
+    }
+    let base64_output = match request.encoding_format.as_deref() {
+        None | Some("float") => false,
+        Some("base64") => true,
+        Some(other) => {
+            return Err(ApiError::invalid(format!(
+                "unknown encoding_format '{other}'"
+            )));
+        }
+    };
+    let (vectors, tokens) = embed(&app, &prompts, request.dimensions).await?;
+    let data: Vec<Value> = vectors
+        .iter()
+        .enumerate()
+        .map(|(index, vector)| {
+            let embedding = match base64_output {
+                true => {
+                    let bytes: Vec<u8> = vector.iter().flat_map(|v| v.to_le_bytes()).collect();
+                    Value::String(base64(&bytes))
+                }
+                false => json!(vector),
+            };
+            json!({ "object": "embedding", "index": index, "embedding": embedding })
+        })
+        .collect();
+    Ok(json_response(
+        StatusCode::OK,
+        &json!({
+            "object": "list",
+            "data": data,
+            "model": app.server.model_name,
+            "usage": { "prompt_tokens": tokens, "total_tokens": tokens },
+        }),
+    ))
+}
+
+/// Healthy only if the model can actually generate a token.
+async fn health_generate(State(app): State<Arc<App>>) -> Response {
+    let tokens = app.server.tokenizer.encode("Hi", true);
+    let params = GenerateParams {
+        max_tokens: 1,
+        ..Default::default()
+    };
+    let mut receiver = app
+        .start(&tokens, &params, 1)
+        .pop()
+        .expect("one was started");
+    while let Some(event) = receiver.recv().await {
+        match event {
+            Event::Done { .. } => return StatusCode::OK.into_response(),
+            Event::Embedding(_) => {}
+            Event::Error(message) => {
+                return (StatusCode::SERVICE_UNAVAILABLE, message).into_response();
+            }
+            Event::Text { .. } => {}
+        }
+    }
+    StatusCode::SERVICE_UNAVAILABLE.into_response()
+}
+
+#[derive(Deserialize)]
+struct TokenizeRequest {
+    prompt: OneOrMany<String>,
+    #[serde(default = "default_true")]
+    add_special_tokens: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// SGLang's `/tokenize`: token ids for a text, or for each of a list of texts.
+async fn tokenize(State(app): State<Arc<App>>, body: Bytes) -> Result<Response, ApiError> {
+    let request: TokenizeRequest = parse_body(&body)?;
+    let tokenizer = &app.server.tokenizer;
+    let encode = |text: &str| tokenizer.encode(text, request.add_special_tokens);
+    let (tokens, count) = match &request.prompt {
+        OneOrMany::One(text) => {
+            let tokens = encode(text);
+            (json!(tokens), json!(tokens.len()))
+        }
+        OneOrMany::Many(texts) => {
+            let lists: Vec<Vec<u32>> = texts.iter().map(|t| encode(t)).collect();
+            let counts: Vec<usize> = lists.iter().map(Vec::len).collect();
+            (json!(lists), json!(counts))
+        }
+    };
+    Ok(json_response(
+        StatusCode::OK,
+        &json!({ "tokens": tokens, "count": count, "max_model_len": app.context_limit() }),
+    ))
+}
+
+#[derive(Deserialize)]
+struct DetokenizeRequest {
+    tokens: OneOrMany<Vec<u32>>,
+}
+
+/// SGLang's `/detokenize`: the text for a list of token ids, or for each of several lists.
+async fn detokenize(State(app): State<Arc<App>>, body: Bytes) -> Result<Response, ApiError> {
+    let request: DetokenizeRequest = parse_body(&body)?;
+    let tokenizer = &app.server.tokenizer;
+    let vocab = app.server.vocab_size;
+    let check = |ids: &[u32]| match ids.iter().find(|&&id| id as usize >= vocab) {
+        Some(id) => Err(ApiError::invalid(format!(
+            "token {id} is outside the vocabulary"
+        ))),
+        None => Ok(()),
+    };
+    let text = match &request.tokens {
+        OneOrMany::One(ids) => {
+            check(ids)?;
+            json!(tokenizer.decode(ids))
+        }
+        OneOrMany::Many(lists) => {
+            let mut texts = Vec::new();
+            for ids in lists {
+                check(ids)?;
+                texts.push(tokenizer.decode(ids));
+            }
+            json!(texts)
+        }
+    };
+    Ok(json_response(StatusCode::OK, &json!({ "text": text })))
 }
 
 /// Counters in Prometheus's text format.

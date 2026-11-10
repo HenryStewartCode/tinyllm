@@ -67,6 +67,19 @@ impl SafeTensors {
                 );
             }
         }
+        // Checkpoints of a bare model (embedding models, often) leave off the "model." that the
+        // names of the same weights carry inside a model for generating text.
+        let bare = tensors.contains_key("embed_tokens.weight")
+            && !tensors.keys().any(|name| name.starts_with("model."));
+        if bare {
+            tensors = tensors
+                .into_iter()
+                .map(|(name, entry)| match name.starts_with("lm_head.") {
+                    true => (name, entry),
+                    false => (format!("model.{name}"), entry),
+                })
+                .collect();
+        }
         Ok(Self { files, tensors })
     }
 

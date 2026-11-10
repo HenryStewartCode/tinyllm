@@ -150,7 +150,7 @@ pub struct Row<'a> {
 }
 
 /// What a row's logits are needed for.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum LogitUse {
     /// Choosing a token from those within `gap` of the best score. Anything further behind can't
     /// affect the result, and with a `limit` over 0, nor can anything but the top `limit` tokens.
@@ -161,6 +161,9 @@ pub enum LogitUse {
     Draw { temperature: f32, key: u64 },
     /// Everything: all the logits have to be available.
     All,
+    /// No scores at all, just the final hidden state (after the last norm), as embedding
+    /// models use it.
+    Hidden,
 }
 
 /// The worker threads and working memory for the forward pass.
@@ -181,6 +184,8 @@ pub struct Workspace {
     scratch: Vec<f32>,
     logits: Vec<f32>, // [n_logits, vocab]
     vocab: usize,
+    hidden: Vec<f32>, // final hidden states of the rows that want logits, if any want those [n_logits, dim]
+    dim: usize,
 }
 
 impl Workspace {
@@ -202,6 +207,8 @@ impl Workspace {
             scratch: Vec::new(),
             logits: Vec::new(),
             vocab: 0,
+            hidden: Vec::new(),
+            dim: 0,
         }
     }
 
@@ -212,6 +219,11 @@ impl Workspace {
     /// Scores for the next token after the `i`-th row that asked for them.
     pub fn logits(&self, i: usize) -> &[f32] {
         &self.logits[i * self.vocab..(i + 1) * self.vocab]
+    }
+
+    /// The final hidden state of the `i`-th row that asked for logits, if it asked for that.
+    pub fn hidden(&self, i: usize) -> &[f32] {
+        &self.hidden[i * self.dim..(i + 1) * self.dim]
     }
 }
 
@@ -544,14 +556,23 @@ impl Model {
                 &self.norm,
                 eps,
             );
-            let lm_head = self.lm_head.as_ref().unwrap_or(&self.embed_tokens);
-            lm_head.forward(
-                pool,
-                &mut ws.logits,
-                &mut ws.scratch,
-                &ws.xb[..n_logits * dim],
-            );
-            self.finish_logits(pool, &mut ws.logits);
+            let wanted = || rows.iter().filter(|r| r.want_logits);
+            ws.dim = dim;
+            if wanted().any(|r| r.sampling == LogitUse::Hidden) {
+                ws.hidden.clear();
+                ws.hidden.extend_from_slice(&ws.xb[..n_logits * dim]);
+            }
+            // A batch of nothing but embeddings needs no scores.
+            if wanted().any(|r| r.sampling != LogitUse::Hidden) {
+                let lm_head = self.lm_head.as_ref().unwrap_or(&self.embed_tokens);
+                lm_head.forward(
+                    pool,
+                    &mut ws.logits,
+                    &mut ws.scratch,
+                    &ws.xb[..n_logits * dim],
+                );
+                self.finish_logits(pool, &mut ws.logits);
+            }
         }
     }
 

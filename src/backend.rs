@@ -22,6 +22,10 @@ pub trait Backend: Send {
     /// The scores from the last `forward` for the `row`-th row that wanted logits.
     fn logits(&self, row: usize) -> Logits<'_>;
 
+    /// The final hidden state from the last `forward` for the `row`-th row that wanted logits,
+    /// if it asked for it with [`crate::model::LogitUse::Hidden`].
+    fn hidden(&self, row: usize) -> &[f32];
+
     /// CPU threads for parallel work between steps.
     fn pool(&self) -> &Pool;
 
@@ -87,6 +91,10 @@ impl Backend for CpuBackend {
 
     fn logits(&self, row: usize) -> Logits<'_> {
         Logits::All(self.workspace.logits(row))
+    }
+
+    fn hidden(&self, row: usize) -> &[f32] {
+        self.workspace.hidden(row)
     }
 
     fn pool(&self) -> &Pool {

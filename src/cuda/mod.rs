@@ -206,6 +206,8 @@ struct StepData {
     temperatures: Vec<f32>,
     /// The two halves of the key for that draw.
     keys: Vec<u32>,
+    /// Whether each row that wants logits wants its final hidden state instead.
+    hidden: Vec<bool>,
     tokens: Vec<u32>,
     write_slots: Vec<u32>,
     row_offset: Vec<u32>,
@@ -274,6 +276,8 @@ pub struct CudaBackend {
     /// Which logit rows were read in full, and where in `logits`.
     full_rows: Vec<usize>,
     logits: Vec<f32>,
+    /// Final hidden states of the rows that want logits, when any want those.
+    hidden: Vec<f32>,
     pool: Pool,
     gpu_name: String,
 }
@@ -474,10 +478,8 @@ impl CudaBackend {
         let logits_rows = options.max_batch;
         let x = gpu.alloc(rows * dim)?;
         let xb = input_buffer(&gpu, precision, rows, dim)?;
-        let added = match architecture.norms_after_blocks {
-            true => gpu.alloc(rows * dim)?,
-            false => Pointer::NULL,
-        };
+        // Also where final hidden states go, for embeddings.
+        let added = gpu.alloc(rows * dim)?;
         let qkv = gpu.alloc(rows * (q_dim + 2 * kv_dim))?;
         let attn_out = input_buffer(&gpu, precision, rows, q_dim)?;
         let gate_up = gpu.alloc(rows * 2 * hidden_dim)?;
@@ -571,6 +573,7 @@ impl CudaBackend {
                 candidate_end: Vec::new(),
                 full_rows: Vec::new(),
                 logits: Vec::new(),
+                hidden: Vec::new(),
                 gpu_name,
             },
         })
@@ -775,6 +778,7 @@ impl CudaBackend {
         step.limits.clear();
         step.temperatures.clear();
         step.keys.clear();
+        step.hidden.clear();
         let tables = self.architecture.rope_tables.len();
         step.cos.resize(tables * batch * half, 0.0);
         step.sin.resize(tables * batch * half, 0.0);
@@ -822,8 +826,9 @@ impl CudaBackend {
                     let (gap, limit, temperature, key) = match row.sampling {
                         LogitUse::Candidates { gap, limit } => (gap, limit as u32, -1.0, 0),
                         LogitUse::Draw { temperature, key } => (-1.0, 0, temperature, key),
-                        LogitUse::All => (-1.0, 0, -1.0, 0),
+                        LogitUse::All | LogitUse::Hidden => (-1.0, 0, -1.0, 0),
                     };
+                    step.hidden.push(row.sampling == LogitUse::Hidden);
                     step.gaps.push(gap);
                     step.limits.push(limit);
                     step.temperatures.push(temperature);
@@ -1006,6 +1011,24 @@ impl CudaBackend {
         let n_logits = step.n_logits;
         let any_candidates = self.step.gaps.iter().any(|&gap| gap >= 0.0);
         let any_draws = self.step.temperatures.iter().any(|&t| t >= 0.0);
+        let any_hidden = self.step.hidden.iter().any(|&hidden| hidden);
+        if any_hidden {
+            // In 32 bits whatever the precision, for embeddings.
+            self.gpu.launch(
+                self.kernels.rmsnorm,
+                [n_logits, 1],
+                &[
+                    Arg::Ptr(self.x),
+                    Arg::Ptr(self.added),
+                    Arg::Ptr(self.norm),
+                    Arg::Int(self.dim),
+                    Arg::Float(self.eps),
+                    Arg::Ptr(step.logit_rows),
+                ],
+            )?;
+            self.hidden.resize(n_logits * self.dim, 0.0);
+            self.gpu.read(self.added, &mut self.hidden)?;
+        }
         if n_logits > 0 {
             self.rmsnorm(self.x, self.xb, self.norm, n_logits, step.logit_rows)?;
             self.matmul(&self.lm_head, self.xb, n_logits, self.logits_device, false)?;
@@ -1080,6 +1103,12 @@ impl CudaBackend {
         self.candidate_end.clear();
         self.full_rows.clear();
         for row in 0..n_logits {
+            if self.step.hidden[row] {
+                // No scores wanted.
+                self.candidate_start.push(0);
+                self.candidate_end.push(0);
+                continue;
+            }
             if self.step.temperatures[row] >= 0.0 {
                 // Already drawn, which leaves just the one candidate.
                 self.candidate_start.push(self.candidates.len() as u32);
@@ -1321,6 +1350,10 @@ impl Backend for CudaBackend {
 
     fn forward(&mut self, rows: &[Row]) {
         self.try_forward(rows).expect("the GPU failed");
+    }
+
+    fn hidden(&self, row: usize) -> &[f32] {
+        &self.hidden[row * self.dim..(row + 1) * self.dim]
     }
 
     fn logits(&self, row: usize) -> Logits<'_> {

@@ -68,6 +68,9 @@ pub struct GenerateParams {
     pub keep_tokens: Vec<u32>,
     /// If the reply may think out loud before it answers, how to tell when it is.
     pub thinking: Option<Thinking>,
+    /// Instead of generating, send the final hidden state of the prompt's last token (see
+    /// [`Event::Embedding`]), as embedding models with last-token pooling use it.
+    pub embed: bool,
 }
 
 /// How a reply thinks out loud before it answers (see [`crate::reasoning`]). While it thinks,
@@ -122,6 +125,7 @@ impl Default for GenerateParams {
             grammar_triggers: Vec::new(),
             keep_tokens: Vec::new(),
             thinking: None,
+            embed: false,
         }
     }
 }
@@ -184,6 +188,9 @@ pub enum Event {
         /// The stop string that ended the reply, if one did.
         stop_string: Option<String>,
     },
+    /// For a request with [`GenerateParams::embed`]: the final hidden state of the prompt's last
+    /// token, after the model's last norm. `Done` follows.
+    Embedding(Vec<f32>),
     Error(String),
 }
 
@@ -538,9 +545,10 @@ impl Engine {
                     token: seq.tokens[pos],
                     slots: &seq.slots[..=pos],
                     want_logits,
-                    sampling: match all_logits {
-                        true => LogitUse::All,
-                        false => seq.sampler.logit_use(seq.generated),
+                    sampling: match (seq.params.embed, all_logits) {
+                        (true, _) => LogitUse::Hidden,
+                        (false, true) => LogitUse::All,
+                        (false, false) => seq.sampler.logit_use(seq.generated),
                     },
                 });
             }
@@ -702,7 +710,10 @@ impl Engine {
         let views: Vec<Option<Logits>> = self
             .active
             .iter()
-            .map(|seq| seq.logits_row.map(|row| self.backend.logits(row)))
+            .map(|seq| match seq.params.embed {
+                true => None,
+                false => seq.logits_row.map(|row| self.backend.logits(row)),
+            })
             .collect();
         let pool = self.backend.pool();
         pool.for_chunks(&mut self.active, 1, 2, |i, seq| {
@@ -733,7 +744,15 @@ impl Engine {
                     seq.prompt_committed = true;
                     Self::commit_into(&mut self.cache, seq);
                 }
-                finished = self.accept_token(i);
+                finished = match seq.params.embed {
+                    true => {
+                        let row = seq.logits_row.expect("checked above");
+                        let hidden = self.backend.hidden(row).to_vec();
+                        let _ = seq.events.send(Event::Embedding(hidden));
+                        Some(FinishReason::Stop)
+                    }
+                    false => self.accept_token(i),
+                };
             }
             match finished {
                 Some(reason) => {

@@ -502,6 +502,7 @@ impl MessageStream {
                     out.push(event("message_delta", &delta));
                     out.push(event("message_stop", &json!({ "type": "message_stop" })));
                 }
+                Event::Embedding(_) => {}
                 Event::Error(message) => {
                     let body = json!({ "type": "error", "error": {
                         "type": "api_error",

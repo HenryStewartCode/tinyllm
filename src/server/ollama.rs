@@ -2,6 +2,7 @@
 //! tools built for Ollama can use a model served here. Replies stream as one JSON object per
 //! line, and generation settings come in `options`.
 
+use super::embed as embed_prompts;
 use super::{
     ApiError, App, ChatRequest, OneOrMany, ReplyPart, SamplingFields, json_response, parse_body,
     prepare, start_chat,
@@ -378,6 +379,7 @@ async fn reply(app: Arc<App>, job: super::ChatJob, streaming: bool, is_chat: boo
                     }
                     return json_response(StatusCode::OK, &finish(value, &model));
                 }
+                Event::Embedding(_) => {}
                 Event::Error(message) => return error(ApiError::invalid(message)),
             }
         }
@@ -428,6 +430,7 @@ async fn reply(app: Arc<App>, job: super::ChatJob, streaming: bool, is_chat: boo
                 }
                 out.push(line(&finish(value, &model)));
             }
+            Event::Embedding(_) => {}
             Event::Error(message) => out.push(line(&json!({ "error": message }))),
         }
         stream::iter(out)
@@ -510,6 +513,75 @@ pub(super) async fn ps(State(app): State<Arc<App>>) -> Response {
             "size_vram": 0,
         }]}),
     )
+}
+
+#[derive(Deserialize)]
+struct EmbedBody {
+    input: OneOrMany<String>,
+    #[serde(default)]
+    truncate: Option<bool>,
+    #[serde(default)]
+    dimensions: Option<usize>,
+}
+
+/// Token ids for each text, cut to fit the context unless `truncate` is false.
+fn embedding_prompts(app: &App, texts: &[String], truncate: bool) -> Vec<Vec<u32>> {
+    let limit = app.context_limit().saturating_sub(1);
+    texts
+        .iter()
+        .map(|text| {
+            let mut tokens = app.server.tokenizer.encode(text, true);
+            if truncate {
+                tokens.truncate(limit);
+            }
+            tokens
+        })
+        .collect()
+}
+
+/// `/api/embed`: vectors for one or several texts.
+pub(super) async fn embed(State(app): State<Arc<App>>, body: Bytes) -> Response {
+    let start = Instant::now();
+    let body: EmbedBody = match parse_body(&body) {
+        Ok(body) => body,
+        Err(err) => return error(err),
+    };
+    let texts = match body.input {
+        OneOrMany::One(text) => vec![text],
+        OneOrMany::Many(texts) => texts,
+    };
+    let prompts = embedding_prompts(&app, &texts, body.truncate.unwrap_or(true));
+    match embed_prompts(&app, &prompts, body.dimensions).await {
+        Ok((vectors, tokens)) => json_response(
+            StatusCode::OK,
+            &json!({
+                "model": app.server.model_name,
+                "embeddings": vectors,
+                "total_duration": start.elapsed().as_nanos() as u64,
+                "load_duration": 0,
+                "prompt_eval_count": tokens,
+            }),
+        ),
+        Err(err) => error(err),
+    }
+}
+
+#[derive(Deserialize)]
+struct LegacyEmbedBody {
+    prompt: String,
+}
+
+/// `/api/embeddings`, the older form: one text, one vector.
+pub(super) async fn embeddings(State(app): State<Arc<App>>, body: Bytes) -> Response {
+    let body: LegacyEmbedBody = match parse_body(&body) {
+        Ok(body) => body,
+        Err(err) => return error(err),
+    };
+    let prompts = embedding_prompts(&app, &[body.prompt], true);
+    match embed_prompts(&app, &prompts, None).await {
+        Ok((vectors, _)) => json_response(StatusCode::OK, &json!({ "embedding": vectors[0] })),
+        Err(err) => error(err),
+    }
 }
 
 pub(super) async fn version() -> Response {

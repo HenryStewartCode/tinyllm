@@ -489,6 +489,7 @@ impl Cli {
                     );
                     return Ok(reply);
                 }
+                Event::Embedding(_) => {}
                 Event::Error(message) => bail!(message),
             }
         }
