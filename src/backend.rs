@@ -3,9 +3,10 @@
 
 use crate::cache::KvPool;
 use crate::config::Config;
+use crate::lora::LoraAdapter;
 use crate::model::{Model, Row, Workspace};
 use crate::pool::Pool;
-use anyhow::Result;
+use anyhow::{Result, bail};
 use std::path::Path;
 
 pub trait Backend: Send {
@@ -36,6 +37,12 @@ pub trait Backend: Send {
     /// token `p` of a sequence in slot `p % page_size` of its page.
     fn page_size(&self) -> usize {
         1
+    }
+
+    /// Add a LoRA adapter, which rows then ask for by number: the first one added is 1, the
+    /// next 2, and so on.
+    fn add_adapter(&mut self, _adapter: &LoraAdapter) -> Result<()> {
+        bail!("{} can't run LoRA adapters yet", self.describe())
     }
 }
 
@@ -103,5 +110,9 @@ impl Backend for CpuBackend {
 
     fn capacity(&self) -> usize {
         self.kv.capacity
+    }
+
+    fn add_adapter(&mut self, adapter: &LoraAdapter) -> Result<()> {
+        self.model.add_adapter(adapter)
     }
 }

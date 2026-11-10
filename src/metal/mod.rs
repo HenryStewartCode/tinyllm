@@ -11,6 +11,7 @@ mod api;
 
 use crate::backend::{Backend, LoadedModel, Logits};
 use crate::config::{Activation, Architecture, Config};
+use crate::lora::{LoraAdapter, LoraPair, Module};
 use crate::model::{LogitUse, Row};
 use crate::pool::Pool;
 use crate::safetensors::SafeTensors;
@@ -130,6 +131,14 @@ struct GatedArgs {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct LoraArgs {
+    in_dim: u32,
+    out_dim: u32,
+    rank: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct LogitArgs {
     count: u32,
     divisor: f32,
@@ -150,6 +159,8 @@ struct Kernels {
     attention: Pipeline,
     gated: Pipeline,
     finish_logits: Pipeline,
+    lora_shrink: Pipeline,
+    lora_expand: Pipeline,
 }
 
 impl Kernels {
@@ -169,6 +180,8 @@ impl Kernels {
             attention: get("attention")?,
             gated: get("gated")?,
             finish_logits: get("finish_logits")?,
+            lora_shrink: get("lora_shrink")?,
+            lora_expand: get("lora_expand")?,
         })
     }
 }
@@ -245,6 +258,8 @@ struct Workspace {
     row_len: Buffer,
     /// The rows that want logits.
     logit_rows: Buffer,
+    /// Each row's LoRA adapter, 0 for none.
+    adapters: Buffer,
     /// RoPE rotations for each row's position `[tables, batch, half]`.
     cos: Buffer,
     sin: Buffer,
@@ -267,6 +282,7 @@ impl Workspace {
             row_offset: floats(1)?,
             row_len: floats(1)?,
             logit_rows: floats(1)?,
+            adapters: floats(1)?,
             cos: floats(shape.rope_tables * shape.half)?,
             sin: floats(shape.rope_tables * shape.half)?,
         })
@@ -282,6 +298,8 @@ struct Step {
     scores: bool,
     /// Some of them want their final hidden state.
     hidden: bool,
+    /// Some row uses a LoRA adapter.
+    any_adapter: bool,
 }
 
 /// Reads weights out of a checkpoint into GPU buffers, counting them.
@@ -399,6 +417,32 @@ pub struct MetalBackend {
     hidden: Buffer,
     pool: Pool,
     gpu_name: String,
+    /// LoRA adapters' corrections as given, for each layer and module, the first being adapter 1.
+    adapters: Vec<Vec<[Option<LoraPair>; 7]>>,
+    /// The same on the GPU, for each layer and each of `LORA_TARGETS`.
+    lora: Vec<[Option<LoraTarget>; 4]>,
+    /// Working space for `A x`, `[rows, largest rank]`.
+    lora_hidden: Buffer,
+    /// The largest rank of any adapter's correction.
+    lora_rank: usize,
+}
+
+/// The matrices LoRA corrections go to, as stacked here, and the modules each stacks.
+const LORA_TARGETS: [&[Module]; 4] = [
+    &[Module::Q, Module::K, Module::V],
+    &[Module::O],
+    &[Module::Gate, Module::Up],
+    &[Module::Down],
+];
+
+/// Every adapter's correction to one stacked matrix: `A` as `[adapters, rank, in]` and `B` as
+/// `[adapters, out, rank]`, padded with zeros to the largest rank.
+struct LoraTarget {
+    a: Buffer,
+    b: Buffer,
+    rank: usize,
+    in_dim: usize,
+    out_dim: usize,
 }
 
 impl MetalBackend {
@@ -574,6 +618,7 @@ impl MetalBackend {
             num_params,
             backend: Self {
                 slot_lists: device.buffer(1 << 16)?,
+                lora_hidden: device.buffer(16)?,
                 logits: device.buffer(vocab_size * 4)?,
                 hidden: device.buffer(dim * 4)?,
                 ws,
@@ -593,6 +638,9 @@ impl MetalBackend {
                 capacity,
                 pool: Pool::new(options.host_threads),
                 gpu_name,
+                adapters: Vec::new(),
+                lora: Vec::new(),
+                lora_rank: 0,
             },
             config,
         })
@@ -634,12 +682,15 @@ impl MetalBackend {
                 self.slot_lists.slice_mut::<u32>(),
             )
         };
+        // SAFETY: as above.
+        let adapters = unsafe { ws.adapters.slice_mut::<u32>() };
         let half = self.shape.half;
         let mut step = Step {
             batch,
             n_logits: 0,
             scores: false,
             hidden: false,
+            any_adapter: false,
         };
         let mut offset = 0;
         for group in groups {
@@ -653,6 +704,13 @@ impl MetalBackend {
                     row.token
                 );
                 tokens[index] = row.token;
+                assert!(
+                    (row.adapter as usize) <= self.adapters.len(),
+                    "there's no adapter {}",
+                    row.adapter
+                );
+                adapters[index] = row.adapter as u32;
+                step.any_adapter |= row.adapter != 0;
                 write_slots[index] = *row.slots.last().expect("a row needs a KV slot");
                 row_offset[index] = offset as u32;
                 row_len[index] = row.slots.len() as u32;
@@ -697,6 +755,10 @@ impl MetalBackend {
                 &mut self.hidden,
                 step.n_logits * self.shape.dim * 4,
             )?;
+        }
+        if step.any_adapter {
+            let bytes = rows.len() * self.lora_rank * 4;
+            reserve(&self.device, &mut self.lora_hidden, bytes)?;
         }
         self.device.run(|e| {
             self.encode(e, &step, None);
@@ -762,13 +824,14 @@ impl MetalBackend {
             e.dispatch([batch, 1], threads(pipeline, ROW_THREADS));
         }
 
-        for layer in &self.layers {
+        for (l, layer) in self.layers.iter().enumerate() {
             // Attention block: mix in information from earlier tokens.
             if on(Part::Norms) {
                 self.rmsnorm(e, &ws.x, &ws.xb, &layer.attn_norm, batch, false);
             }
             if on(Part::Matmuls) {
                 self.matmul(e, &layer.qkv, &ws.xb, &ws.qkv, batch, false);
+                self.lora(e, step, l, 0, &ws.xb, &ws.qkv);
             }
             if let Some((q_weight, k_weight)) = &layer.head_norms
                 && on(Part::Norms)
@@ -788,6 +851,7 @@ impl MetalBackend {
                     &ws.attn_out,
                     batch,
                     layer.norm_after_attn.as_ref(),
+                    (step, l, 1),
                 );
             }
 
@@ -797,6 +861,7 @@ impl MetalBackend {
             }
             if on(Part::Matmuls) {
                 self.matmul(e, &layer.gate_up, &ws.xb, &ws.gate_up, batch, false);
+                self.lora(e, step, l, 2, &ws.xb, &ws.gate_up);
             }
             if !on(Part::Other) {
                 if on(Part::Matmuls) {
@@ -806,6 +871,7 @@ impl MetalBackend {
                         &ws.gated,
                         batch,
                         layer.norm_after_mlp.as_ref(),
+                        (step, l, 3),
                     );
                 }
                 continue;
@@ -829,6 +895,7 @@ impl MetalBackend {
                     &ws.gated,
                     batch,
                     layer.norm_after_mlp.as_ref(),
+                    (step, l, 3),
                 );
             }
         }
@@ -920,12 +987,15 @@ impl MetalBackend {
         input: &Buffer,
         batch: usize,
         norm: Option<&Buffer>,
+        (step, layer, target): (&Step, usize, usize),
     ) {
         let ws = &self.ws;
         let Some(norm) = norm else {
-            return self.matmul(e, w, input, &ws.x, batch, true);
+            self.matmul(e, w, input, &ws.x, batch, true);
+            return self.lora(e, step, layer, target, input, &ws.x);
         };
         self.matmul(e, w, input, &ws.added, batch, false);
+        self.lora(e, step, layer, target, input, &ws.added);
         e.set_pipeline(&self.kernels.rmsnorm_add);
         e.set_buffer(0, &ws.added, 0);
         e.set_buffer(1, &ws.x, 0);
@@ -939,6 +1009,139 @@ impl MetalBackend {
             },
         );
         e.dispatch([batch, 1], NORM_THREADS);
+    }
+
+    /// Queue the LoRA corrections to stacked matrix `target` (one of `LORA_TARGETS`) of `layer`:
+    /// `out += B (A input)` for each row using an adapter.
+    fn lora(
+        &self,
+        e: &Encoder,
+        step: &Step,
+        layer: usize,
+        target: usize,
+        input: &Buffer,
+        out: &Buffer,
+    ) {
+        if !step.any_adapter {
+            return;
+        }
+        let Some(Some(t)) = self.lora.get(layer).map(|targets| &targets[target]) else {
+            return;
+        };
+        let k = &self.kernels;
+        let args = LoraArgs {
+            in_dim: t.in_dim as u32,
+            out_dim: t.out_dim as u32,
+            rank: t.rank as u32,
+        };
+        e.set_pipeline(&k.lora_shrink);
+        e.set_buffer(0, input, 0);
+        e.set_buffer(1, &t.a, 0);
+        e.set_buffer(2, &self.ws.adapters, 0);
+        e.set_buffer(3, &self.lora_hidden, 0);
+        e.set_bytes(4, &args);
+        let shrink_threads = threads(&k.lora_shrink, ROW_THREADS);
+        e.dispatch(
+            [t.rank.div_ceil(shrink_threads / SIMD), step.batch],
+            shrink_threads,
+        );
+        e.set_pipeline(&k.lora_expand);
+        e.set_buffer(0, &self.lora_hidden, 0);
+        e.set_buffer(1, &t.b, 0);
+        e.set_buffer(2, &self.ws.adapters, 0);
+        e.set_buffer(3, out, 0);
+        e.set_bytes(4, &args);
+        let threads = threads(&k.lora_expand, ROW_THREADS);
+        e.dispatch([t.out_dim.div_ceil(threads), step.batch], threads);
+    }
+
+    /// `(in, out)` for a module.
+    fn module_shape(&self, module: Module) -> (usize, usize) {
+        let Shape {
+            dim,
+            q_dim,
+            kv_dim,
+            hidden_dim,
+            ..
+        } = self.shape;
+        match module {
+            Module::Q => (dim, q_dim),
+            Module::K | Module::V => (dim, kv_dim),
+            Module::O => (q_dim, dim),
+            Module::Gate | Module::Up => (dim, hidden_dim),
+            Module::Down => (hidden_dim, dim),
+        }
+    }
+
+    /// Put every adapter's corrections in GPU buffers, replacing what was there.
+    fn upload_adapters(&mut self) -> Result<()> {
+        let residual = self.architecture.residual_scale;
+        let mut largest = 0;
+        let mut lora = Vec::with_capacity(self.layers.len());
+        for l in 0..self.layers.len() {
+            let mut targets: [Option<LoraTarget>; 4] = Default::default();
+            for (t, modules) in LORA_TARGETS.iter().enumerate() {
+                let in_dim = self.module_shape(modules[0]).0;
+                let outs: Vec<usize> = modules.iter().map(|&m| self.module_shape(m).1).collect();
+                let out_dim: usize = outs.iter().sum();
+                let rank_of = |adapter: &Vec<[Option<LoraPair>; 7]>| -> usize {
+                    modules
+                        .iter()
+                        .map(|&m| adapter[l][m as usize].as_ref().map_or(0, |p| p.rank))
+                        .sum()
+                };
+                let rank = self.adapters.iter().map(rank_of).max().unwrap_or(0);
+                if rank == 0 {
+                    continue;
+                }
+                let n = self.adapters.len();
+                let (mut a, mut b) = (
+                    vec![0.0f32; n * rank * in_dim],
+                    vec![0.0f32; n * out_dim * rank],
+                );
+                for (i, adapter) in self.adapters.iter().enumerate() {
+                    let (mut first_rank, mut first_out) = (0, 0);
+                    for (&module, &out) in modules.iter().zip(&outs) {
+                        if let Some(pair) = &adapter[l][module as usize] {
+                            // The output projections' outputs are scaled, so their corrections are.
+                            let scale = match module {
+                                Module::O | Module::Down => residual,
+                                _ => 1.0,
+                            };
+                            let at = (i * rank + first_rank) * in_dim;
+                            a[at..at + pair.rank * in_dim].copy_from_slice(&pair.a);
+                            for o in 0..out {
+                                for j in 0..pair.rank {
+                                    b[(i * out_dim + first_out + o) * rank + first_rank + j] =
+                                        pair.b[o * pair.rank + j] * scale;
+                                }
+                            }
+                            first_rank += pair.rank;
+                        }
+                        first_out += out;
+                    }
+                }
+                let upload = |values: &[f32]| -> Result<Buffer> {
+                    let buffer = self.device.buffer(values.len() * 4)?;
+                    // SAFETY: the GPU hasn't seen this buffer yet.
+                    let memory = unsafe { buffer.slice_mut::<f32>() };
+                    memory[..values.len()].copy_from_slice(values);
+                    Ok(buffer)
+                };
+                targets[t] = Some(LoraTarget {
+                    a: upload(&a)?,
+                    b: upload(&b)?,
+                    rank,
+                    in_dim,
+                    out_dim,
+                });
+                largest = largest.max(rank);
+            }
+            lora.push(targets);
+        }
+        self.lora = lora;
+        self.lora_rank = largest;
+        Ok(())
     }
 
     /// Queue the normalization of the queries and keys.
@@ -1145,6 +1348,18 @@ impl Backend for MetalBackend {
 
     fn capacity(&self) -> usize {
         self.capacity
+    }
+
+    fn add_adapter(&mut self, adapter: &LoraAdapter) -> Result<()> {
+        ensure!(
+            adapter.layers.len() == self.layers.len(),
+            "{}: made for a model with {} layers, not {}",
+            adapter.name,
+            adapter.layers.len(),
+            self.layers.len()
+        );
+        self.adapters.push(adapter.layers.clone());
+        self.upload_adapters()
     }
 }
 

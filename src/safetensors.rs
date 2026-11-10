@@ -130,7 +130,36 @@ const AWQ_SLOT: [usize; 8] = [0, 4, 1, 5, 2, 6, 3, 7];
 impl SafeTensors {
     /// Index `model.safetensors`, or every shard named in `model.safetensors.index.json`.
     pub fn open(dir: &Path) -> Result<Self> {
-        let files = find_files(dir)?;
+        let mut st = Self::index(find_files(dir)?)?;
+        // Checkpoints of a bare model (embedding models, often) leave off the "model." that the
+        // names of the same weights carry inside a model for generating text.
+        let bare = st.tensors.contains_key("embed_tokens.weight")
+            && !st.tensors.keys().any(|name| name.starts_with("model."));
+        if bare {
+            st.tensors = std::mem::take(&mut st.tensors)
+                .into_iter()
+                .map(|(name, entry)| match name.starts_with("lm_head.") {
+                    true => (name, entry),
+                    false => (format!("model.{name}"), entry),
+                })
+                .collect();
+        }
+        // How 4-bit weights are packed comes from the model's configuration.
+        if let Ok(text) = std::fs::read_to_string(dir.join("config.json")) {
+            let config: serde_json::Value = serde_json::from_str(&text)?;
+            if let Some(quantization) = config.get("quantization_config") {
+                st.int4 = Int4Format::from_config(quantization)?;
+            }
+        }
+        Ok(st)
+    }
+
+    /// Index one file, taking tensor names as they are.
+    pub fn open_file(path: &Path) -> Result<Self> {
+        Self::index(vec![path.to_path_buf()])
+    }
+
+    fn index(files: Vec<PathBuf>) -> Result<Self> {
         let mut tensors = HashMap::new();
         for (i, path) in files.iter().enumerate() {
             let mut file =
@@ -163,35 +192,23 @@ impl SafeTensors {
                 );
             }
         }
-        // Checkpoints of a bare model (embedding models, often) leave off the "model." that the
-        // names of the same weights carry inside a model for generating text.
-        let bare = tensors.contains_key("embed_tokens.weight")
-            && !tensors.keys().any(|name| name.starts_with("model."));
-        if bare {
-            tensors = tensors
-                .into_iter()
-                .map(|(name, entry)| match name.starts_with("lm_head.") {
-                    true => (name, entry),
-                    false => (format!("model.{name}"), entry),
-                })
-                .collect();
-        }
-        // How 4-bit weights are packed comes from the model's configuration.
-        let int4 = match std::fs::read_to_string(dir.join("config.json")) {
-            Ok(text) => {
-                let config: serde_json::Value = serde_json::from_str(&text)?;
-                match config.get("quantization_config") {
-                    Some(quantization) => Int4Format::from_config(quantization)?,
-                    None => None,
-                }
-            }
-            Err(_) => None,
-        };
         Ok(Self {
             files,
             tensors,
-            int4,
+            int4: None,
         })
+    }
+
+    /// The names of all the tensors.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.tensors.keys().map(String::as_str)
+    }
+
+    /// The shape tensor `name` is stored with.
+    pub fn shape(&self, name: &str) -> Option<&[usize]> {
+        self.tensors
+            .get(name)
+            .map(|entry| entry.info.shape.as_slice())
     }
 
     pub fn contains(&self, name: &str) -> bool {

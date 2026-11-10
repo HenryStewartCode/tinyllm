@@ -21,6 +21,7 @@
 
 use crate::cache::KvPool;
 use crate::config::{Activation, Architecture, Config, ExpertNaming, Experts};
+use crate::lora::{LoraAdapter, Module};
 use crate::ops::{
     Matrix, add_bias, add_rows, add_scaled, dot, gated_gelu, matmul, rmsnorm, rmsnorm_heads, rope,
     soft_cap, softmax, swiglu, with_scratch,
@@ -315,6 +316,14 @@ pub struct Model {
     head_dim: usize,
     hidden_dim: usize,
     vocab_size: usize,
+    /// LoRA adapters, which rows ask for by number: the first is 1.
+    adapters: Vec<Adapter>,
+}
+
+/// A LoRA adapter's corrections, as matrices: for each layer and module, `A` and `B` (with the
+/// adapter's scale, and for the modules whose output is scaled, that too).
+struct Adapter {
+    layers: Vec<[Option<(Matrix, Matrix)>; 7]>,
 }
 
 /// One token to run through the model.
@@ -327,6 +336,9 @@ pub struct Row<'a> {
     pub want_logits: bool,
     /// How the scores will be used, which can save moving them all to the CPU.
     pub sampling: LogitUse,
+    /// The LoRA adapter to apply (see [`crate::lora`]): 0 for none, or the number the backend
+    /// loaded it as.
+    pub adapter: u16,
 }
 
 /// What a row's logits are needed for.
@@ -367,6 +379,17 @@ pub struct Workspace {
     hidden: Vec<f32>, // final hidden states of the rows that want logits, if any want those [n_logits, dim]
     dim: usize,
     moe: MoeBuffers,
+    lora: LoraBuffers,
+}
+
+/// Working memory for LoRA corrections.
+#[derive(Default)]
+struct LoraBuffers {
+    rows: Vec<usize>,  // the rows using one adapter
+    input: Vec<f32>,   // their inputs [rows, in]
+    reduced: Vec<f32>, // A times those [rows, rank]
+    delta: Vec<f32>,   // B times that [rows, out]
+    scratch: Vec<f32>,
 }
 
 /// Working memory for a mixture of experts.
@@ -403,6 +426,7 @@ impl Workspace {
             hidden: Vec::new(),
             dim: 0,
             moe: MoeBuffers::default(),
+            lora: LoraBuffers::default(),
         }
     }
 
@@ -587,7 +611,90 @@ impl Model {
             head_dim,
             hidden_dim,
             vocab_size,
+            adapters: Vec::new(),
         })
+    }
+
+    /// Add a LoRA adapter, which rows then ask for by its number (the first is 1).
+    pub fn add_adapter(&mut self, adapter: &LoraAdapter) -> Result<()> {
+        anyhow::ensure!(
+            adapter.layers.len() == self.layers.len(),
+            "{}: made for a model with {} layers, not {}",
+            adapter.name,
+            adapter.layers.len(),
+            self.layers.len()
+        );
+        let residual = self.architecture.residual_scale;
+        let layers = adapter
+            .layers
+            .iter()
+            .map(|modules| {
+                std::array::from_fn(|m| {
+                    let pair = modules[m].as_ref()?;
+                    let (in_dim, out_dim) = Module::ALL[m].shape(&self.config);
+                    // The output projections' outputs are scaled, so their corrections are too.
+                    let scale = match Module::ALL[m] {
+                        Module::O | Module::Down => residual,
+                        _ => 1.0,
+                    };
+                    let b: Vec<f32> = pair.b.iter().map(|v| v * scale).collect();
+                    Some((
+                        Matrix::from_rows(&pair.a, pair.rank, in_dim),
+                        Matrix::from_rows(&b, out_dim, pair.rank),
+                    ))
+                })
+            })
+            .collect();
+        self.adapters.push(Adapter { layers });
+        Ok(())
+    }
+
+    /// Add each adapter's correction for `module` of `layer` to the rows of `out` that use it:
+    /// `out[r] += B (A x[r])`, where `x` holds the module's inputs. Each row's correction is
+    /// worked out the same way whatever else is in the batch.
+    #[allow(clippy::too_many_arguments)]
+    fn add_lora(
+        &self,
+        pool: &Pool,
+        layer: usize,
+        module: Module,
+        rows: &[Row],
+        x: &[f32],
+        out: &mut [f32],
+        lora: &mut LoraBuffers,
+    ) {
+        let (in_dim, out_dim) = module.shape(&self.config);
+        for (index, adapter) in self.adapters.iter().enumerate() {
+            let Some((a, b)) = &adapter.layers[layer][module as usize] else {
+                continue;
+            };
+            let number = index as u16 + 1;
+            lora.rows.clear();
+            lora.rows.extend(
+                (rows.iter().enumerate())
+                    .filter(|(_, row)| row.adapter == number)
+                    .map(|(r, _)| r),
+            );
+            if lora.rows.is_empty() {
+                continue;
+            }
+            let n = lora.rows.len();
+            lora.input.clear();
+            for &r in &lora.rows {
+                lora.input
+                    .extend_from_slice(&x[r * in_dim..(r + 1) * in_dim]);
+            }
+            lora.reduced.resize(n * a.rows(), 0.0);
+            matmul(pool, &mut lora.reduced, &mut lora.scratch, a, &lora.input);
+            lora.delta.resize(n * out_dim, 0.0);
+            matmul(pool, &mut lora.delta, &mut lora.scratch, b, &lora.reduced);
+            for (j, &r) in lora.rows.iter().enumerate() {
+                let delta = &lora.delta[j * out_dim..(j + 1) * out_dim];
+                for (o, d) in out[r * out_dim..(r + 1) * out_dim].iter_mut().zip(delta) {
+                    *o += d;
+                }
+            }
+        }
     }
 
     pub fn num_params(&self) -> usize {
@@ -764,6 +871,15 @@ impl Model {
             layer
                 .v_proj
                 .forward(pool, &mut ws.v, &mut ws.scratch, &ws.xb);
+            if !self.adapters.is_empty() {
+                for (module, out) in [
+                    (Module::Q, &mut ws.q),
+                    (Module::K, &mut ws.k),
+                    (Module::V, &mut ws.v),
+                ] {
+                    self.add_lora(pool, l, module, rows, &ws.xb, out, &mut ws.lora);
+                }
+            }
             if let Some((q_norm, k_norm)) = &layer.head_norms {
                 rmsnorm_heads(pool, &mut ws.q, q_norm, eps);
                 rmsnorm_heads(pool, &mut ws.k, k_norm, eps);
@@ -792,6 +908,10 @@ impl Model {
             layer
                 .o_proj
                 .forward(pool, &mut ws.xb, &mut ws.scratch, &ws.attn_out);
+            if !self.adapters.is_empty() {
+                let (attn_out, out) = (&ws.attn_out, &mut ws.xb);
+                self.add_lora(pool, l, Module::O, rows, attn_out, out, &mut ws.lora);
+            }
             let added = match &layer.norm_after_attn {
                 Some(norm) => {
                     rmsnorm(pool, &mut ws.xc, &ws.xb, norm, eps);
@@ -809,12 +929,23 @@ impl Model {
                         .forward(pool, &mut ws.gate, &mut ws.scratch, &ws.xb);
                     mlp.up_proj
                         .forward(pool, &mut ws.up, &mut ws.scratch, &ws.xb);
+                    if !self.adapters.is_empty() {
+                        for (module, out) in
+                            [(Module::Gate, &mut ws.gate), (Module::Up, &mut ws.up)]
+                        {
+                            self.add_lora(pool, l, module, rows, &ws.xb, out, &mut ws.lora);
+                        }
+                    }
                     match self.architecture.activation {
                         Activation::Silu => swiglu(pool, &mut ws.gate, &ws.up, self.hidden_dim),
                         Activation::Gelu => gated_gelu(pool, &mut ws.gate, &ws.up, self.hidden_dim),
                     }
                     mlp.down_proj
                         .forward(pool, &mut ws.xb, &mut ws.scratch, &ws.gate);
+                    if !self.adapters.is_empty() {
+                        let (gate, out) = (&ws.gate, &mut ws.xb);
+                        self.add_lora(pool, l, Module::Down, rows, gate, out, &mut ws.lora);
+                    }
                 }
                 FeedForward::Sparse {
                     router,

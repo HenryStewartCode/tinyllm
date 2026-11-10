@@ -40,6 +40,8 @@ struct Options {
 
 #[derive(Deserialize)]
 struct ChatBody {
+    #[serde(default)]
+    model: Option<String>,
     messages: Vec<Value>,
     #[serde(default)]
     tools: Option<Value>,
@@ -55,6 +57,8 @@ struct ChatBody {
 
 #[derive(Deserialize)]
 struct GenerateBody {
+    #[serde(default)]
+    model: Option<String>,
     #[serde(default)]
     prompt: String,
     #[serde(default)]
@@ -225,7 +229,10 @@ pub(super) async fn chat(State(app): State<Arc<App>>, body: Bytes) -> Response {
             tools: body.tools.clone(),
             chat_template_kwargs: thinking_kwargs(body.think.as_ref()),
             separate_reasoning: Some(true),
-            sampling: sampling(&body.options, body.format.as_ref())?,
+            sampling: SamplingFields {
+                model: body.model.clone(),
+                ..sampling(&body.options, body.format.as_ref())?
+            },
             ..Default::default()
         };
         Ok((body.stream, request))
@@ -271,7 +278,10 @@ pub(super) async fn generate(State(app): State<Arc<App>>, body: Bytes) -> Respon
         return json_response(StatusCode::OK, &done);
     }
     let sampling = match sampling(&body.options, body.format.as_ref()) {
-        Ok(sampling) => sampling,
+        Ok(sampling) => SamplingFields {
+            model: body.model.clone(),
+            ..sampling
+        },
         Err(err) => return error(err),
     };
     if body.raw || app.server.template.is_none() {

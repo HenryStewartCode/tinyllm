@@ -884,6 +884,69 @@ MATMUL_Q4(1)
 MATMUL_Q4(2)
 MATMUL_Q4(4)
 
+// ---------------------------------------------------------------------------------------------
+// LoRA adapters
+// ---------------------------------------------------------------------------------------------
+// A row using adapter a (1 or more; 0 is none) gets B_a (A_a x) added to a matrix's output, with
+// every adapter's A stored as `[adapters, rank, in]` and B transposed, `[adapters, rank, out]`,
+// padded with zeros to the largest rank. First h = A x, then out += B h. Each block takes
+// LORA_ROWS rows, so that rows sharing an adapter read its matrices once between them. Both add
+// up in a fixed order for each row, so its result doesn't depend on the batch.
+#define LORA_ROWS 4
+
+// lora_shrink: h[row][j] = dot(A_a[j], x[row]), with x in 16-bit tiles (`tiled`) or 32-bit rows.
+// One block per LORA_ROWS rows and group of j, a warp per j, which reads A_a[j] once for the
+// block's rows.
+extern "C" __global__ void lora_shrink(const void *x, int tiled, int in_dim, const float *a, int rank,
+                                       const unsigned *adapters, int batch, float *h) {
+    const int first = blockIdx.x * LORA_ROWS;
+    const int rows = min(LORA_ROWS, batch - first);
+    const int chunks = (in_dim + TILE - 1) / TILE;
+    const int lane = threadIdx.x % WARP;
+    const int j = blockIdx.y * (blockDim.x / WARP) + threadIdx.x / WARP;
+    if (j < rank) {
+        for (int r = 0; r < rows; r++) {
+            const int row = first + r;
+            const unsigned adapter = adapters[row];
+            float sum = 0.0f;
+            if (adapter != 0) {
+                const float *aj = a + ((size_t)(adapter - 1) * rank + j) * in_dim;
+                for (int k = lane; k < in_dim; k += WARP) {
+                    const float v =
+                        tiled ? __bfloat162float(reinterpret_cast<const __nv_bfloat16 *>(
+                                    x)[tile_index(row, k, chunks)])
+                              : reinterpret_cast<const float *>(x)[(size_t)row * in_dim + k];
+                    sum += aj[k] * v;
+                }
+                sum = warp_sum(sum);
+            }
+            if (lane == 0)
+                h[(size_t)row * rank + j] = sum;
+        }
+    }
+}
+
+// lora_expand: out[row][o] += dot(B_a[:, o], h[row]), one thread per o for LORA_ROWS rows.
+extern "C" __global__ void lora_expand(const float *h, int rank, const float *b, int out_dim,
+                                       const unsigned *adapters, int batch, float *out) {
+    const int first = blockIdx.x * LORA_ROWS;
+    const int rows = min(LORA_ROWS, batch - first);
+    const int o = blockIdx.y * blockDim.x + threadIdx.x;
+    if (o >= out_dim)
+        return;
+    for (int r = 0; r < rows; r++) {
+        const unsigned adapter = adapters[first + r];
+        if (adapter == 0)
+            continue;
+        const float *bo = b + (size_t)(adapter - 1) * rank * out_dim + o;
+        const float *hr = h + (size_t)(first + r) * rank;
+        float sum = 0.0f;
+        for (int j = 0; j < rank; j++)
+            sum += bo[(size_t)j * out_dim] * hr[j];
+        out[(size_t)(first + r) * out_dim + o] += sum;
+    }
+}
+
 // One block per row, as rope_store, with the keys and values stored 16-bit in the tile layout:
 // the KV pools are `[slots, kv_dim]` matrices, so a page of 16 slots is one group of tiles.
 extern "C" __global__ void rope_store_bf16(float *qkv, int stride, const float *cos_table,

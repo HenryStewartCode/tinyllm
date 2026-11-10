@@ -15,6 +15,7 @@ pub use api::{Arg, Gpu, Graph, Kernel, Module, Pointer};
 
 use crate::backend::{Backend, LoadedModel, Logits};
 use crate::config::{Activation, Architecture, Config, ExpertNaming, Experts as ConfigExperts};
+use crate::lora::{LoraAdapter, LoraPair, Module as LoraModule};
 use crate::model::{LogitUse, Row};
 use crate::pool::Pool;
 use crate::safetensors::{FP8_BLOCK, SafeTensors, bf16_to_f32, f32_to_bf16};
@@ -188,6 +189,8 @@ struct Kernels {
     matmul_q4_1: Kernel,
     matmul_q4_2: Kernel,
     matmul_q4_4: Kernel,
+    lora_shrink: Kernel,
+    lora_expand: Kernel,
     swiglu_bf16: Kernel,
     geglu_bf16: Kernel,
     rope_store_bf16: Kernel,
@@ -236,6 +239,8 @@ impl Kernels {
             matmul_q4_1: gpu.kernel(module, "matmul_q4_1")?,
             matmul_q4_2: gpu.kernel(module, "matmul_q4_2")?,
             matmul_q4_4: gpu.kernel(module, "matmul_q4_4")?,
+            lora_shrink: gpu.kernel(module, "lora_shrink")?,
+            lora_expand: gpu.kernel(module, "lora_expand")?,
             moe_route: gpu.kernel(module, "moe_route")?,
             moe_sort: gpu.kernel(module, "moe_sort")?,
             moe_gather: gpu.kernel(module, "moe_gather")?,
@@ -298,6 +303,8 @@ struct StepData {
     write_slots: Vec<u32>,
     row_offset: Vec<u32>,
     row_len: Vec<u32>,
+    /// Each row's LoRA adapter, 0 for none.
+    adapters: Vec<u32>,
     team_size: Vec<u32>,
     scratch_offset: Vec<u32>,
     logit_rows: Vec<u32>,
@@ -348,7 +355,7 @@ pub struct CudaBackend {
     step: StepData,
     /// The kernels of a forward pass, recorded once per batch size, then replayed. That saves
     /// a little GPU time per kernel, which only matters when the batch is small.
-    graphs: HashMap<usize, Graph>,
+    graphs: HashMap<(usize, bool), Graph>,
 
     /// Two entries per row that wants logits: how many candidates it has, and the token drawn.
     results_device: Pointer,
@@ -368,6 +375,32 @@ pub struct CudaBackend {
     hidden: Vec<f32>,
     pool: Pool,
     gpu_name: String,
+    /// LoRA adapters' corrections as given, for each layer and module, the first being adapter 1.
+    adapters: Vec<Vec<[Option<LoraPair>; 7]>>,
+    /// The same on the GPU, for each layer and each of `LORA_TARGETS`.
+    lora: Vec<[LoraTarget; 4]>,
+    /// Working space for `A x`, `[rows, largest rank]`.
+    lora_hidden: Pointer,
+}
+
+/// The matrices LoRA corrections go to, as stacked here, and the modules each stacks.
+const LORA_TARGETS: [&[LoraModule]; 4] = [
+    &[LoraModule::Q, LoraModule::K, LoraModule::V],
+    &[LoraModule::O],
+    &[LoraModule::Gate, LoraModule::Up],
+    &[LoraModule::Down],
+];
+
+/// Every adapter's correction to one stacked matrix: `A` as `[adapters, rank, in]` and `B`
+/// transposed, `[adapters, rank, out]`, padded with zeros to the largest rank. A rank of 0 means
+/// no adapter changes this matrix.
+#[derive(Clone, Copy, Default)]
+struct LoraTarget {
+    a: Pointer,
+    b: Pointer,
+    rank: usize,
+    in_dim: usize,
+    out_dim: usize,
 }
 
 impl CudaBackend {
@@ -648,7 +681,7 @@ impl CudaBackend {
         let candidate_values_device = gpu.alloc(options.max_batch * MAX_CANDIDATES)?;
         let candidate_ids_device = gpu.alloc(options.max_batch * MAX_CANDIDATES)?;
         let rope_slots = 2 * options.max_batch * (head_dim / 2) * architecture.rope_tables.len();
-        let step_slots = 13 * options.max_batch + rope_slots + 16;
+        let step_slots = 14 * options.max_batch + rope_slots + 16;
         let step_buffer = gpu.alloc(step_slots)?;
 
         // The KV cache gets what's left, unless told otherwise.
@@ -736,6 +769,9 @@ impl CudaBackend {
                 logits: Vec::new(),
                 hidden: Vec::new(),
                 gpu_name,
+                adapters: Vec::new(),
+                lora: Vec::new(),
+                lora_hidden: Pointer::NULL,
             },
         })
     }
@@ -855,17 +891,27 @@ impl CudaBackend {
     }
 
     /// Queue `x += W input`, normalizing the addition first if the model does that.
+    #[allow(clippy::too_many_arguments)]
     fn add_block_output(
         &self,
         w: &Matrix,
         input: Pointer,
         batch: usize,
         norm: Option<Pointer>,
+        lora: Option<(usize, usize)>,
+        step: &StepPointers,
     ) -> Result<()> {
-        let Some(norm) = norm else {
-            return self.matmul(w, input, batch, self.x, true);
+        let out = match norm {
+            Some(_) => self.added,
+            None => self.x,
         };
-        self.matmul(w, input, batch, self.added, false)?;
+        self.matmul(w, input, batch, out, norm.is_none())?;
+        if let Some((layer, target)) = lora {
+            self.lora(layer, target, input, batch, out, step)?;
+        }
+        let Some(norm) = norm else {
+            return Ok(());
+        };
         self.gpu.launch(
             self.kernels.rmsnorm_add,
             [batch, 1],
@@ -877,6 +923,151 @@ impl CudaBackend {
                 Arg::Float(self.eps),
             ],
         )
+    }
+
+    /// Queue the LoRA corrections to stacked matrix `target` (one of `LORA_TARGETS`) of `layer`:
+    /// `out += B (A input)` for each row using an adapter.
+    fn lora(
+        &self,
+        layer: usize,
+        target: usize,
+        input: Pointer,
+        batch: usize,
+        out: Pointer,
+        step: &StepPointers,
+    ) -> Result<()> {
+        let Some(t) = self.lora.get(layer).map(|targets| targets[target]) else {
+            return Ok(());
+        };
+        if t.rank == 0 || !step.any_adapter {
+            return Ok(());
+        }
+        // Rows per block in the LoRA kernels (`LORA_ROWS` in `kernels.cu`).
+        const ROWS: usize = 4;
+        self.gpu.launch_blocks(
+            self.kernels.lora_shrink,
+            [batch.div_ceil(ROWS), t.rank.div_ceil(8)],
+            256,
+            &[
+                Arg::Ptr(input),
+                Arg::Int((self.precision == Precision::Bf16) as usize),
+                Arg::Int(t.in_dim),
+                Arg::Ptr(t.a),
+                Arg::Int(t.rank),
+                Arg::Ptr(step.adapters),
+                Arg::Int(batch),
+                Arg::Ptr(self.lora_hidden),
+            ],
+        )?;
+        self.gpu.launch_blocks(
+            self.kernels.lora_expand,
+            [batch.div_ceil(ROWS), t.out_dim.div_ceil(256)],
+            256,
+            &[
+                Arg::Ptr(self.lora_hidden),
+                Arg::Int(t.rank),
+                Arg::Ptr(t.b),
+                Arg::Int(t.out_dim),
+                Arg::Ptr(step.adapters),
+                Arg::Int(batch),
+                Arg::Ptr(out),
+            ],
+        )
+    }
+
+    /// `(in, out)` for a module.
+    fn module_shape(&self, module: LoraModule) -> (usize, usize) {
+        let (q_dim, kv_dim) = (
+            self.n_heads * self.head_dim,
+            self.n_kv_heads * self.head_dim,
+        );
+        match module {
+            LoraModule::Q => (self.dim, q_dim),
+            LoraModule::K | LoraModule::V => (self.dim, kv_dim),
+            LoraModule::O => (q_dim, self.dim),
+            LoraModule::Gate | LoraModule::Up => (self.dim, self.hidden_dim),
+            LoraModule::Down => (self.hidden_dim, self.dim),
+        }
+    }
+
+    /// Put every adapter's corrections on the GPU, replacing what was there.
+    fn upload_adapters(&mut self) -> Result<()> {
+        for targets in self.lora.drain(..) {
+            for target in targets.iter().filter(|t| t.rank > 0) {
+                self.gpu.free(target.a)?;
+                self.gpu.free(target.b)?;
+            }
+        }
+        if self.lora_hidden != Pointer::NULL {
+            self.gpu.free(self.lora_hidden)?;
+        }
+        let residual = self.architecture.residual_scale;
+        let mut largest = 1;
+        for l in 0..self.layers.len() {
+            let mut targets = [LoraTarget::default(); 4];
+            for (t, modules) in LORA_TARGETS.iter().enumerate() {
+                let in_dim = self.module_shape(modules[0]).0;
+                let outs: Vec<usize> = modules.iter().map(|&m| self.module_shape(m).1).collect();
+                let out_dim: usize = outs.iter().sum();
+                let rank_of = |adapter: &Vec<[Option<LoraPair>; 7]>| -> usize {
+                    modules
+                        .iter()
+                        .map(|&m| adapter[l][m as usize].as_ref().map_or(0, |p| p.rank))
+                        .sum()
+                };
+                let rank = self.adapters.iter().map(rank_of).max().unwrap_or(0);
+                if rank == 0 {
+                    continue;
+                }
+                let n = self.adapters.len();
+                let (mut a, mut b) = (
+                    vec![0.0f32; n * rank * in_dim],
+                    vec![0.0f32; n * out_dim * rank],
+                );
+                for (i, adapter) in self.adapters.iter().enumerate() {
+                    let (mut first_rank, mut first_out) = (0, 0);
+                    for (&module, &out) in modules.iter().zip(&outs) {
+                        if let Some(pair) = &adapter[l][module as usize] {
+                            // The output projections' outputs are scaled, so their corrections are.
+                            let scale = match module {
+                                LoraModule::O | LoraModule::Down => residual,
+                                _ => 1.0,
+                            };
+                            let at = (i * rank + first_rank) * in_dim;
+                            a[at..at + pair.rank * in_dim].copy_from_slice(&pair.a);
+                            // B is stored transposed: `[adapters, rank, out]`.
+                            for o in 0..out {
+                                for j in 0..pair.rank {
+                                    b[(i * rank + first_rank + j) * out_dim + first_out + o] =
+                                        pair.b[o * pair.rank + j] * scale;
+                                }
+                            }
+                            first_rank += pair.rank;
+                        }
+                        first_out += out;
+                    }
+                }
+                let a_device = self.gpu.alloc(a.len())?;
+                self.gpu.write_now(a_device, &a)?;
+                let b_device = self.gpu.alloc(b.len())?;
+                self.gpu.write_now(b_device, &b)?;
+                targets[t] = LoraTarget {
+                    a: a_device,
+                    b: b_device,
+                    rank,
+                    in_dim,
+                    out_dim,
+                };
+                largest = largest.max(rank);
+            }
+            self.lora.push(targets);
+        }
+        self.lora_hidden = self.gpu.alloc((self.max_batch + PADDING_ROWS) * largest)?;
+        // Recorded steps don't know about the new adapter.
+        for (_, graph) in self.graphs.drain() {
+            self.gpu.destroy_graph(graph)?;
+        }
+        Ok(())
     }
 
     /// Queue a mixture of experts on the normalized input in `xb`, adding its result to `x`.
@@ -1079,6 +1270,7 @@ impl CudaBackend {
         step.write_slots.clear();
         step.row_offset.clear();
         step.row_len.clear();
+        step.adapters.clear();
         step.team_size.clear();
         step.scratch_offset.clear();
         step.logit_rows.clear();
@@ -1128,6 +1320,12 @@ impl CudaBackend {
                     .push(*row.slots.last().expect("a row needs a KV slot"));
                 step.row_offset.push(offset);
                 step.row_len.push(row.slots.len() as u32);
+                assert!(
+                    (row.adapter as usize) <= self.adapters.len(),
+                    "there's no adapter {}",
+                    row.adapter
+                );
+                step.adapters.push(row.adapter as u32);
                 step.scratch_offset.push(scratch_total as u32);
                 scratch_total += row.slots.len() * self.n_heads;
                 if row.want_logits {
@@ -1185,6 +1383,8 @@ impl CudaBackend {
         combined.extend_from_slice(&step.row_offset);
         let row_len = mark(combined);
         combined.extend_from_slice(&step.row_len);
+        let adapters = mark(combined);
+        combined.extend_from_slice(&step.adapters);
         let team_size = mark(combined);
         combined.extend_from_slice(&step.team_size);
         let scratch_offset = mark(combined);
@@ -1216,6 +1416,8 @@ impl CudaBackend {
             write_slots,
             row_offset,
             row_len,
+            adapters,
+            any_adapter: step.adapters.iter().any(|&a| a != 0),
             team_size,
             scratch_offset,
             logit_rows,
@@ -1261,10 +1463,11 @@ impl CudaBackend {
             Activation::Gelu => (self.kernels.geglu_bf16, self.kernels.geglu),
         };
 
-        for layer in &self.layers {
+        for (l, layer) in self.layers.iter().enumerate() {
             // Attention block: mix in information from earlier tokens.
             self.rmsnorm(self.x, self.xb, layer.attn_norm, batch, Pointer::NULL)?;
             self.matmul(&layer.qkv, self.xb, batch, self.qkv, false)?;
+            self.lora(l, 0, self.xb, batch, self.qkv, step)?;
             if let Some((q_weight, k_weight)) = layer.head_norms {
                 match self.architecture.full_qk_norms {
                     true => self.full_qk_norms(q_weight, k_weight, batch)?,
@@ -1273,7 +1476,14 @@ impl CudaBackend {
             }
             self.rope_and_store(layer, batch, step)?;
             self.attention(layer, batch, step)?;
-            self.add_block_output(&layer.o_proj, self.attn_out, batch, layer.norm_after_attn)?;
+            self.add_block_output(
+                &layer.o_proj,
+                self.attn_out,
+                batch,
+                layer.norm_after_attn,
+                Some((l, 1)),
+                step,
+            )?;
 
             // MLP block: process each token on its own.
             self.rmsnorm(self.x, self.xb, layer.mlp_norm, batch, Pointer::NULL)?;
@@ -1285,6 +1495,7 @@ impl CudaBackend {
                 }
             };
             self.matmul(gate_up, self.xb, batch, self.gate_up, false)?;
+            self.lora(l, 2, self.xb, batch, self.gate_up, step)?;
             let swiglu_args = [
                 Arg::Ptr(self.gate_up),
                 Arg::Ptr(self.gated),
@@ -1299,7 +1510,14 @@ impl CudaBackend {
                 )?,
                 Precision::F32 => self.gpu.launch(gated, [batch, 1], &swiglu_args[..3])?,
             }
-            self.add_block_output(down, self.gated, batch, layer.norm_after_mlp)?;
+            self.add_block_output(
+                down,
+                self.gated,
+                batch,
+                layer.norm_after_mlp,
+                Some((l, 3)),
+                step,
+            )?;
         }
         Ok(())
     }
@@ -1318,11 +1536,12 @@ impl CudaBackend {
         assert!(batch <= self.max_batch, "batch larger than the buffers");
         let step = self.upload_step(rows)?;
         if batch <= MAX_RECORDED_BATCH {
-            if !self.graphs.contains_key(&batch) {
+            let key = (batch, step.any_adapter);
+            if !self.graphs.contains_key(&key) {
                 let graph = self.record_graph(batch, &step)?;
-                self.graphs.insert(batch, graph);
+                self.graphs.insert(key, graph);
             }
-            self.gpu.launch_graph(&self.graphs[&batch])?;
+            self.gpu.launch_graph(&self.graphs[&key])?;
         } else {
             self.launch_layers(batch, &step)?;
         }
@@ -1469,6 +1688,9 @@ struct StepPointers {
     write_slots: Pointer,
     row_offset: Pointer,
     row_len: Pointer,
+    adapters: Pointer,
+    /// Some row uses a LoRA adapter.
+    any_adapter: bool,
     team_size: Pointer,
     scratch_offset: Pointer,
     logit_rows: Pointer,
@@ -2141,6 +2363,28 @@ impl Backend for CudaBackend {
             Precision::Bf16 => TILE,
             Precision::F32 => 1,
         }
+    }
+
+    fn add_adapter(&mut self, adapter: &LoraAdapter) -> Result<()> {
+        ensure!(
+            adapter.layers.len() == self.layers.len(),
+            "{}: made for a model with {} layers, not {}",
+            adapter.name,
+            adapter.layers.len(),
+            self.layers.len()
+        );
+        for (l, layer) in self.layers.iter().enumerate() {
+            let changes_mlp = [LoraModule::Gate, LoraModule::Up, LoraModule::Down]
+                .iter()
+                .any(|&m| adapter.layers[l][m as usize].is_some());
+            ensure!(
+                !(changes_mlp && matches!(layer.feed_forward, FeedForward::Sparse(_))),
+                "{}: adapters for mixtures of experts' MLPs aren't supported",
+                adapter.name
+            );
+        }
+        self.adapters.push(adapter.layers.clone());
+        self.upload_adapters()
     }
 }
 

@@ -7,6 +7,7 @@ use crate::engine::{
     TokenLogprob, Usage,
 };
 use crate::grammar::{Grammar, Vocabulary};
+use crate::lora::Adapters;
 use crate::reasoning::{Piece, ReasoningFormat, ReasoningParser};
 use crate::sampler::SamplingParams;
 use crate::tokenizer::Tokenizer;
@@ -79,6 +80,8 @@ pub struct Server {
     /// The model's architecture, as `config.json` names it.
     pub model_type: String,
     pub num_params: usize,
+    /// The LoRA adapters requests can choose, by name.
+    pub adapters: Adapters,
 }
 
 struct App {
@@ -256,6 +259,10 @@ struct SamplingFields {
     regex: Option<String>,
     ebnf: Option<String>,
     json_schema: Option<Value>,
+    // Which weights: the model, or one of its LoRA adapters, chosen by naming it as the model
+    // or (as SGLang does it) in `lora_path`.
+    model: Option<String>,
+    lora_path: Option<String>,
 }
 
 impl SamplingFields {
@@ -331,6 +338,8 @@ struct NativeRequest {
     input_ids: Option<Vec<u32>>,
     stream: bool,
     sampling_params: SamplingFields,
+    /// The LoRA adapter to use, by name.
+    lora_path: Option<String>,
 }
 
 fn new_seed() -> u64 {
@@ -414,7 +423,23 @@ impl App {
         };
         let stop_strings = stop_strings.into_iter().filter(|s| !s.is_empty()).collect();
 
+        let adapters = &self.server.adapters;
+        let adapter = match (&fields.lora_path, &fields.model) {
+            (Some(name), _) => adapters.find(name).ok_or_else(|| {
+                ApiError::invalid(match adapters.is_empty() {
+                    true => format!("there's no LoRA adapter named {name}: this server has none"),
+                    false => format!(
+                        "there's no LoRA adapter named {name}; this server has {}",
+                        adapters.names().join(", ")
+                    ),
+                })
+            })?,
+            (None, Some(model)) => adapters.find(model).unwrap_or(0),
+            (None, None) => 0,
+        };
+
         Ok(GenerateParams {
+            adapter,
             max_tokens,
             sampling: SamplingParams {
                 temperature,
@@ -1381,6 +1406,7 @@ async fn generate(State(app): State<Arc<App>>, body: Bytes) -> Result<Response, 
         return Err(ApiError::invalid("/generate only supports n = 1 so far"));
     }
     let mut fields = request.sampling_params;
+    fields.lora_path = request.lora_path.or(fields.lora_path);
     // SGLang's defaults for this endpoint, rather than the OpenAI ones.
     fields.max_tokens = fields.max_tokens.or(Some(128));
     fields.temperature = fields.temperature.or(Some(1.0));
@@ -1446,19 +1472,26 @@ async fn generate(State(app): State<Arc<App>>, body: Bytes) -> Result<Response, 
 }
 
 async fn models(State(app): State<Arc<App>>) -> Response {
-    json_response(
-        StatusCode::OK,
-        &json!({
-            "object": "list",
-            "data": [{
-                "id": app.server.model_name,
-                "object": "model",
-                "created": app.created,
-                "owned_by": "tinyllm",
-                "max_model_len": app.context_limit(),
-            }],
-        }),
-    )
+    let base = &app.server.model_name;
+    let mut data = vec![json!({
+        "id": base,
+        "object": "model",
+        "created": app.created,
+        "owned_by": "tinyllm",
+        "max_model_len": app.context_limit(),
+    })];
+    // Each adapter is a model of its own, as vLLM lists them.
+    for name in app.server.adapters.names() {
+        data.push(json!({
+            "id": name,
+            "object": "model",
+            "created": app.created,
+            "owned_by": "tinyllm",
+            "parent": base,
+            "max_model_len": app.context_limit(),
+        }));
+    }
+    json_response(StatusCode::OK, &json!({ "object": "list", "data": data }))
 }
 
 async fn model_info(State(app): State<Arc<App>>) -> Response {

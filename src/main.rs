@@ -14,6 +14,7 @@ use tinyllm::cuda::{self, CudaBackend};
 use tinyllm::engine::{
     self, EngineConfig, EngineHandle, Event, GenerateParams, Request, Speculative,
 };
+use tinyllm::lora::{self, Adapters, LoraAdapter};
 use tinyllm::metal::{self, MetalBackend};
 use tinyllm::reasoning::ReasoningFormat;
 use tinyllm::sampler::SamplingParams;
@@ -203,6 +204,12 @@ struct Args {
     /// The most tokens to guess ahead for one request
     #[arg(long, default_value_t = 6)]
     speculative_num_draft_tokens: usize,
+
+    /// A LoRA adapter (a PEFT directory) that requests can choose by naming it as their model,
+    /// or in `lora_path`: NAME=PATH, or just PATH to name it after its directory. Repeat for more.
+    /// Without --serve, the first one is used
+    #[arg(long = "lora", alias = "lora-paths", value_name = "NAME=PATH", num_args = 1..)]
+    lora: Vec<String>,
 }
 
 fn main() -> Result<()> {
@@ -305,6 +312,24 @@ fn main() -> Result<()> {
         backend.describe(),
         start.elapsed().as_secs_f64()
     );
+    let mut backend = backend;
+    let mut adapter_names = Vec::new();
+    for argument in &args.lora {
+        let (name, path) = lora::parse_argument(argument)?;
+        if adapter_names.contains(&name) {
+            bail!("two adapters are called {name}");
+        }
+        let adapter = LoraAdapter::load(&name, &path, &config)?;
+        backend
+            .add_adapter(&adapter)
+            .with_context(|| format!("adding the adapter {name}"))?;
+        eprintln!(
+            "Added LoRA adapter {name} (rank {}) from {}",
+            adapter.max_rank(),
+            path.display()
+        );
+        adapter_names.push(name);
+    }
 
     let engine_config = EngineConfig {
         threads,
@@ -322,6 +347,8 @@ fn main() -> Result<()> {
         },
     };
     let params = GenerateParams {
+        // Without the server, the first adapter (if any) is the one to use.
+        adapter: (!adapter_names.is_empty()) as u16,
         max_tokens: args.max_tokens,
         sampling: SamplingParams {
             temperature: args.temperature,
@@ -396,6 +423,7 @@ fn main() -> Result<()> {
                 reasoning,
                 model_type: config.model_type.clone(),
                 num_params,
+                adapters: Adapters::new(adapter_names),
             },
             &format!("{}:{}", args.host, args.port),
         );

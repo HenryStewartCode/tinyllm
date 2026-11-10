@@ -564,3 +564,52 @@ kernel void finish_logits(device float *logits [[buffer(0)]], constant LogitArgs
         value = a.softcap * precise::tanh(value / a.softcap);
     logits[i] = value;
 }
+
+// LoRA adapters: a row using adapter a (1 or more; 0 is none) gets B_a (A_a x) added to a
+// matrix's output, with every adapter's A stored as [adapters, rank, in] and B as
+// [adapters, out, rank], padded with zeros to the largest rank. First h = A x, one simdgroup per
+// (j, row); then each output adds its row of B times h. Both add up in a fixed order.
+struct LoraArgs {
+    uint in_dim;
+    uint out_dim;
+    uint rank;
+};
+kernel void lora_shrink(device const float *x [[buffer(0)]], device const float *a [[buffer(1)]],
+                        device const uint *adapters [[buffer(2)]], device float *h [[buffer(3)]],
+                        constant LoraArgs &args [[buffer(4)]],
+                        uint2 group [[threadgroup_position_in_grid]],
+                        uint simd [[simdgroup_index_in_threadgroup]],
+                        uint simds [[simdgroups_per_threadgroup]],
+                        uint lane [[thread_index_in_simdgroup]]) {
+    const uint row = group.y, j = group.x * simds + simd;
+    if (j >= args.rank)
+        return;
+    const uint adapter = adapters[row];
+    float sum = 0.0f;
+    if (adapter != 0) {
+        device const float *aj = a + ((ulong)(adapter - 1) * args.rank + j) * args.in_dim;
+        device const float *xr = x + (ulong)row * args.in_dim;
+        for (uint k = lane; k < args.in_dim; k += SIMD)
+            sum += aj[k] * xr[k];
+        sum = simd_sum(sum);
+    }
+    if (lane == 0)
+        h[(ulong)row * args.rank + j] = sum;
+}
+kernel void lora_expand(device const float *h [[buffer(0)]], device const float *b [[buffer(1)]],
+                        device const uint *adapters [[buffer(2)]], device float *out [[buffer(3)]],
+                        constant LoraArgs &args [[buffer(4)]],
+                        uint2 group [[threadgroup_position_in_grid]],
+                        uint2 tid [[thread_position_in_threadgroup]],
+                        uint2 threads [[threads_per_threadgroup]]) {
+    const uint row = group.y, o = group.x * threads.x + tid.x;
+    const uint adapter = adapters[row];
+    if (o >= args.out_dim || adapter == 0)
+        return;
+    device const float *bo = b + ((ulong)(adapter - 1) * args.out_dim + o) * args.rank;
+    device const float *hr = h + (ulong)row * args.rank;
+    float sum = 0.0f;
+    for (uint j = 0; j < args.rank; j++)
+        sum += bo[j] * hr[j];
+    out[(ulong)row * args.out_dim + o] += sum;
+}

@@ -6,6 +6,7 @@ use std::time::Instant;
 use tinyllm::backend::{Backend, CpuBackend, LoadedModel, Logits};
 use tinyllm::config::Config;
 use tinyllm::cuda::{self, CudaBackend};
+use tinyllm::lora::LoraAdapter;
 use tinyllm::metal::{self, MetalBackend};
 use tinyllm::model::{LogitUse, Row};
 use tinyllm::tokenizer::Tokenizer;
@@ -25,7 +26,13 @@ fn env_usize(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-/// A backend chosen by the DEVICE environment variable (cpu, cuda or metal).
+/// The adapter rows use: 1 if LORA names one to load, otherwise none.
+fn adapter() -> u16 {
+    std::env::var("LORA").is_ok() as u16
+}
+
+/// A backend chosen by the DEVICE environment variable (cpu, cuda or metal), with the LoRA
+/// adapter in the directory LORA names, if any.
 fn open(dir: &Path, cache_tokens: usize, max_batch: usize) -> (Box<dyn Backend>, Config) {
     let threads = env_usize("THREADS", 4);
     let config = Config::load(dir).unwrap();
@@ -62,6 +69,11 @@ fn open(dir: &Path, cache_tokens: usize, max_batch: usize) -> (Box<dyn Backend>,
         let LoadedModel { backend, .. } = CpuBackend::load(dir, threads, bytes).unwrap();
         Box::new(backend)
     };
+    let mut backend = backend;
+    if let Ok(path) = std::env::var("LORA") {
+        let adapter = LoraAdapter::load("lora", Path::new(&path), &config).unwrap();
+        backend.add_adapter(&adapter).unwrap();
+    }
     (backend, config)
 }
 
@@ -100,6 +112,7 @@ fn main() {
                     slots: &slots[..=i],
                     want_logits: true,
                     sampling: LogitUse::All,
+                    adapter: adapter(),
                 })
                 .collect();
             b.attach();
@@ -137,6 +150,7 @@ fn main() {
                     slots,
                     want_logits: true,
                     sampling: LogitUse::All,
+                    adapter: adapter(),
                 })
                 .collect();
             for (name, seconds) in backend.profile(&rows).unwrap() {
@@ -159,6 +173,7 @@ fn main() {
                     slots: &slots[..=i],
                     want_logits: i + 1 == plen,
                     sampling: LogitUse::All,
+                    adapter: adapter(),
                 })
                 .collect();
             b.forward(&rows);
@@ -176,6 +191,7 @@ fn main() {
                     slots: &slots[..ids.len()],
                     want_logits: true,
                     sampling: LogitUse::All,
+                    adapter: adapter(),
                 }];
                 b.forward(&rows);
             }
@@ -223,6 +239,7 @@ fn main() {
                         slots: &slots[..=i],
                         want_logits: i + 1 == p.len(),
                         sampling: LogitUse::All,
+                        adapter: adapter(),
                     }]);
                 }
                 for _ in 0..steps {
@@ -234,6 +251,7 @@ fn main() {
                         slots: &slots[..toks.len()],
                         want_logits: true,
                         sampling: LogitUse::All,
+                        adapter: adapter(),
                     }]);
                 }
                 alone.push(got);
@@ -259,6 +277,7 @@ fn main() {
                         slots: &s[..=i],
                         want_logits: i + 1 == p.len(),
                         sampling: LogitUse::All,
+                        adapter: adapter(),
                     })
                 })
                 .collect();
@@ -286,6 +305,7 @@ fn main() {
                         slots: &s[..t.len()],
                         want_logits: true,
                         sampling: LogitUse::All,
+                        adapter: adapter(),
                     })
                     .collect();
                 b.forward(&rows);
@@ -317,6 +337,7 @@ fn main() {
                             slots: &sl[..=i],
                             want_logits: i == 15,
                             sampling: LogitUse::All,
+                            adapter: adapter(),
                         })
                     })
                     .collect();
@@ -357,6 +378,7 @@ fn main() {
                             slots: &slots[s][..pos],
                             want_logits: true,
                             sampling,
+                            adapter: adapter(),
                         })
                         .collect();
                     b.forward(&rows);
@@ -390,6 +412,7 @@ fn main() {
                             slots: &slots[..=i],
                             want_logits: i + 1 == n,
                             sampling: LogitUse::All,
+                            adapter: adapter(),
                         })
                         .collect();
                     b.forward(&rows);
@@ -426,6 +449,7 @@ fn main() {
                         slots: &slots[..=i],
                         want_logits: i + 1 == p.len(),
                         sampling: LogitUse::All,
+                        adapter: adapter(),
                     })
                     .collect();
                 for c in rows.chunks(chunk) {
@@ -445,6 +469,7 @@ fn main() {
                         slots: &slots[..toks.len()],
                         want_logits: true,
                         sampling: LogitUse::All,
+                        adapter: adapter(),
                     }]);
                 }
                 out
@@ -461,6 +486,7 @@ fn main() {
                         slots: &slots[..=i],
                         want_logits: i + 1 == other.len(),
                         sampling: LogitUse::All,
+                        adapter: adapter(),
                     })
                     .collect();
                 b.forward(&rows);
@@ -475,6 +501,7 @@ fn main() {
                         slots: &slots[..toks.len()],
                         want_logits: true,
                         sampling: LogitUse::All,
+                        adapter: adapter(),
                     }]);
                 }
             }

@@ -265,6 +265,29 @@ All 20 replies were identical with and without guessing, in each case. Requests 
 logprobs or thinking budgets don't guess, and the number of guesses per step is capped so that
 large batches don't spend their time checking guesses.
 
+### LoRA adapters
+
+`--lora NAME=PATH` (repeat it for more) loads a LoRA adapter in the PEFT format that Hugging Face
+shares them in (`adapter_config.json` and `adapter_model.safetensors`). A request chooses one by
+naming it as its `model`, as with vLLM, or in `lora_path`, as with SGLang (`/generate` takes
+`lora_path` too); requests that don't use the model as it is. `/v1/models` lists the adapters.
+
+```bash
+tinyllm -m models/Qwen2.5-0.5B-Instruct --serve --lora sql=adapters/sql chat=adapters/chat
+curl localhost:8000/v1/chat/completions -d '{"model": "sql", "messages": [...]}'
+```
+
+Rather than changing the weights, which would need a copy of the model per adapter, each step
+adds `B (A x)` to a module's output for the rows that use an adapter, so a batch can mix requests
+using different adapters and none. Prompts cached for one adapter aren't reused for another, since
+its keys and values differ. Adapters can change any of the attention and MLP projections, with any
+rank, `lora_alpha`, `alpha_pattern` and `use_rslora`, on the CPU and on both kinds of GPU.
+
+On an RTX 2000 Ada, with Qwen2.5-0.5B and a rank-16 adapter on all seven projections, a step whose
+rows all use the adapter runs at 70–80% of the model's speed alone (132 against 166 tok/s for one
+request, 2,130 against 2,825 for 32), and prompts at 65%. Steps with no rows using an adapter run
+exactly as before.
+
 ### Tool calling
 
 Pass `tools` as you would to OpenAI. Calls come back in `tool_calls`, a piece at a time if you're
@@ -351,6 +374,7 @@ cargo run --release -- -m models/Qwen2.5-0.5B-Instruct --chat --system "You are 
 | `--parallel N` | 32 CPU, 128 GPU | requests in progress at once |
 | `--speculative-algorithm A` | none | `ngram` to guess tokens ahead (see [Speculative decoding](#speculative-decoding)) |
 | `--speculative-num-draft-tokens N` | 6 | the most tokens to guess ahead per request |
+| `--lora NAME=PATH` | | a LoRA adapter requests can choose (see [LoRA adapters](#lora-adapters)); without `--serve`, the first is used |
 | `--batch-size N` | 64 CPU, 512 GPU | tokens run through the model per step |
 | `--cache-mb N` | see right | KV cache size. CPU: ¼ of RAM up to 8 GiB, committed as used. GPU: what's left after loading |
 | `--show-tokens` | off | print the prompt's token ids |
@@ -515,6 +539,13 @@ Checked against Hugging Face `transformers` (float32) and `tokenizers`:
   diverge where two tokens are nearly tied.
 - **GPU batching:** logits are bit-identical whether a sequence runs alone or batched, in both
   precisions, tensor cores included (24 million compared in each, none different).
+- **LoRA adapters:** `scripts/make_lora.py` builds a random adapter and the same model with it
+  merged into the weights. On SmolLM2-135M and Qwen2.5-0.5B, with rank-16 adapters on all seven
+  projections that move the logits by up to 20, running the adapter matches the merged model to
+  within 6e-4 on the CPU, the Apple GPU and the NVIDIA GPU in 32 bits (greedy generations
+  identical), and the NVIDIA GPU in 16 bits as closely as 16-bit weights usually do. Batching
+  changes nothing. Through the server (`scripts/lora_test.py`), requests mixing two adapters and
+  none get exactly the replies they get alone, and an adapter never reuses another's cached prompt.
 - **Apple GPU:** the random-weight models of every dense architecture above match `transformers`
   as closely as the CPU does (within 2.5e-7 for the Llama-style ones, 5.4e-4 for Gemma 2 with
   256-wide heads, where the CPU is at 5.9e-4). On Qwen3-0.6B, Qwen2.5-0.5B and SmolLM2-135M the
@@ -573,6 +604,7 @@ missing is breadth, and the last 10–20% of single-stream speed.
 | Tool calling, with `tool_choice` and strict schemas | yes, with parsers for many model families | yes, for the families that run here: Qwen and Hermes, Mistral, Llama 3 |
 | Reasoning parsers, thinking budgets | yes, for many families | yes, for `<think>` models (Qwen3, SmolLM3, DeepSeek-R1 and others) |
 | Speculative decoding | yes: EAGLE, MTP, draft models, n-grams | n-grams only, with replies exactly as without it |
+| LoRA adapters | yes, mixed in batches, loaded and unloaded while running | yes, mixed in batches, chosen by `model` or `lora_path`; loaded at start-up only |
 | Architectures | many | Llama-style (Llama, Mistral, Qwen2/3, SmolLM2/3, Phi-3, Granite, Gemma 1–3) and mixtures of experts (Qwen3-MoE, Qwen2-MoE, Mixtral, OLMoE, Granite MoE). **No DeepSeek (MLA), GPT-OSS, hybrid attention models** |
 | Sliding-window attention, logit soft-capping | yes | yes |
 | Embedding models | yes | yes, with last-token pooling |
@@ -580,8 +612,8 @@ missing is breadth, and the last 10–20% of single-stream speed.
 | Multi-GPU, multi-node, router | yes | **no** |
 | The SGL frontend language (`gen`, `select`, `fork`) | yes | **no** |
 
-Biggest gaps first, the plan is: LoRA adapters, DeepSeek's attention (MLA), then draft-model
-speculative decoding.
+Biggest gaps first, the plan is: DeepSeek's attention (MLA), then draft-model speculative
+decoding.
 
 Other limitations: only BPE tokenizers are supported (not SentencePiece Unigram or WordPiece,
 though that covers the Llama family), embeddings only use last-token pooling, and sliding windows

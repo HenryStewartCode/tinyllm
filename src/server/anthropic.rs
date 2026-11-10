@@ -21,6 +21,7 @@ use std::sync::Arc;
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct MessagesRequest {
+    model: Option<String>,
     max_tokens: Option<usize>,
     messages: Vec<Value>,
     system: Option<Value>,
@@ -224,6 +225,7 @@ fn chat_request(request: &MessagesRequest) -> Result<ChatRequest, ApiError> {
             top_p: request.top_p,
             top_k: request.top_k,
             stop: request.stop_sequences.clone().map(OneOrMany::Many),
+            model: request.model.clone(),
             ..Default::default()
         },
         ..Default::default()

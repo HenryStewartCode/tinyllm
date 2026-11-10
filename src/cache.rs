@@ -18,6 +18,9 @@
 //! Slots are handed out in pages. On the CPU a page is one slot, but the GPU's tensor cores work
 //! on 16 tokens at a time, so there a page is 16 consecutive slots holding 16 consecutive tokens,
 //! with token `p` of a sequence always in slot `p % 16` of its page. Only whole pages are shared.
+//!
+//! Tokens computed with a LoRA adapter have different keys and values from the same tokens
+//! without it, so each adapter has a tree of its own: a separate root, in the same pool.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
@@ -74,6 +77,8 @@ struct Node {
 /// not yet shared), or owned by the tree.
 pub struct PrefixCache {
     nodes: Vec<Node>,
+    /// The root of each adapter's tree, after the model's own at `ROOT` (adapter 0).
+    roots: HashMap<u16, NodeId>,
     unused_nodes: Vec<NodeId>,
     free_pages: Vec<u32>,
     /// Slots per page.
@@ -98,6 +103,7 @@ impl PrefixCache {
         };
         Self {
             nodes: vec![root],
+            roots: HashMap::from([(0, ROOT)]),
             unused_nodes: Vec::new(),
             // Reversed, so that the lowest pages are handed out first and the untouched part of
             // the pool stays uncommitted for as long as possible.
@@ -144,9 +150,35 @@ impl PrefixCache {
         self.nodes[node as usize].children.get(page).copied()
     }
 
-    /// How many leading tokens of `tokens` are cached, without changing anything.
-    pub fn match_len(&self, tokens: &[u32]) -> usize {
-        let (mut node, mut pos) = (ROOT, 0);
+    /// The root of `adapter`'s tree, made if it isn't there yet. Roots are the only nodes
+    /// without tokens, and are their own parents.
+    fn root(&mut self, adapter: u16) -> NodeId {
+        if let Some(&root) = self.roots.get(&adapter) {
+            return root;
+        }
+        let id = self.nodes.len() as NodeId;
+        self.nodes.push(Node {
+            tokens: Vec::new(),
+            slots: Vec::new(),
+            parent: id,
+            children: HashMap::new(),
+            pins: 0,
+            last_used: 0,
+        });
+        self.roots.insert(adapter, id);
+        id
+    }
+
+    fn is_root(&self, node: NodeId) -> bool {
+        self.nodes[node as usize].tokens.is_empty()
+    }
+
+    /// How many leading tokens of `tokens` are cached for `adapter`, without changing anything.
+    pub fn match_len(&self, adapter: u16, tokens: &[u32]) -> usize {
+        let Some(&root) = self.roots.get(&adapter) else {
+            return 0;
+        };
+        let (mut node, mut pos) = (root, 0);
         while let Some(child) = self.child_for(node, tokens, pos) {
             let edge = &self.nodes[child as usize].tokens;
             let matched = self.whole_pages(common_prefix(edge, &tokens[pos..]));
@@ -159,11 +191,11 @@ impl PrefixCache {
         pos
     }
 
-    /// Find the longest cached prefix of `tokens`, append its slots to `slots`, and pin it so
-    /// that it stays until [`release`](Self::release).
-    pub fn acquire(&mut self, tokens: &[u32], slots: &mut Vec<u32>) -> NodeId {
+    /// Find the longest prefix of `tokens` cached for `adapter`, append its slots to `slots`, and
+    /// pin it so that it stays until [`release`](Self::release).
+    pub fn acquire(&mut self, adapter: u16, tokens: &[u32], slots: &mut Vec<u32>) -> NodeId {
         self.clock += 1;
-        let (mut node, mut pos) = (ROOT, 0);
+        let (mut node, mut pos) = (self.root(adapter), 0);
         while let Some(child) = self.child_for(node, tokens, pos) {
             let common = common_prefix(&self.nodes[child as usize].tokens, &tokens[pos..]);
             let matched = self.whole_pages(common);
@@ -181,7 +213,7 @@ impl PrefixCache {
     /// Stop holding on to a node returned by `acquire` or `commit`.
     pub fn release(&mut self, node: NodeId) {
         let mut at = node;
-        while at != ROOT {
+        while !self.is_root(at) {
             let n = &mut self.nodes[at as usize];
             debug_assert!(n.pins > 0);
             n.pins -= 1;
@@ -215,12 +247,18 @@ impl PrefixCache {
     /// can use them, and move its pin from `pinned` to the end of them. Where another sequence
     /// got there first, this sequence's duplicate pages are freed and replaced with the shared
     /// ones.
-    pub fn commit(&mut self, pinned: NodeId, tokens: &[u32], slots: &mut [u32]) -> NodeId {
+    pub fn commit(
+        &mut self,
+        adapter: u16,
+        pinned: NodeId,
+        tokens: &[u32],
+        slots: &mut [u32],
+    ) -> NodeId {
         assert_eq!(tokens.len(), slots.len());
         assert!(tokens.len().is_multiple_of(self.page_size));
         let page_size = self.page_size;
         self.clock += 1;
-        let (mut node, mut pos) = (ROOT, 0);
+        let (mut node, mut pos) = (self.root(adapter), 0);
         while let Some(child) = self.child_for(node, tokens, pos) {
             let common = common_prefix(&self.nodes[child as usize].tokens, &tokens[pos..]);
             let matched = self.whole_pages(common);
@@ -256,7 +294,7 @@ impl PrefixCache {
 
     fn pin(&mut self, node: NodeId) {
         let mut at = node;
-        while at != ROOT {
+        while !self.is_root(at) {
             let n = &mut self.nodes[at as usize];
             n.pins += 1;
             at = n.parent;
@@ -315,9 +353,9 @@ impl PrefixCache {
     /// Free up to `wanted` pages, oldest branches first, trimming from the ends of leaves.
     fn evict(&mut self, wanted: usize) {
         let page_size = self.page_size;
-        let is_candidate = |id: usize, n: &Node| {
-            id != ROOT as usize && n.pins == 0 && n.children.is_empty() && !n.tokens.is_empty()
-        };
+        // Roots have no tokens, so they're never candidates.
+        let is_candidate =
+            |_: usize, n: &Node| n.pins == 0 && n.children.is_empty() && !n.tokens.is_empty();
         let mut heap: BinaryHeap<_> = self
             .nodes
             .iter()
@@ -368,10 +406,10 @@ mod tests {
     /// Simulate a sequence computing `tokens`: reuse what's cached, allocate the rest, commit.
     fn run(cache: &mut PrefixCache, tokens: &[u32]) -> (NodeId, Vec<u32>, usize) {
         let mut slots = Vec::new();
-        let pinned = cache.acquire(tokens, &mut slots);
+        let pinned = cache.acquire(0, tokens, &mut slots);
         let hit = slots.len();
         assert!(cache.allocate(tokens.len() - hit, &mut slots));
-        let node = cache.commit(pinned, tokens, &mut slots);
+        let node = cache.commit(0, pinned, tokens, &mut slots);
         (node, slots, hit)
     }
 
@@ -386,9 +424,9 @@ mod tests {
         assert_eq!(slots_a[..3], slots_b[..3]);
         assert_ne!(slots_a[3..], slots_b[3..]);
         cache.release(b);
-        assert_eq!(cache.match_len(&[1, 2, 3, 4, 5, 6]), 5);
-        assert_eq!(cache.match_len(&[1, 2, 3, 9, 7]), 4);
-        assert_eq!(cache.match_len(&[2, 2]), 0);
+        assert_eq!(cache.match_len(0, &[1, 2, 3, 4, 5, 6]), 5);
+        assert_eq!(cache.match_len(0, &[1, 2, 3, 9, 7]), 4);
+        assert_eq!(cache.match_len(0, &[2, 2]), 0);
         assert_eq!(cache.cached(), 7);
     }
 
@@ -408,12 +446,12 @@ mod tests {
         let mut cache = PrefixCache::new(20, 1);
         // Both start before either has committed.
         let (mut s1, mut s2) = (Vec::new(), Vec::new());
-        let p1 = cache.acquire(&[1, 2, 3], &mut s1);
-        let p2 = cache.acquire(&[1, 2, 3, 4], &mut s2);
+        let p1 = cache.acquire(0, &[1, 2, 3], &mut s1);
+        let p2 = cache.acquire(0, &[1, 2, 3, 4], &mut s2);
         assert!(cache.allocate(3, &mut s1));
         assert!(cache.allocate(4, &mut s2));
-        let n1 = cache.commit(p1, &[1, 2, 3], &mut s1);
-        let n2 = cache.commit(p2, &[1, 2, 3, 4], &mut s2);
+        let n1 = cache.commit(0, p1, &[1, 2, 3], &mut s1);
+        let n2 = cache.commit(0, p2, &[1, 2, 3, 4], &mut s2);
         assert_eq!(
             s1[..3],
             s2[..3],
@@ -437,8 +475,8 @@ mod tests {
         // Refresh nothing; ask for almost everything. Only `a` can go.
         let mut slots = Vec::new();
         assert!(cache.allocate(10 + MIN_EVICTION / 2, &mut slots));
-        assert_eq!(cache.match_len(&long_a), 0);
-        assert_eq!(cache.match_len(&long_b), long_b.len());
+        assert_eq!(cache.match_len(0, &long_a), 0);
+        assert_eq!(cache.match_len(0, &long_b), long_b.len());
         // More than what's left can't be satisfied, and nothing is taken.
         let free_before = cache.free_pages.len();
         assert!(!cache.allocate(1, &mut Vec::new()));
@@ -453,7 +491,7 @@ mod tests {
         let (a, _, _) = run(&mut cache, &tokens);
         cache.release(a);
         assert!(cache.allocate(MIN_EVICTION, &mut Vec::new()));
-        assert_eq!(cache.match_len(&tokens), 10);
+        assert_eq!(cache.match_len(0, &tokens), 10);
     }
 
     #[test]
@@ -472,7 +510,7 @@ mod tests {
     fn run_paged(cache: &mut PrefixCache, tokens: &[u32]) -> (NodeId, Vec<u32>, usize) {
         let page = cache.page_size();
         let mut slots = Vec::new();
-        let pinned = cache.acquire(tokens, &mut slots);
+        let pinned = cache.acquire(0, tokens, &mut slots);
         let hit = slots.len();
         let new_tokens = tokens.len() - hit;
         let mut pages = Vec::new();
@@ -481,7 +519,7 @@ mod tests {
             slots.push(pages[i / page] * page as u32 + (position % page) as u32);
         }
         let whole = tokens.len() - tokens.len() % page;
-        let node = cache.commit(pinned, &tokens[..whole], &mut slots[..whole]);
+        let node = cache.commit(0, pinned, &tokens[..whole], &mut slots[..whole]);
         if !tokens.len().is_multiple_of(page) {
             cache.free_page(pages[pages.len() - 1]);
         }
@@ -496,7 +534,7 @@ mod tests {
         assert_eq!(hit, 0);
         cache.release(a);
         // 32 of the 40 tokens are whole pages; the last 8 were never committed.
-        assert_eq!(cache.match_len(&first), 32);
+        assert_eq!(cache.match_len(0, &first), 32);
         assert_eq!(cache.cached(), 32);
         assert_eq!(slots_a[..16], (0..16).collect::<Vec<u32>>()[..]);
         assert_eq!(
@@ -508,7 +546,7 @@ mod tests {
         // Shares 23 tokens with `first`, but only the 16 of a whole page can be reused.
         let mut second = first[..23].to_vec();
         second.extend([900, 901, 902, 903]);
-        assert_eq!(cache.match_len(&second), 16);
+        assert_eq!(cache.match_len(0, &second), 16);
         let (b, slots_b, hit) = run_paged(&mut cache, &second);
         assert_eq!(hit, 16);
         assert_eq!(slots_a[..16], slots_b[..16]);
@@ -531,12 +569,12 @@ mod tests {
         // from the end of the branch.
         let mut pages = Vec::new();
         assert!(cache.allocate(2, &mut pages));
-        assert_eq!(cache.match_len(&tokens), 112 - 4 * 16);
+        assert_eq!(cache.match_len(0, &tokens), 112 - 4 * 16);
         assert_eq!(cache.cached(), 112 - 4 * 16);
         // Everything is pinned or held now except the rest of the branch.
         assert!(!cache.allocate(7, &mut pages), "only 6 pages are left");
         assert!(cache.allocate(6, &mut pages));
-        assert_eq!(cache.match_len(&tokens), 0);
+        assert_eq!(cache.match_len(0, &tokens), 0);
     }
 
     #[test]
@@ -552,8 +590,8 @@ mod tests {
         assert_eq!(hit, 0, "no whole page in common");
         cache.release(b);
         // Both branches are still there, on different pages, and evicting frees each page once.
-        assert_eq!(cache.match_len(&first), 32);
-        assert_eq!(cache.match_len(&second), 32);
+        assert_eq!(cache.match_len(0, &first), 32);
+        assert_eq!(cache.match_len(0, &second), 32);
         assert_eq!(cache.available(), 16 * 16);
         cache.clear();
         assert_eq!(cache.cached(), 0);
@@ -563,5 +601,39 @@ mod tests {
         pages.dedup();
         assert_eq!(pages.len(), 16, "every page comes back exactly once");
         assert!(slots_b.len() == 32);
+    }
+
+    #[test]
+    fn adapters_have_trees_of_their_own() {
+        let mut cache = PrefixCache::new(64, 1);
+        let tokens = [1, 2, 3, 4];
+        let (mut base_slots, mut adapter_slots) = (Vec::new(), Vec::new());
+        let pinned = cache.acquire(0, &tokens, &mut base_slots);
+        assert!(cache.allocate(4, &mut base_slots));
+        let base = cache.commit(0, pinned, &tokens, &mut base_slots);
+        assert_eq!(cache.match_len(0, &tokens), 4);
+        assert_eq!(
+            cache.match_len(1, &tokens),
+            0,
+            "the adapter can't use the model's tokens"
+        );
+        let pinned = cache.acquire(1, &tokens, &mut adapter_slots);
+        assert!(adapter_slots.is_empty());
+        assert!(cache.allocate(4, &mut adapter_slots));
+        let adapter = cache.commit(1, pinned, &tokens, &mut adapter_slots);
+        assert_eq!(cache.match_len(1, &tokens), 4);
+        assert_ne!(base_slots, adapter_slots);
+        cache.release(base);
+        cache.release(adapter);
+        // Both can be evicted, and the roots survive it.
+        cache.clear();
+        assert_eq!(cache.cached(), 0);
+        assert_eq!(cache.match_len(1, &tokens), 0);
+        let mut slots = Vec::new();
+        let pinned = cache.acquire(1, &[5, 6], &mut slots);
+        assert!(cache.allocate(2, &mut slots));
+        let node = cache.commit(1, pinned, &[5, 6], &mut slots);
+        cache.release(node);
+        assert_eq!(cache.match_len(1, &[5, 6]), 2);
     }
 }

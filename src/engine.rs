@@ -84,6 +84,9 @@ pub struct GenerateParams {
     /// Instead of generating, send the final hidden state of the prompt's last token (see
     /// [`Event::Embedding`]), as embedding models with last-token pooling use it.
     pub embed: bool,
+    /// The LoRA adapter to run the model with (see [`crate::lora`]): 0 for none, or the number
+    /// it was loaded as.
+    pub adapter: u16,
 }
 
 /// How a reply thinks out loud before it answers (see [`crate::reasoning`]). While it thinks,
@@ -133,6 +136,7 @@ impl Default for GenerateParams {
             ignore_eos: false,
             skip_special_tokens: true,
             strip_leading_space: false,
+            adapter: 0,
             logprobs: None,
             grammar: None,
             grammar_triggers: Vec::new(),
@@ -599,6 +603,7 @@ impl Engine {
                 let all_logits = seq.needs_all_logits();
                 let generated = seq.generated + pos.saturating_sub(first_scored);
                 rows.push(Row {
+                    adapter: seq.params.adapter,
                     token: seq.tokens[pos],
                     slots: &seq.slots[..=pos],
                     want_logits,
@@ -658,12 +663,14 @@ impl Engine {
             let seq = &self.waiting[i];
             // The last token is always run, so that there are logits to sample from.
             let cacheable = seq.tokens.len() - 1;
-            let cached = self.cache.match_len(&seq.tokens[..cacheable]);
+            let adapter = seq.params.adapter;
+            let cached = self.cache.match_len(adapter, &seq.tokens[..cacheable]);
 
             // If a prompt in progress shares a long beginning with this one, wait for it to
             // finish and reuse its work, instead of computing the same thing twice.
             let wait = self.active.iter().any(|other| {
                 other.is_prefilling()
+                    && other.params.adapter == adapter
                     && common_prefix_len(&other.tokens, &seq.tokens) >= cached + MIN_SHARED_PREFIX
             });
             if wait {
@@ -678,7 +685,9 @@ impl Engine {
                 break; // out of memory for now, and it's first come, first served
             }
             let mut seq = self.waiting.remove(i).expect("index is in range");
-            let pinned = self.cache.acquire(&seq.tokens[..cacheable], &mut seq.slots);
+            let pinned = self
+                .cache
+                .acquire(adapter, &seq.tokens[..cacheable], &mut seq.slots);
             seq.pinned = Some(pinned);
             if seq.cached_tokens.is_none() {
                 seq.cached_tokens = Some(seq.slots.len());
@@ -1062,7 +1071,13 @@ impl Engine {
     fn commit_into(cache: &mut PrefixCache, seq: &mut Sequence) {
         if let Some(pinned) = seq.pinned {
             let whole = seq.slots.len() - seq.slots.len() % cache.page_size();
-            seq.pinned = Some(cache.commit(pinned, &seq.tokens[..whole], &mut seq.slots[..whole]));
+            let adapter = seq.params.adapter;
+            seq.pinned = Some(cache.commit(
+                adapter,
+                pinned,
+                &seq.tokens[..whole],
+                &mut seq.slots[..whole],
+            ));
         }
     }
 }

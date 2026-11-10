@@ -25,6 +25,7 @@
 //! | [`pool`]        | fork-join thread pool for very short parallel sections             |
 //! | [`sampler`]     | temperature, top-k, top-p, min-p, penalties                        |
 //! | [`speculative`] | guessing tokens ahead and checking them together                   |
+//! | [`lora`]        | LoRA adapters that requests can choose between                     |
 //! | [`chat`]        | runs each model's Jinja chat template                              |
 //! | [`reasoning`]   | separates a reasoning model's thinking from its answer             |
 //! | [`tools`]       | tool calling: what to show the model, and reading its calls        |
@@ -39,6 +40,7 @@ pub mod config;
 pub mod cuda;
 pub mod engine;
 pub mod grammar;
+pub mod lora;
 #[cfg_attr(not(target_os = "macos"), path = "metal/unsupported.rs")]
 pub mod metal;
 pub mod model;
