@@ -1821,8 +1821,10 @@ async fn metrics(State(app): State<Arc<App>>) -> Response {
         ),
     ];
     let mut out = format!(
-        "# HELP tinyllm_step_seconds_total Time spent running batches\n# TYPE tinyllm_step_seconds_total counter\ntinyllm_step_seconds_total {}\n",
-        stats.step_micros.load(Relaxed) as f64 / 1e6
+        "# HELP tinyllm_step_seconds_total Time spent running batches\n# TYPE tinyllm_step_seconds_total counter\ntinyllm_step_seconds_total {}\n\
+         # HELP tinyllm_forward_seconds_total The part of that spent in the model's forward pass\n# TYPE tinyllm_forward_seconds_total counter\ntinyllm_forward_seconds_total {}\n",
+        stats.step_micros.load(Relaxed) as f64 / 1e6,
+        stats.forward_micros.load(Relaxed) as f64 / 1e6
     );
     for (kind, name, help, value) in lines {
         out.push_str(&format!(

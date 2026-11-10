@@ -553,6 +553,7 @@ missing is breadth, and the last 10–20% of single-stream speed.
 | Prometheus metrics | yes | yes |
 | GPU execution | yes | **one NVIDIA GPU**, or an Apple GPU through Metal; no AMD. Slightly slower for one stream, faster under load: see [Performance](#performance) |
 | Reusable compiled batches (CUDA graphs) | yes | yes, for batches of up to 64 |
+| Scheduling overlapped with the GPU's work | yes | not needed so far: scheduling, sampling and streaming take 0–3% of each step with up to 256 requests at once (Qwen2.5-0.5B on the RTX 2000 Ada), and the GPU is busy 96% of the time. `/metrics` shows the split as `tinyllm_forward_seconds_total` |
 | Quantized weights | yes: FP8, INT8, AWQ, GPTQ, GGUF, bitsandbytes, MXFP4 and more | FP8 checkpoints and 8-bit integers on the GPU; bfloat16 weights stay 16-bit on the CPU. **No 4-bit, AWQ, GPTQ or GGUF** |
 | Tool calling, with `tool_choice` and strict schemas | yes, with parsers for many model families | yes, for the families that run here: Qwen and Hermes, Mistral, Llama 3 |
 | Reasoning parsers, thinking budgets | yes, for many families | yes, for `<think>` models (Qwen3, SmolLM3, DeepSeek-R1 and others) |
@@ -564,8 +565,8 @@ missing is breadth, and the last 10–20% of single-stream speed.
 | Multi-GPU, multi-node, router | yes | **no** |
 | The SGL frontend language (`gen`, `select`, `fork`) | yes | **no** |
 
-Biggest gaps first, the plan is: overlapping CPU scheduling with GPU work, LoRA adapters, 4-bit
-weights (AWQ/GPTQ), DeepSeek's attention (MLA), then draft-model speculative decoding.
+Biggest gaps first, the plan is: 4-bit weights (AWQ/GPTQ), LoRA adapters, DeepSeek's attention
+(MLA), then draft-model speculative decoding.
 
 Other limitations: only BPE tokenizers are supported (not SentencePiece Unigram or WordPiece,
 though that covers the Llama family), embeddings only use last-token pooling, and sliding windows

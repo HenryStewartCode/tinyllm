@@ -216,6 +216,9 @@ pub struct Stats {
     pub generated_tokens: AtomicU64,
     pub steps: AtomicU64,
     pub step_micros: AtomicU64,
+    /// The part of `step_micros` spent in the backend's forward pass; the rest is the CPU's
+    /// scheduling, sampling and streaming.
+    pub forward_micros: AtomicU64,
     pub rows: AtomicU64,
     pub running: AtomicU64,
     pub waiting: AtomicU64,
@@ -607,7 +610,11 @@ impl Engine {
                 });
             }
         }
+        let forward_start = Instant::now();
         self.backend.forward(&rows);
+        self.stats
+            .forward_micros
+            .fetch_add(forward_start.elapsed().as_micros() as u64, Relaxed);
         let row_count = rows.len();
         drop(rows);
 
