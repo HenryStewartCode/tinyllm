@@ -181,6 +181,8 @@ pub enum Event {
     Done {
         reason: FinishReason,
         usage: Usage,
+        /// The stop string that ended the reply, if one did.
+        stop_string: Option<String>,
     },
     Error(String),
 }
@@ -844,6 +846,7 @@ impl Engine {
         let _ = seq.events.send(Event::Done {
             reason,
             usage: seq.usage(),
+            stop_string: seq.text.matched.take(),
         });
         self.retire(seq);
     }
@@ -952,6 +955,8 @@ struct TextStream {
     strip: usize,
     /// Everything has been decided; ignore further input.
     stopped: bool,
+    /// The stop string that was found.
+    matched: Option<String>,
 }
 
 impl TextStream {
@@ -962,6 +967,7 @@ impl TextStream {
             stops,
             strip,
             stopped: false,
+            matched: None,
         }
     }
 
@@ -1023,13 +1029,14 @@ impl TextStream {
             }
         }
         self.held.push_str(&decoded);
-        if let Some(at) = self
+        let found = self
             .stops
             .iter()
-            .filter_map(|s| self.held.find(s.as_str()))
-            .min()
-        {
+            .filter_map(|stop| self.held.find(stop.as_str()).map(|at| (at, stop)))
+            .min_by_key(|&(at, _)| at);
+        if let Some((at, stop)) = found {
             self.stopped = true;
+            self.matched = Some(stop.clone());
             self.held.truncate(at);
             return (std::mem::take(&mut self.held), true);
         }
@@ -1117,6 +1124,7 @@ mod tests {
     fn earliest_stop_string_wins() {
         let mut s = stream(&["bb", "a"]);
         assert_eq!(s.push(b"xxbbyya"), ("xx".to_string(), true));
+        assert_eq!(s.matched.as_deref(), Some("bb"));
     }
 
     #[test]

@@ -327,6 +327,8 @@ fn main() -> Result<()> {
                 vocab_size: config.vocab_size,
                 tool_format,
                 reasoning,
+                model_type: config.model_type.clone(),
+                num_params,
             },
             &format!("{}:{}", args.host, args.port),
         );

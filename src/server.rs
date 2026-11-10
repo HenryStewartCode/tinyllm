@@ -7,7 +7,7 @@ use crate::engine::{
     TokenLogprob, Usage,
 };
 use crate::grammar::{Grammar, Vocabulary};
-use crate::reasoning::{self, Piece, ReasoningFormat, ReasoningParser};
+use crate::reasoning::{Piece, ReasoningFormat, ReasoningParser};
 use crate::sampler::SamplingParams;
 use crate::tokenizer::Tokenizer;
 use crate::tools::{self, ToolFormat, ToolOptions, ToolOutput, ToolParser, ToolReading};
@@ -31,6 +31,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Instant, SystemTime};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tower_http::cors::CorsLayer;
+
+mod anthropic;
+mod ollama;
 
 /// Largest request body accepted, which is what limits prompt size in practice.
 const MAX_BODY_BYTES: usize = 64 << 20;
@@ -73,6 +76,9 @@ pub struct Server {
     pub tool_format: Option<ToolFormat>,
     /// How the model marks its thinking, if it's a reasoning model.
     pub reasoning: Option<ReasoningFormat>,
+    /// The model's architecture, as `config.json` names it.
+    pub model_type: String,
+    pub num_params: usize,
 }
 
 struct App {
@@ -102,6 +108,15 @@ pub fn serve(server: Server, address: &str) -> Result<()> {
         .route("/v1/completions", post(completions))
         .route("/v1/models", get(models))
         .route("/generate", post(generate))
+        .route("/v1/messages", post(anthropic::messages))
+        .route("/v1/messages/count_tokens", post(anthropic::count_tokens))
+        .route("/api/chat", post(ollama::chat))
+        .route("/api/generate", post(ollama::generate))
+        .route("/api/tags", get(ollama::tags))
+        .route("/api/show", post(ollama::show))
+        .route("/api/ps", get(ollama::ps))
+        .route("/api/version", get(ollama::version))
+        .route("/", get(|| async { "tinyllm is running" }))
         .route("/health", get(|| async { StatusCode::OK }))
         .route("/metrics", get(metrics))
         .route("/get_model_info", get(model_info))
@@ -254,6 +269,7 @@ struct StreamOptions {
     include_usage: bool,
 }
 
+/// A chat request in OpenAI's format, which the other chat APIs are translated into.
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct ChatRequest {
@@ -634,6 +650,7 @@ struct Collected {
     text: String,
     logprobs: Vec<TokenLogprob>,
     finish: Option<FinishReason>,
+    stop_string: Option<String>,
 }
 
 /// Wait for every generation to finish.
@@ -655,8 +672,13 @@ async fn collect(
                 results[index].text.push_str(&text);
                 results[index].logprobs.extend(logprobs);
             }
-            Event::Done { reason, usage: u } => {
+            Event::Done {
+                reason,
+                usage: u,
+                stop_string,
+            } => {
                 results[index].finish = Some(reason);
+                results[index].stop_string = stop_string;
                 usage.add(index, &u);
             }
             Event::Error(message) => return Err(ApiError::invalid(message)),
@@ -783,103 +805,120 @@ impl ChunkFormat {
     }
 }
 
+/// What a chat reply is made of, as it streams.
+#[derive(Debug)]
+enum ReplyPart {
+    /// More of a reasoning model's thinking.
+    Reasoning(String),
+    /// More of the answer.
+    Content(String),
+    /// A tool call begins.
+    Call { index: usize, name: String },
+    /// More of a tool call's arguments, as JSON text.
+    Arguments { index: usize, text: String },
+}
+
+impl From<ToolOutput> for ReplyPart {
+    fn from(output: ToolOutput) -> Self {
+        match output {
+            ToolOutput::Content(text) => ReplyPart::Content(text),
+            ToolOutput::Call { index, name } => ReplyPart::Call { index, name },
+            ToolOutput::Arguments { index, text } => ReplyPart::Arguments { index, text },
+        }
+    }
+}
+
+/// How to read a chat reply: where its thinking is, and whether it may call tools.
+#[derive(Clone, Default)]
+struct ReplyReading {
+    tools: Option<ToolReading>,
+    /// The model's reasoning format, and whether the prompt opened a block of thinking.
+    thinking: Option<(ReasoningFormat, bool)>,
+}
+
+impl ReplyReading {
+    /// Whether replies are plain text, with nothing to pick out of them.
+    fn is_plain(&self) -> bool {
+        self.tools.is_none() && self.thinking.is_none()
+    }
+
+    fn tool_format(&self) -> Option<ToolFormat> {
+        self.tools.as_ref().map(|tools| tools.format)
+    }
+
+    fn reader(&self) -> ChoiceReader {
+        ChoiceReader {
+            thinking: self
+                .thinking
+                .as_ref()
+                .map(|(format, open)| ReasoningParser::new(format.clone(), *open)),
+            calls: self.tools.as_ref().map(ToolReading::parser),
+        }
+    }
+
+    /// Read a whole reply at once.
+    fn read_all(&self, text: &str) -> Reply {
+        let mut reader = self.reader();
+        let mut parts = reader.read(Some(text));
+        parts.extend(reader.read(None));
+        let mut reply = Reply::default();
+        for part in parts {
+            match part {
+                ReplyPart::Reasoning(text) => reply.reasoning.push_str(&text),
+                ReplyPart::Content(text) => reply.content.push_str(&text),
+                ReplyPart::Call { name, .. } => reply.calls.push((name, String::new())),
+                ReplyPart::Arguments { index, text } => reply.calls[index].1.push_str(&text),
+            }
+        }
+        reply
+    }
+}
+
+/// A whole chat reply, taken apart.
+#[derive(Default)]
+struct Reply {
+    reasoning: String,
+    content: String,
+    /// Each tool call's name and arguments (as JSON text).
+    calls: Vec<(String, String)>,
+}
+
 /// Reads one chat choice as it streams: its thinking, if it's a reasoning model, and its tool
 /// calls, if it might make any.
 struct ChoiceReader {
     thinking: Option<ReasoningParser>,
-    calls: Option<(ToolParser, ToolFormat)>,
-    /// Logprobs for text that hasn't been sent on yet. Tokens don't line up with what gets
-    /// sent, so they go with the next chunk out.
-    logprobs: Vec<TokenLogprob>,
+    calls: Option<ToolParser>,
 }
 
 impl ChoiceReader {
-    fn take_logprobs(&mut self, app: &App, want_logprobs: bool) -> Value {
-        match want_logprobs {
-            true => app.chat_logprobs(&std::mem::take(&mut self.logprobs)),
-            false => Value::Null,
-        }
-    }
-
-    /// Read more of the reply, adding stream chunks to `out`. `None` means it's finished.
-    fn read(
-        &mut self,
-        text: Option<&str>,
-        index: usize,
-        app: &App,
-        format: &ChunkFormat,
-        want_logprobs: bool,
-        out: &mut Vec<Result<Bytes, Infallible>>,
-    ) {
+    /// Read more of the reply. `None` means it's finished.
+    fn read(&mut self, text: Option<&str>) -> Vec<ReplyPart> {
         let pieces = match (&mut self.thinking, text) {
             (Some(thinking), Some(text)) => thinking.push(text),
             (Some(thinking), None) => thinking.finish(),
             (None, Some(text)) => vec![Piece::Content(text.to_string())],
             (None, None) => Vec::new(),
         };
+        let mut parts = Vec::new();
         for piece in pieces {
-            match piece {
-                Piece::Reasoning(text) => {
-                    let logprobs = self.take_logprobs(app, want_logprobs);
-                    out.push(sse(&format.reasoning_delta(index, &text, logprobs)));
+            match (piece, &mut self.calls) {
+                (Piece::Reasoning(text), _) => parts.push(ReplyPart::Reasoning(text)),
+                (Piece::Content(text), Some(parser)) => {
+                    parts.extend(parser.push(&text).into_iter().map(ReplyPart::from));
                 }
-                Piece::Content(text) => match &mut self.calls {
-                    Some((parser, _)) => {
-                        let outputs = parser.push(&text);
-                        self.send(outputs, index, app, format, want_logprobs, out);
-                    }
-                    None => {
-                        let logprobs = self.take_logprobs(app, want_logprobs);
-                        out.push(sse(&format.delta(index, &text, logprobs)));
-                    }
-                },
+                (Piece::Content(text), None) => parts.push(ReplyPart::Content(text)),
             }
         }
         if text.is_none()
-            && let Some((parser, _)) = &mut self.calls
+            && let Some(parser) = &mut self.calls
         {
-            let outputs = parser.finish();
-            self.send(outputs, index, app, format, want_logprobs, out);
+            parts.extend(parser.finish().into_iter().map(ReplyPart::from));
         }
+        parts
     }
 
     fn calls_made(&self) -> usize {
-        self.calls.as_ref().map_or(0, |(parser, _)| parser.calls())
-    }
-
-    /// Turn what the tool parser found into stream chunks.
-    fn send(
-        &mut self,
-        outputs: Vec<ToolOutput>,
-        index: usize,
-        app: &App,
-        format: &ChunkFormat,
-        want_logprobs: bool,
-        out: &mut Vec<Result<Bytes, Infallible>>,
-    ) {
-        let tool_format = self.calls.as_ref().expect("only called for tools").1;
-        for output in outputs {
-            let logprobs = self.take_logprobs(app, want_logprobs);
-            let chunk = match output {
-                ToolOutput::Content(text) => format.delta(index, &text, logprobs),
-                ToolOutput::Call { index: call, name } => format.call_delta(
-                    index,
-                    json!({
-                        "index": call,
-                        "id": app.call_id(tool_format),
-                        "type": "function",
-                        "function": { "name": name, "arguments": "" },
-                    }),
-                    logprobs,
-                ),
-                ToolOutput::Arguments { index: call, text } => format.call_delta(
-                    index,
-                    json!({ "index": call, "function": { "arguments": text } }),
-                    logprobs,
-                ),
-            };
-            out.push(sse(&chunk));
-        }
+        self.calls.as_ref().map_or(0, ToolParser::calls)
     }
 }
 
@@ -892,10 +931,37 @@ struct StreamJob {
     choices_per_prompt: usize,
     /// Text to send first on each choice (`echo`).
     prefixes: Vec<String>,
-    /// How to read tool calls out of each choice, if they should be.
-    tool_reading: Option<ToolReading>,
-    /// How to separate each choice's thinking, if it should be, and whether the prompt opened it.
-    thinking: Option<(ReasoningFormat, bool)>,
+    /// What to pick out of each chat choice.
+    reading: ReplyReading,
+}
+
+/// A piece of a chat reply as an OpenAI stream chunk.
+fn part_chunk(
+    app: &App,
+    format: &ChunkFormat,
+    index: usize,
+    part: ReplyPart,
+    logprobs: Value,
+    tool_format: Option<ToolFormat>,
+) -> Value {
+    match part {
+        ReplyPart::Reasoning(text) => format.reasoning_delta(index, &text, logprobs),
+        ReplyPart::Content(text) => format.delta(index, &text, logprobs),
+        ReplyPart::Call { index: call, name } => {
+            let id = app.call_id(tool_format.expect("calls are only read with a format"));
+            let call = json!({
+                "index": call,
+                "id": id,
+                "type": "function",
+                "function": { "name": name, "arguments": "" },
+            });
+            format.call_delta(index, call, logprobs)
+        }
+        ReplyPart::Arguments { index: call, text } => {
+            let call = json!({ "index": call, "function": { "arguments": text } });
+            format.call_delta(index, call, logprobs)
+        }
+    }
 }
 
 fn stream_events(job: StreamJob) -> impl Stream<Item = Result<Bytes, Infallible>> + Send + 'static {
@@ -907,24 +973,18 @@ fn stream_events(job: StreamJob) -> impl Stream<Item = Result<Bytes, Infallible>
         want_logprobs,
         choices_per_prompt,
         prefixes,
-        tool_reading,
-        thinking,
+        reading,
     } = job;
     let mut remaining = receivers.len();
     let mut usage = UsageTotal::new(choices_per_prompt);
-    let mut readers: Vec<ChoiceReader> = match (&tool_reading, &thinking) {
-        (None, None) => Vec::new(),
-        _ => receivers
+    let tool_format = reading.tool_format();
+    // Each chat choice's reader, and logprobs for text it hasn't let go of yet: tokens don't line
+    // up with what gets sent, so they go with the next chunk out.
+    let mut readers: Vec<(ChoiceReader, Vec<TokenLogprob>)> = match reading.is_plain() {
+        true => Vec::new(),
+        false => receivers
             .iter()
-            .map(|_| ChoiceReader {
-                thinking: thinking
-                    .as_ref()
-                    .map(|(format, open)| ReasoningParser::new(format.clone(), *open)),
-                calls: tool_reading
-                    .as_ref()
-                    .map(|reading| (reading.parser(), reading.format)),
-                logprobs: Vec::new(),
-            })
+            .map(|_| (reading.reader(), Vec::new()))
             .collect(),
     };
 
@@ -952,11 +1012,29 @@ fn stream_events(job: StreamJob) -> impl Stream<Item = Result<Bytes, Infallible>
 
     let events = merge(receivers).flat_map(move |(index, event)| {
         let mut out = Vec::new();
+        let send_parts = |reader: &mut (ChoiceReader, Vec<TokenLogprob>),
+                          text: Option<&str>,
+                          out: &mut Vec<Result<Bytes, Infallible>>| {
+            for part in reader.0.read(text) {
+                let logprobs = match want_logprobs {
+                    true => app.chat_logprobs(&std::mem::take(&mut reader.1)),
+                    false => Value::Null,
+                };
+                out.push(sse(&part_chunk(
+                    &app,
+                    &format,
+                    index,
+                    part,
+                    logprobs,
+                    tool_format,
+                )));
+            }
+        };
         match event {
             Event::Text { text, logprobs } => {
                 if let Some(reader) = readers.get_mut(index) {
-                    reader.logprobs.extend(logprobs);
-                    reader.read(Some(&text), index, &app, &format, want_logprobs, &mut out);
+                    reader.1.extend(logprobs);
+                    send_parts(reader, Some(&text), &mut out);
                 } else {
                     let logprobs = match (want_logprobs, format.is_chat) {
                         (false, _) => Value::Null,
@@ -966,12 +1044,14 @@ fn stream_events(job: StreamJob) -> impl Stream<Item = Result<Bytes, Infallible>
                     out.push(sse(&format.delta(index, &text, logprobs)));
                 }
             }
-            Event::Done { reason, usage: u } => {
+            Event::Done {
+                reason, usage: u, ..
+            } => {
                 usage.add(index, &u);
                 let reason = match readers.get_mut(index) {
                     Some(reader) => {
-                        reader.read(None, index, &app, &format, want_logprobs, &mut out);
-                        chat_finish_reason(reason, reader.calls_made())
+                        send_parts(reader, None, &mut out);
+                        chat_finish_reason(reason, reader.0.calls_made())
                     }
                     None => finish_reason(reason),
                 };
@@ -1001,15 +1081,52 @@ fn stream_events(job: StreamJob) -> impl Stream<Item = Result<Bytes, Infallible>
 // Endpoints
 // ---------------------------------------------------------------------------------------------
 
-async fn chat_completions(State(app): State<Arc<App>>, body: Bytes) -> Result<Response, ApiError> {
-    let request: ChatRequest = parse_body(&body)?;
+/// A chat request that's been started.
+struct ChatJob {
+    receivers: Vec<(usize, UnboundedReceiver<Event>)>,
+    /// What to pick out of the replies.
+    reading: ReplyReading,
+    n: usize,
+    prompt_tokens: usize,
+}
+
+/// A chat request, laid out and ready to start.
+struct ChatPrompt {
+    tokens: Vec<u32>,
+    params: GenerateParams,
+    reading: ReplyReading,
+}
+
+/// Lay out a conversation with the model's template and start generating replies. Every API
+/// that chats comes through here.
+fn start_chat(app: &App, request: &ChatRequest) -> Result<ChatJob, ApiError> {
+    let ChatPrompt {
+        tokens,
+        params,
+        reading,
+    } = prepare_chat(app, request)?;
+    let n = request.sampling.n.unwrap_or(1);
+    let receivers = app
+        .start(&tokens, &params, n)
+        .into_iter()
+        .enumerate()
+        .collect();
+    Ok(ChatJob {
+        receivers,
+        reading,
+        n,
+        prompt_tokens: tokens.len(),
+    })
+}
+
+/// Lay out a conversation and work out how to generate and read the reply.
+fn prepare_chat(app: &App, request: &ChatRequest) -> Result<ChatPrompt, ApiError> {
     let template = app.server.template.as_ref().ok_or_else(|| {
         ApiError::invalid("this model has no chat template; use /v1/completions instead")
     })?;
     if request.messages.is_empty() {
         return Err(ApiError::invalid("messages must not be empty"));
     }
-    let n = request.sampling.n.unwrap_or(1);
     // Some templates only understand plain strings, so a text-only list of parts is joined.
     let mut messages: Vec<Value> = request.messages.iter().map(flatten_content).collect();
     tools::prepare_messages(&mut messages).map_err(ApiError::invalid)?;
@@ -1049,6 +1166,9 @@ async fn chat_completions(State(app): State<Arc<App>>, body: Bytes) -> Result<Re
         Ok((tokens, params))
     })?;
     params.strip_leading_space = true;
+    if request.logprobs {
+        params.logprobs = Some(request.top_logprobs.unwrap_or(0));
+    }
     // Where to put a reasoning model's thinking, and whether the prompt has already started it.
     let thinking = match (&app.server.reasoning, &params.thinking) {
         (Some(format), Some(thinking)) if request.separate_reasoning.unwrap_or(true) => {
@@ -1056,15 +1176,19 @@ async fn chat_completions(State(app): State<Arc<App>>, body: Bytes) -> Result<Re
         }
         _ => None,
     };
-    if request.logprobs {
-        params.logprobs = Some(request.top_logprobs.unwrap_or(0));
-    }
-    let receivers: Vec<_> = app
-        .start(&tokens, &params, n)
-        .into_iter()
-        .enumerate()
-        .collect();
+    Ok(ChatPrompt {
+        tokens,
+        params,
+        reading: ReplyReading {
+            tools: tool_reading,
+            thinking,
+        },
+    })
+}
 
+async fn chat_completions(State(app): State<Arc<App>>, body: Bytes) -> Result<Response, ApiError> {
+    let request: ChatRequest = parse_body(&body)?;
+    let job = start_chat(&app, &request)?;
     let format = ChunkFormat {
         is_chat: true,
         id: app.next_id("chatcmpl"),
@@ -1075,34 +1199,27 @@ async fn chat_completions(State(app): State<Arc<App>>, body: Bytes) -> Result<Re
         return Ok(sse_response(stream_events(StreamJob {
             app: app.clone(),
             format,
-            receivers,
+            receivers: job.receivers,
             include_usage: request.stream_options.include_usage,
             want_logprobs: request.logprobs,
-            choices_per_prompt: n,
+            choices_per_prompt: job.n,
             prefixes: Vec::new(),
-            tool_reading,
-            thinking,
+            reading: job.reading,
         })));
     }
 
-    let (results, usage) = collect(receivers, n).await?;
+    let (results, usage) = collect(job.receivers, job.n).await?;
     let choices: Vec<Value> = results
         .iter()
         .enumerate()
         .map(|(index, result)| {
-            let (reasoning, text) = match &thinking {
-                Some((format, open)) => reasoning::split(format, *open, &result.text),
-                None => (String::new(), result.text.clone()),
-            };
-            let (mut message, calls) = assistant_message(&app, &text, tool_reading.as_ref());
-            if !reasoning.is_empty() {
-                message["reasoning_content"] = reasoning.into();
-            }
+            let reply = job.reading.read_all(&result.text);
             json!({
                 "index": index,
-                "message": message,
+                "message": openai_message(&app, &reply, job.reading.tool_format()),
                 "logprobs": if request.logprobs { app.chat_logprobs(&result.logprobs) } else { Value::Null },
-                "finish_reason": result.finish.map(|reason| chat_finish_reason(reason, calls)),
+                "finish_reason": result.finish.map(|reason| chat_finish_reason(reason, reply.calls.len())),
+                "matched_stop": result.stop_string,
             })
         })
         .collect();
@@ -1119,39 +1236,30 @@ async fn chat_completions(State(app): State<Arc<App>>, body: Bytes) -> Result<Re
     ))
 }
 
-/// A finished reply as a message, and how many tool calls it has.
-fn assistant_message(app: &App, text: &str, reading: Option<&ToolReading>) -> (Value, usize) {
-    let Some(reading) = reading else {
-        return (json!({ "role": "assistant", "content": text }), 0);
-    };
-    let mut parser = reading.parser();
-    let mut outputs = parser.push(text);
-    outputs.extend(parser.finish());
-
-    let mut content = String::new();
-    let mut calls: Vec<Value> = Vec::new();
-    for output in outputs {
-        match output {
-            ToolOutput::Content(text) => content.push_str(&text),
-            ToolOutput::Call { name, .. } => calls.push(json!({
-                "id": app.call_id(reading.format),
-                "type": "function",
-                "function": { "name": name, "arguments": "" },
-            })),
-            ToolOutput::Arguments { index, text } => {
-                let arguments = &mut calls[index]["function"]["arguments"];
-                let so_far = arguments.as_str().expect("set above").to_string();
-                *arguments = (so_far + &text).into();
-            }
+/// A finished reply as an OpenAI message.
+fn openai_message(app: &App, reply: &Reply, tool_format: Option<ToolFormat>) -> Value {
+    let mut message = json!({ "role": "assistant", "content": reply.content });
+    if let Some(format) = tool_format.filter(|_| !reply.calls.is_empty()) {
+        let calls: Vec<Value> = reply
+            .calls
+            .iter()
+            .map(|(name, arguments)| {
+                json!({
+                    "id": app.call_id(format),
+                    "type": "function",
+                    "function": { "name": name, "arguments": arguments },
+                })
+            })
+            .collect();
+        message["tool_calls"] = calls.into();
+        if reply.content.is_empty() {
+            message["content"] = Value::Null;
         }
     }
-    let count = calls.len();
-    if calls.is_empty() {
-        return (json!({ "role": "assistant", "content": content }), 0);
+    if !reply.reasoning.is_empty() {
+        message["reasoning_content"] = reply.reasoning.clone().into();
     }
-    let content = (!content.is_empty()).then_some(content);
-    let message = json!({ "role": "assistant", "content": content, "tool_calls": calls });
-    (message, count)
+    message
 }
 
 /// Replace a `content` list of `{"type": "text", "text": ...}` parts with one string.
@@ -1217,8 +1325,7 @@ async fn completions(State(app): State<Arc<App>>, body: Bytes) -> Result<Respons
             want_logprobs,
             choices_per_prompt: n,
             prefixes,
-            tool_reading: None,
-            thinking: None,
+            reading: ReplyReading::default(),
         })));
     }
 
@@ -1295,7 +1402,7 @@ async fn generate(State(app): State<Arc<App>>, body: Bytes) -> Result<Response, 
                         text.push_str(&piece);
                         sse(&json!({ "text": text, "meta_info": meta(&Usage::default(), None, &id) }))
                     }
-                    Event::Done { reason, usage } => {
+                    Event::Done { reason, usage, .. } => {
                         sse(&json!({ "text": text, "meta_info": meta(&usage, Some(reason), &id) }))
                     }
                     Event::Error(message) => sse(&ApiError::invalid(message).body()),
@@ -1313,7 +1420,7 @@ async fn generate(State(app): State<Arc<App>>, body: Bytes) -> Result<Response, 
     while let Some(event) = receiver.recv().await {
         match event {
             Event::Text { text: piece, .. } => text.push_str(&piece),
-            Event::Done { reason, usage } => {
+            Event::Done { reason, usage, .. } => {
                 return Ok(json_response(
                     StatusCode::OK,
                     &json!({ "text": text, "meta_info": meta(&usage, Some(reason), &id) }),
