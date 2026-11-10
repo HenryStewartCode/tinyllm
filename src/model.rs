@@ -16,7 +16,8 @@
 //! Where families of models differ from this is described by [`Architecture`]: other
 //! activations, an extra normalization of what each block adds, and so on.
 //!
-//! Weights are converted to f32 when they're loaded, so every kernel is plain f32 math.
+//! Weights stored as bfloat16 stay that way and are widened to f32 inside the matrix kernel,
+//! which is exact; others become f32 when they're loaded. Every kernel does plain f32 math.
 
 use crate::cache::KvPool;
 use crate::config::{Activation, Architecture, Config};
@@ -61,25 +62,33 @@ impl Linear {
         scale: f32,
     ) -> Result<Vec<Self>> {
         let total = out_dims.iter().sum();
-        let mut values = st.load(&format!("{name}.weight"), &[total, in_dim])?;
+        let weight_name = format!("{name}.weight");
         let bias_name = format!("{name}.bias");
         let mut bias = match st.contains(&bias_name) {
             true => Some(st.load(&bias_name, &[total])?),
             false => None,
         };
-        if scale != 1.0 {
-            values.iter_mut().for_each(|v| *v *= scale);
-            bias.iter_mut().flatten().for_each(|v| *v *= scale);
+        bias.iter_mut().flatten().for_each(|v| *v *= scale);
+        // Weights stored as bfloat16 stay that way, which changes no result (see `ops::Bf16`).
+        // Scaling them would round them, so scaled ones become 32-bit.
+        let keep_bf16 = st.dtype(&weight_name) == Some("BF16") && scale == 1.0;
+        let (mut full, mut half) = (Vec::new(), Vec::new());
+        match keep_bf16 {
+            true => half = st.load_bf16(&weight_name, &[total, in_dim])?,
+            false => {
+                full = st.load(&weight_name, &[total, in_dim])?;
+                full.iter_mut().for_each(|v| *v *= scale);
+            }
         }
         let mut start = 0;
         let mut layers = Vec::with_capacity(out_dims.len());
         for &out_dim in out_dims {
+            let rows = start * in_dim..(start + out_dim) * in_dim;
             layers.push(Self {
-                weight: Matrix::from_rows(
-                    &values[start * in_dim..(start + out_dim) * in_dim],
-                    out_dim,
-                    in_dim,
-                ),
+                weight: match keep_bf16 {
+                    true => Matrix::from_rows_bf16(&half[rows], out_dim, in_dim),
+                    false => Matrix::from_rows(&full[rows], out_dim, in_dim),
+                },
                 bias: bias.as_ref().map(|b| b[start..start + out_dim].to_vec()),
             });
             start += out_dim;

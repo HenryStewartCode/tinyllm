@@ -36,9 +36,9 @@ cargo run --release -- -m models/SmolLM2-135M-Instruct --chat
 | Model | Download | Speed, one stream (M1 Max) | Notes |
 |---|---|---|---|
 | `HuggingFaceTB/SmolLM2-135M-Instruct` | 270 MB | ~140 tok/s | tiny and fast, not very smart. Verified. |
-| `Qwen/Qwen2.5-0.5B-Instruct` | 990 MB | ~50 tok/s | noticeably better answers. Verified. |
+| `Qwen/Qwen2.5-0.5B-Instruct` | 990 MB | ~60 tok/s | noticeably better answers. Verified. |
 | `meta-llama/Llama-3.2-1B-Instruct` | 2.5 GB | ~18 tok/s | gated (see below). Verified. |
-| `Qwen/Qwen3-0.6B` | 1.5 GB | ~37 tok/s | a reasoning model: thinks before it answers. Verified. |
+| `Qwen/Qwen3-0.6B` | 1.5 GB | ~50 tok/s | a reasoning model: thinks before it answers. Verified. |
 | `ibm-granite/granite-3.3-2b-instruct` | 5 GB | | Verified. |
 | `HuggingFaceTB/SmolLM3-3B` | 6 GB | | reasoning model. Verified. |
 | `microsoft/Phi-3-mini-4k-instruct` | 7.6 GB | | Verified. |
@@ -324,7 +324,7 @@ What makes it a server rather than a loop:
 | [`src/backend.rs`](src/backend.rs) | What a device has to provide, and the CPU implementation. |
 | [`src/cuda/`](src/cuda/mod.rs) | The NVIDIA backend: [loading the driver](src/cuda/api.rs), [the kernels](src/cuda/kernels.cu), and running a batch. |
 | [`src/model.rs`](src/model.rs) | The transformer's batched forward pass on the CPU. |
-| [`src/ops.rs`](src/ops.rs) | Numeric kernels: interleaved weight storage and a NEON matrix kernel, RMSNorm, RoPE, softmax, SwiGLU, vectorized `exp`. |
+| [`src/ops.rs`](src/ops.rs) | Numeric kernels: interleaved weight storage (32- or 16-bit) and a NEON matrix kernel, RMSNorm, RoPE, softmax, SwiGLU, vectorized `exp`. |
 | [`src/pool.rs`](src/pool.rs) | A spinning fork-join thread pool: a forward pass is hundreds of parallel sections lasting microseconds each. |
 | [`src/sampler.rs`](src/sampler.rs) | Temperature, top-k, top-p, min-p, repetition/frequency/presence penalties, logit bias. |
 | [`src/chat.rs`](src/chat.rs) | Runs each model's Jinja chat template the way `transformers` does. |
@@ -368,7 +368,11 @@ Most of a single stream's time is now reading the weights from memory, which eve
 once: about 1 GB for Qwen2.5 and 270 MB for SmolLM2. At the 200 GB/s this GPU sustains, that's
 about 5 of Qwen2.5's 6 ms per token, and 1.3 of SmolLM2's 2.2 ms.
 
-On the CPU, an M1 Max with 6 threads (other applications running), through the HTTP server:
+On the CPU, weights stored as bfloat16 (most checkpoints) stay 16-bit and are widened inside the
+matrix kernel, which is exact: logits are bit-identical to keeping them as 32-bit numbers, with
+half the memory traffic. That made a single Qwen2.5-0.5B stream about 1.4× faster than in the
+table below, which was measured before (M1 Max, 6 threads, other applications running, through
+the HTTP server):
 
 | Concurrent requests | SmolLM2-135M, total tok/s | Qwen2.5-0.5B, total tok/s | Qwen2.5 per stream |
 |---|---|---|---|

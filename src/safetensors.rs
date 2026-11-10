@@ -87,6 +87,13 @@ impl SafeTensors {
         self.tensors.contains_key(name)
     }
 
+    /// How tensor `name` is stored: `"BF16"`, `"F16"`, `"F32"`...
+    pub fn dtype(&self, name: &str) -> Option<&str> {
+        self.tensors
+            .get(name)
+            .map(|entry| entry.info.dtype.as_str())
+    }
+
     /// Read tensor `name`, check that it has the expected `shape`, and convert it to f32.
     pub fn load(&self, name: &str, shape: &[usize]) -> Result<Vec<f32>> {
         let (bytes, dtype) = self.read(name, shape)?;

@@ -1,5 +1,6 @@
-//! Numeric kernels. Everything is f32 on plain slices; batches are matrices stored row-major as
-//! one flat slice, so row `b` of a `[batch, dim]` matrix is `m[b * dim..(b + 1) * dim]`.
+//! Numeric kernels. Everything is f32 on plain slices (weight matrices may be stored as bfloat16);
+//! batches are matrices stored row-major as one flat slice, so row `b` of a `[batch, dim]` matrix
+//! is `m[b * dim..(b + 1) * dim]`.
 //!
 //! The kernels add numbers up in the same order whatever the shape of the batch, so a sequence
 //! gets bit-identical results no matter which other sequences it shares a batch with.
@@ -67,6 +68,53 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     sum
 }
 
+/// What a weight matrix's elements can be stored as.
+pub trait Weight: Copy + Default + Send + Sync + 'static {
+    fn to_f32(self) -> f32;
+
+    /// Four consecutive elements as one NEON register.
+    ///
+    /// # Safety
+    /// `ptr` must point to four readable elements.
+    #[cfg(target_arch = "aarch64")]
+    unsafe fn load4(ptr: *const Self) -> std::arch::aarch64::float32x4_t;
+}
+
+impl Weight for f32 {
+    #[inline(always)]
+    fn to_f32(self) -> f32 {
+        self
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    unsafe fn load4(ptr: *const Self) -> std::arch::aarch64::float32x4_t {
+        // SAFETY: the caller promises four readable elements.
+        unsafe { std::arch::aarch64::vld1q_f32(ptr) }
+    }
+}
+
+/// A bfloat16 number: the top half of an f32's bits. Most checkpoints are stored this way, and
+/// widening one to an f32 is exact, so keeping weights like this halves the memory they take
+/// and the time spent reading them, and changes no result.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct Bf16(pub u16);
+
+impl Weight for Bf16 {
+    #[inline(always)]
+    fn to_f32(self) -> f32 {
+        f32::from_bits((self.0 as u32) << 16)
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    unsafe fn load4(ptr: *const Self) -> std::arch::aarch64::float32x4_t {
+        use std::arch::aarch64::*;
+        // SAFETY: the caller promises four readable elements; `Bf16` is a `u16`.
+        unsafe { vreinterpretq_f32_u32(vshll_n_u16::<16>(vld1_u16(ptr.cast::<u16>()))) }
+    }
+}
+
 /// A weight matrix laid out for fast multiplication.
 ///
 /// Rows are grouped into blocks of `BLOCK_ROWS`, and the rows of a block are interleaved every
@@ -74,22 +122,30 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
 /// the CPU's prefetcher follows well, and one read brings in the elements of 4 rows at once.
 /// Columns that don't fill a whole SIMD register are kept to one side in `tail`.
 pub struct Matrix {
-    /// `[blocks, BLOCK_ROWS * interleaved columns]`. A last, partial block is padded with zeros.
-    blocks: Vec<f32>,
-    /// `[rows, tail columns]`
-    tail: Vec<f32>,
+    data: Data,
     rows: usize,
     cols: usize,
 }
 
-impl Matrix {
-    /// Build from row-major `[rows, cols]` values.
-    pub fn from_rows(values: &[f32], rows: usize, cols: usize) -> Self {
+enum Data {
+    F32(Layout<f32>),
+    Bf16(Layout<Bf16>),
+}
+
+struct Layout<T> {
+    /// `[blocks, BLOCK_ROWS * interleaved columns]`. A last, partial block is padded with zeros.
+    blocks: Vec<T>,
+    /// `[rows, tail columns]`
+    tail: Vec<T>,
+}
+
+impl<T: Weight> Layout<T> {
+    fn new(values: &[T], rows: usize, cols: usize) -> Self {
         assert_eq!(values.len(), rows * cols, "matrix shape");
         let tail_cols = cols % BLOCK_LANES;
         let chunks = cols / BLOCK_LANES;
         let n_blocks = rows.div_ceil(BLOCK_ROWS);
-        let mut blocks = vec![0.0; n_blocks * BLOCK_ROWS * chunks * BLOCK_LANES];
+        let mut blocks = vec![T::default(); n_blocks * BLOCK_ROWS * chunks * BLOCK_LANES];
         let mut tail = Vec::with_capacity(rows * tail_cols);
         for (r, row) in values.chunks_exact(cols).enumerate() {
             let (block, in_block) = (r / BLOCK_ROWS, r % BLOCK_ROWS);
@@ -100,9 +156,45 @@ impl Matrix {
             }
             tail.extend_from_slice(&row[chunks * BLOCK_LANES..]);
         }
+        Self { blocks, tail }
+    }
+
+    fn copy_row(&self, r: usize, cols: usize, out: &mut [f32]) {
+        let tail_cols = cols % BLOCK_LANES;
+        let chunks = cols / BLOCK_LANES;
+        let (block, in_block) = (r / BLOCK_ROWS, r % BLOCK_ROWS);
+        let (out_chunks, _) = out.as_chunks_mut::<BLOCK_LANES>();
+        for (c, out) in out_chunks.iter_mut().enumerate() {
+            let at = (block * chunks + c) * BLOCK_ROWS * BLOCK_LANES + in_block * BLOCK_LANES;
+            for (o, w) in out.iter_mut().zip(&self.blocks[at..at + BLOCK_LANES]) {
+                *o = w.to_f32();
+            }
+        }
+        let tail = &self.tail[r * tail_cols..(r + 1) * tail_cols];
+        for (o, w) in out[chunks * BLOCK_LANES..].iter_mut().zip(tail) {
+            *o = w.to_f32();
+        }
+    }
+}
+
+impl Matrix {
+    /// Build from row-major `[rows, cols]` values.
+    pub fn from_rows(values: &[f32], rows: usize, cols: usize) -> Self {
         Self {
-            blocks,
-            tail,
+            data: Data::F32(Layout::new(values, rows, cols)),
+            rows,
+            cols,
+        }
+    }
+
+    /// Build from row-major `[rows, cols]` bfloat16 values, keeping them that way.
+    pub fn from_rows_bf16(values: &[u16], rows: usize, cols: usize) -> Self {
+        // SAFETY: `Bf16` is a `repr(Rust)` newtype of `u16` with the same size and alignment,
+        // and every bit pattern is valid for both.
+        let values: &[Bf16] =
+            unsafe { std::slice::from_raw_parts(values.as_ptr().cast(), values.len()) };
+        Self {
+            data: Data::Bf16(Layout::new(values, rows, cols)),
             rows,
             cols,
         }
@@ -124,26 +216,29 @@ impl Matrix {
         self.len() == 0
     }
 
+    /// Bytes taken by the elements.
+    pub fn bytes(&self) -> usize {
+        match &self.data {
+            Data::F32(layout) => (layout.blocks.len() + layout.tail.len()) * 4,
+            Data::Bf16(layout) => (layout.blocks.len() + layout.tail.len()) * 2,
+        }
+    }
+
     /// Copy row `r` into `out`, which is how an embedding is looked up.
     pub fn copy_row(&self, r: usize, out: &mut [f32]) {
         assert!(r < self.rows && out.len() == self.cols);
-        let tail_cols = self.cols % BLOCK_LANES;
-        let chunks = self.cols / BLOCK_LANES;
-        let (block, in_block) = (r / BLOCK_ROWS, r % BLOCK_ROWS);
-        let (out_chunks, _) = out.as_chunks_mut::<BLOCK_LANES>();
-        for (c, out) in out_chunks.iter_mut().enumerate() {
-            let at = (block * chunks + c) * BLOCK_ROWS * BLOCK_LANES + in_block * BLOCK_LANES;
-            out.copy_from_slice(&self.blocks[at..at + BLOCK_LANES]);
+        match &self.data {
+            Data::F32(layout) => layout.copy_row(r, self.cols, out),
+            Data::Bf16(layout) => layout.copy_row(r, self.cols, out),
         }
-        out[chunks * BLOCK_LANES..].copy_from_slice(&self.tail[r * tail_cols..(r + 1) * tail_cols]);
     }
 }
 
 /// Dot products of one block of weight rows with `X` input rows.
 #[inline(always)]
-fn dot_block<const X: usize>(
-    block: &[f32],
-    tail: &[f32],
+fn dot_block<T: Weight, const X: usize>(
+    block: &[T],
+    tail: &[T],
     x: [&[f32]; X],
 ) -> [[f32; X]; BLOCK_ROWS] {
     let (chunks, _) = block.as_chunks::<{ BLOCK_ROWS * BLOCK_LANES }>();
@@ -155,7 +250,7 @@ fn dot_block<const X: usize>(
         for b in 0..X {
             for i in 0..tail_cols {
                 let xi = x[b][chunks.len() * BLOCK_LANES + i];
-                out[a][b] = fmadd(tail[a * tail_cols + i], xi, out[a][b]);
+                out[a][b] = fmadd(tail[a * tail_cols + i].to_f32(), xi, out[a][b]);
             }
         }
     }
@@ -167,8 +262,8 @@ fn dot_block<const X: usize>(
 /// `X` input vectors, with one accumulator register per pair.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-fn block_sums<const X: usize>(
-    chunks: &[[f32; BLOCK_ROWS * BLOCK_LANES]],
+fn block_sums<T: Weight, const X: usize>(
+    chunks: &[[T; BLOCK_ROWS * BLOCK_LANES]],
     inputs: [&[[f32; BLOCK_LANES]]; X],
 ) -> [[f32; X]; BLOCK_ROWS] {
     use std::arch::aarch64::*;
@@ -180,10 +275,10 @@ fn block_sums<const X: usize>(
         for (c, w) in chunks.iter().enumerate() {
             let w = w.as_ptr();
             let wv = [
-                vld1q_f32(w),
-                vld1q_f32(w.add(BLOCK_LANES)),
-                vld1q_f32(w.add(2 * BLOCK_LANES)),
-                vld1q_f32(w.add(3 * BLOCK_LANES)),
+                T::load4(w),
+                T::load4(w.add(BLOCK_LANES)),
+                T::load4(w.add(2 * BLOCK_LANES)),
+                T::load4(w.add(3 * BLOCK_LANES)),
             ];
             for b in 0..X {
                 let xv = vld1q_f32(ptrs[b].add(c * BLOCK_LANES));
@@ -205,8 +300,8 @@ fn block_sums<const X: usize>(
 
 #[cfg(not(target_arch = "aarch64"))]
 #[inline(always)]
-fn block_sums<const X: usize>(
-    chunks: &[[f32; BLOCK_ROWS * BLOCK_LANES]],
+fn block_sums<T: Weight, const X: usize>(
+    chunks: &[[T; BLOCK_ROWS * BLOCK_LANES]],
     inputs: [&[[f32; BLOCK_LANES]]; X],
 ) -> [[f32; X]; BLOCK_ROWS] {
     let mut acc = [[[0.0f32; BLOCK_LANES]; X]; BLOCK_ROWS];
@@ -215,7 +310,7 @@ fn block_sums<const X: usize>(
             for b in 0..X {
                 let x = &inputs[b][c];
                 for l in 0..BLOCK_LANES {
-                    acc[a][b][l] = fmadd(w[a * BLOCK_LANES + l], x[l], acc[a][b][l]);
+                    acc[a][b][l] = fmadd(w[a * BLOCK_LANES + l].to_f32(), x[l], acc[a][b][l]);
                 }
             }
         }
@@ -225,7 +320,7 @@ fn block_sums<const X: usize>(
 
 /// One block of weight rows times every row of `x`, into `out: [BLOCK_ROWS, batch]`.
 #[inline(always)]
-fn dot_rows(out: &mut [f32], block: &[f32], tail: &[f32], x: &[f32], cols: usize) {
+fn dot_rows<T: Weight>(out: &mut [f32], block: &[T], tail: &[T], x: &[f32], cols: usize) {
     let batch = x.len() / cols;
     assert!(block.len() <= BLOCK_ROWS * cols && out.len() == BLOCK_ROWS * batch);
     let row = |b: usize| &x[b * cols..(b + 1) * cols];
@@ -260,17 +355,31 @@ fn dot_rows(out: &mut [f32], block: &[f32], tail: &[f32], x: &[f32], cols: usize
 /// every input row while it's in the CPU cache, so a batch costs one trip through memory for the
 /// weights however large it is, which is why batching pays off so much.
 pub fn matmul(pool: &Pool, out: &mut [f32], scratch: &mut Vec<f32>, w: &Matrix, x: &[f32]) {
-    let cols = w.cols;
+    match &w.data {
+        Data::F32(layout) => matmul_layout(pool, out, scratch, layout, w.rows, w.cols, x),
+        Data::Bf16(layout) => matmul_layout(pool, out, scratch, layout, w.rows, w.cols, x),
+    }
+}
+
+fn matmul_layout<T: Weight>(
+    pool: &Pool,
+    out: &mut [f32],
+    scratch: &mut Vec<f32>,
+    w: &Layout<T>,
+    rows: usize,
+    cols: usize,
+    x: &[f32],
+) {
     let batch = x.len() / cols;
     assert_eq!(x.len(), batch * cols, "matmul: input shape");
-    assert_eq!(out.len(), batch * w.rows, "matmul: output shape");
-    let n_blocks = w.rows.div_ceil(BLOCK_ROWS);
+    assert_eq!(out.len(), batch * rows, "matmul: output shape");
+    let n_blocks = rows.div_ceil(BLOCK_ROWS);
     let tail_cols = cols % BLOCK_LANES;
     let block_len = BLOCK_ROWS * (cols - tail_cols);
 
     // The threads divide up the weight rows, so results come out as [m, batch] and get flipped
     // afterwards. For a single input and whole blocks, that's already the final layout.
-    let in_place = batch == 1 && w.rows.is_multiple_of(BLOCK_ROWS);
+    let in_place = batch == 1 && rows.is_multiple_of(BLOCK_ROWS);
     let target: &mut [f32] = if in_place {
         out
     } else {
@@ -284,17 +393,17 @@ pub fn matmul(pool: &Pool, out: &mut [f32], scratch: &mut Vec<f32>, w: &Matrix, 
         if tail_cols == 0 {
             dot_rows(out, block, &[], x, cols);
         } else {
-            let mut tail = [0.0f32; BLOCK_ROWS * BLOCK_LANES];
-            let rows = BLOCK_ROWS.min(w.rows - i * BLOCK_ROWS);
-            tail[..rows * tail_cols]
-                .copy_from_slice(&w.tail[i * BLOCK_ROWS * tail_cols..][..rows * tail_cols]);
+            let mut tail = [T::default(); BLOCK_ROWS * BLOCK_LANES];
+            let block_rows = BLOCK_ROWS.min(rows - i * BLOCK_ROWS);
+            tail[..block_rows * tail_cols]
+                .copy_from_slice(&w.tail[i * BLOCK_ROWS * tail_cols..][..block_rows * tail_cols]);
             dot_rows(out, block, &tail[..BLOCK_ROWS * tail_cols], x, cols);
         }
     });
 
     if !in_place {
         let scratch = &*scratch;
-        pool.for_chunks(out, w.rows, row_grain(w.rows), |b, row| {
+        pool.for_chunks(out, rows, row_grain(rows), |b, row| {
             for (i, o) in row.iter_mut().enumerate() {
                 *o = scratch[i * batch + b];
             }
@@ -518,6 +627,33 @@ mod tests {
                 w.copy_row(r, &mut row);
                 assert_eq!(row, values[r * cols..(r + 1) * cols]);
             }
+        }
+    }
+
+    #[test]
+    fn bf16_storage_gives_the_same_results() {
+        for (m, cols) in [(5, 3), (8, 16), (13, 37), (64, 128)] {
+            let bits: Vec<u16> = (0..m * cols)
+                .map(|i| crate::safetensors::f32_to_bf16(((i * 37 % 101) as f32 - 50.0) / 7.0))
+                .collect();
+            let values: Vec<f32> = bits.iter().map(|&b| Bf16(b).to_f32()).collect();
+            let (full, half) = (
+                Matrix::from_rows(&values, m, cols),
+                Matrix::from_rows_bf16(&bits, m, cols),
+            );
+            let pool = Pool::new(2);
+            for batch in [1, 3, 6] {
+                let x: Vec<f32> = (0..batch * cols).map(|i| (i % 11) as f32 * 0.25).collect();
+                let (mut a, mut b) = (vec![0.0; batch * m], vec![0.0; batch * m]);
+                matmul(&pool, &mut a, &mut Vec::new(), &full, &x);
+                matmul(&pool, &mut b, &mut Vec::new(), &half, &x);
+                assert!(a.iter().zip(&b).all(|(p, q)| p.to_bits() == q.to_bits()));
+            }
+            let (mut a, mut b) = (vec![0.0; cols], vec![0.0; cols]);
+            full.copy_row(m - 1, &mut a);
+            half.copy_row(m - 1, &mut b);
+            assert_eq!(a, b);
+            assert_eq!(half.bytes() * 2, full.bytes());
         }
     }
 
