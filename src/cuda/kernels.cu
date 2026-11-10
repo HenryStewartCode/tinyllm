@@ -477,6 +477,164 @@ MATMUL_BF16(2)
 MATMUL_BF16(4)
 
 // ---------------------------------------------------------------------------------------------
+// Mixtures of experts
+// ---------------------------------------------------------------------------------------------
+// A token goes through the few experts its router scores best. On the GPU that's done in steps
+// whose launches don't depend on which experts were chosen, so a recorded graph can replay them:
+// moe_route picks each row's experts, moe_sort lays out the (row, expert) pairs grouped by expert
+// in runs padded to whole 16-row groups, moe_gather copies the rows into that order, the grouped
+// matmul multiplies each group by its expert's weights, and moe_combine adds each row's results
+// up, in order of expert. Kernels launched for more groups than there turn out to be stop early.
+#define MAX_TOP_K 16
+#define MAX_EXPERTS 512
+
+// One warp per row: the softmax of the experts' scores, the top_k best (the lower-numbered of any
+// tie), and their weights, renormalized to add up to 1 if asked. Written in order of expert.
+extern "C" __global__ void moe_route(const float *scores, int experts, int top_k, int renormalize,
+                                     int *topk_ids, float *topk_weights) {
+    const int row = blockIdx.x, lane = threadIdx.x;
+    const float *s = scores + (size_t)row * experts;
+    float max = -FLT_MAX;
+    for (int i = lane; i < experts; i += WARP)
+        max = fmaxf(max, s[i]);
+    max = warp_max(max);
+    float sum = 0.0f;
+    for (int i = lane; i < experts; i += WARP)
+        sum += expf(s[i] - max);
+    sum = warp_sum(sum);
+    int chosen[MAX_TOP_K];
+    float weight[MAX_TOP_K];
+    float total = 0.0f;
+    for (int k = 0; k < top_k; k++) {
+        float best = -FLT_MAX;
+        int best_i = 0x7fffffff;
+        for (int i = lane; i < experts; i += WARP) {
+            bool taken = false;
+            for (int j = 0; j < k; j++)
+                taken |= chosen[j] == i;
+            if (!taken && (s[i] > best || (s[i] == best && i < best_i))) {
+                best = s[i];
+                best_i = i;
+            }
+        }
+        for (int step = WARP / 2; step > 0; step >>= 1) {
+            const float other = __shfl_xor_sync(0xffffffffu, best, step);
+            const int other_i = __shfl_xor_sync(0xffffffffu, best_i, step);
+            if (other > best || (other == best && other_i < best_i)) {
+                best = other;
+                best_i = other_i;
+            }
+        }
+        chosen[k] = best_i;
+        weight[k] = expf(best - max) / sum;
+        total += weight[k];
+    }
+    if (lane != 0)
+        return;
+    for (int k = 1; k < top_k; k++) {
+        for (int j = k; j > 0 && chosen[j - 1] > chosen[j]; j--) {
+            const int id = chosen[j];
+            chosen[j] = chosen[j - 1];
+            chosen[j - 1] = id;
+            const float w = weight[j];
+            weight[j] = weight[j - 1];
+            weight[j - 1] = w;
+        }
+    }
+    for (int k = 0; k < top_k; k++) {
+        topk_ids[row * top_k + k] = chosen[k];
+        topk_weights[row * top_k + k] = renormalize ? weight[k] / total : weight[k];
+    }
+}
+
+// One block: lay out the (row, expert) pairs grouped by expert, each expert's run padded to a
+// whole number of 16-row groups. Each thread takes some experts and finds their pairs in order,
+// so the layout is the same every time. `slot_of[pair]` is where a pair went; `sorted_rows[slot]`
+// is its row (or -1 for padding); `group_expert[group]` is each group's expert.
+extern "C" __global__ void moe_sort(const int *topk_ids, int rows, int top_k, int experts,
+                                    int *sorted_rows, int *slot_of, int *group_expert,
+                                    int *num_groups) {
+    __shared__ int counts[MAX_EXPERTS];
+    __shared__ int starts[MAX_EXPERTS + 1];
+    const int pairs = rows * top_k;
+    for (int e = threadIdx.x; e < experts; e += blockDim.x) {
+        int count = 0;
+        for (int i = 0; i < pairs; i++)
+            count += topk_ids[i] == e;
+        counts[e] = count;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int at = 0;
+        for (int e = 0; e < experts; e++) {
+            starts[e] = at;
+            at += (counts[e] + TILE - 1) / TILE * TILE;
+        }
+        starts[experts] = at;
+        *num_groups = at / TILE;
+    }
+    __syncthreads();
+    for (int e = threadIdx.x; e < experts; e += blockDim.x) {
+        int at = starts[e];
+        for (int i = 0; i < pairs; i++) {
+            if (topk_ids[i] == e) {
+                sorted_rows[at] = i / top_k;
+                slot_of[i] = at;
+                at++;
+            }
+        }
+        for (; at < starts[e + 1]; at++)
+            sorted_rows[at] = -1;
+        for (int g = starts[e] / TILE; g < starts[e + 1] / TILE; g++)
+            group_expert[g] = e;
+    }
+}
+
+// One block per slot: copy its row of the 16-bit tile-layout input (zeros for padding).
+extern "C" __global__ void moe_gather(const __nv_bfloat16 *x, int chunks, const int *sorted_rows,
+                                      const int *num_groups, __nv_bfloat16 *out) {
+    const int slot = blockIdx.x;
+    if (slot >= *num_groups * TILE)
+        return;
+    const int row = sorted_rows[slot];
+    for (int c = threadIdx.x; c < chunks * TILE; c += WARP)
+        out[tile_index(slot, c, chunks)] =
+            row < 0 ? __float2bfloat16(0.0f) : x[tile_index(row, c, chunks)];
+}
+
+// moe_matmul_TX: out = W_e x for each 16-row group of `x`, with `e` that group's expert and the
+// experts' weight matrices `expert_stride` elements apart, all in the 16-bit tile layout.
+#define MOE_MATMUL(TX)                                                                         \
+    extern "C" __global__ void moe_matmul_##TX(                                                \
+        const __nv_bfloat16 *w, unsigned long long expert_stride, const int *group_expert,    \
+        const int *num_groups, int m, int chunks, const __nv_bfloat16 *x, float *out) {       \
+        const int warp = threadIdx.x / WARP;                                                   \
+        const int x_group = blockIdx.x * TX + warp / WARPS_ACROSS;                             \
+        const int groups = *num_groups;                                                        \
+        if (x_group >= groups)                                                                 \
+            return;                                                                            \
+        matmul_tiles<TX>(w + group_expert[x_group] * expert_stride, m, chunks, x,              \
+                         groups * TILE, out, nullptr, 0, nullptr);                             \
+    }
+MOE_MATMUL(1)
+MOE_MATMUL(2)
+MOE_MATMUL(4)
+
+// One block per row: add up what its experts made of it, weighted, in order of expert, and add
+// that to the residual stream.
+extern "C" __global__ void moe_combine(const float *down, int dim, const int *slot_of,
+                                       const float *topk_weights, int top_k, float *x) {
+    const int row = blockIdx.x;
+    for (int c = threadIdx.x; c < dim; c += WARP) {
+        float sum = 0.0f;
+        for (int k = 0; k < top_k; k++)
+            sum += topk_weights[row * top_k + k] *
+                   down[(size_t)slot_of[row * top_k + k] * dim + c];
+        x[(size_t)row * dim + c] += sum;
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // 8-bit weights
 // ---------------------------------------------------------------------------------------------
 // With --quantization int8, each layer's matrices hold one signed byte per weight and a scale for
@@ -866,6 +1024,25 @@ extern "C" __global__ void swiglu_bf16(const float *gate_up, __nv_bfloat16 *out,
 extern "C" __global__ void geglu_bf16(const float *gate_up, __nv_bfloat16 *out, int hidden,
                                       int chunks) {
     gated_tiles<Gelu>(gate_up, out, hidden, chunks);
+}
+
+// Like swiglu_bf16 and geglu_bf16, for the slots of a mixture of experts.
+template <typename Activation>
+__device__ __forceinline__ void moe_gated(const float *gate_up, __nv_bfloat16 *out, int hidden,
+                                          int chunks, const int *num_groups) {
+    if (blockIdx.x >= *num_groups * TILE)
+        return;
+    gated_tiles<Activation>(gate_up, out, hidden, chunks);
+}
+
+extern "C" __global__ void moe_swiglu(const float *gate_up, __nv_bfloat16 *out, int hidden,
+                                      int chunks, const int *num_groups) {
+    moe_gated<Silu>(gate_up, out, hidden, chunks, num_groups);
+}
+
+extern "C" __global__ void moe_geglu(const float *gate_up, __nv_bfloat16 *out, int hidden,
+                                     int chunks, const int *num_groups) {
+    moe_gated<Gelu>(gate_up, out, hidden, chunks, num_groups);
 }
 
 // ---------------------------------------------------------------------------------------------

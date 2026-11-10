@@ -14,7 +14,7 @@ mod api;
 pub use api::{Arg, Gpu, Graph, Kernel, Module, Pointer};
 
 use crate::backend::{Backend, LoadedModel, Logits};
-use crate::config::{Activation, Architecture, Config};
+use crate::config::{Activation, Architecture, Config, ExpertNaming, Experts as ConfigExperts};
 use crate::model::{LogitUse, Row};
 use crate::pool::Pool;
 use crate::safetensors::{FP8_BLOCK, SafeTensors, bf16_to_f32, f32_to_bf16};
@@ -113,9 +113,7 @@ struct Layer {
     /// Normalizes what attention adds to the residual stream, if the model does that.
     norm_after_attn: Option<Pointer>,
     mlp_norm: Pointer,
-    /// gate_proj and up_proj as one matrix, for the same reason.
-    gate_up: Matrix,
-    down: Matrix,
+    feed_forward: FeedForward,
     /// The same for the MLP.
     norm_after_mlp: Option<Pointer>,
     k_pool: Pointer,
@@ -123,6 +121,40 @@ struct Layer {
     rope_table: usize,
     /// How many tokens it can see.
     window: usize,
+}
+
+enum FeedForward {
+    /// gate_proj and up_proj as one matrix, for the same reason as `qkv`, then down_proj.
+    Dense {
+        gate_up: Matrix,
+        down: Matrix,
+    },
+    Sparse(Experts),
+}
+
+/// A layer's mixture of experts, all its experts' weights in the 16-bit tile layout, side by side.
+struct Experts {
+    router: Matrix,
+    /// Each expert's gate_proj and up_proj stacked, `[2 * hidden, dim]`.
+    gate_up: Pointer,
+    /// Each expert's down_proj, `[dim, hidden]`.
+    down: Pointer,
+}
+
+/// Working memory for mixtures of experts.
+struct MoeBuffers {
+    scores: Pointer,
+    topk_ids: Pointer,
+    topk_weights: Pointer,
+    slot_of: Pointer,
+    sorted_rows: Pointer,
+    group_expert: Pointer,
+    num_groups: Pointer,
+    /// The rows in expert order, 16-bit tiles `[slots, dim]`.
+    x: Pointer,
+    gate_up: Pointer,
+    gated: Pointer,
+    down: Pointer,
 }
 
 struct Kernels {
@@ -157,6 +189,15 @@ struct Kernels {
     attention_bf16: Vec<Kernel>,
     top_candidates: Kernel,
     draw_tokens: Kernel,
+    moe_route: Kernel,
+    moe_sort: Kernel,
+    moe_gather: Kernel,
+    moe_matmul_1: Kernel,
+    moe_matmul_2: Kernel,
+    moe_matmul_4: Kernel,
+    moe_swiglu: Kernel,
+    moe_geglu: Kernel,
+    moe_combine: Kernel,
 }
 
 impl Kernels {
@@ -186,6 +227,15 @@ impl Kernels {
             matmul_f8_1: gpu.kernel(module, "matmul_f8_1")?,
             matmul_f8_2: gpu.kernel(module, "matmul_f8_2")?,
             matmul_f8_4: gpu.kernel(module, "matmul_f8_4")?,
+            moe_route: gpu.kernel(module, "moe_route")?,
+            moe_sort: gpu.kernel(module, "moe_sort")?,
+            moe_gather: gpu.kernel(module, "moe_gather")?,
+            moe_matmul_1: gpu.kernel(module, "moe_matmul_1")?,
+            moe_matmul_2: gpu.kernel(module, "moe_matmul_2")?,
+            moe_matmul_4: gpu.kernel(module, "moe_matmul_4")?,
+            moe_swiglu: gpu.kernel(module, "moe_swiglu")?,
+            moe_geglu: gpu.kernel(module, "moe_geglu")?,
+            moe_combine: gpu.kernel(module, "moe_combine")?,
             swiglu_bf16: gpu.kernel(module, "swiglu_bf16")?,
             geglu_bf16: gpu.kernel(module, "geglu_bf16")?,
             rope_store_bf16: gpu.kernel(module, "rope_store_bf16")?,
@@ -282,6 +332,7 @@ pub struct CudaBackend {
     gated: Pointer,
     logits_device: Pointer,
     step_buffer: Pointer,
+    moe: Option<MoeBuffers>,
 
     slot_list_buffer: Growing,
     scratch: Growing,
@@ -345,10 +396,20 @@ impl CudaBackend {
         let fits_tiles = n_heads / n_kv_heads <= TILE
             && head_dim.is_multiple_of(TILE)
             && TILE_CHUNK_COUNTS.contains(&(head_dim / TILE));
-        ensure!(
-            architecture.experts.is_none() && !architecture.full_qk_norms,
-            "mixtures of experts only run on the CPU so far"
-        );
+        if let Some(experts) = &architecture.experts {
+            ensure!(
+                experts.shared_hidden.is_none(),
+                "mixtures of experts with a shared expert only run on the CPU so far"
+            );
+            ensure!(
+                options.precision == Precision::Bf16,
+                "mixtures of experts need 16-bit precision on the GPU"
+            );
+            ensure!(
+                experts.top_k <= 16 && experts.count <= 512,
+                "the GPU handles at most 512 experts and 16 per token"
+            );
+        }
         let precision = if options.precision == Precision::Bf16 && !fits_tiles {
             eprintln!("This model's attention heads don't fit 16-bit tiles, so using 32-bit.");
             Precision::F32
@@ -392,12 +453,17 @@ impl CudaBackend {
             let p = format!("model.layers.{l}");
             let attn = format!("{p}.self_attn");
             let attn_norm = upload_vector(&format!("{p}.input_layernorm.weight"), dim)?;
-            let head_norms = match architecture.head_norms {
-                true => Some((
+            let head_norms = match (architecture.head_norms, architecture.full_qk_norms) {
+                (true, _) => Some((
                     upload_vector(&format!("{attn}.q_norm.weight"), head_dim)?,
                     upload_vector(&format!("{attn}.k_norm.weight"), head_dim)?,
                 )),
-                false => None,
+                // A whole token's queries, and keys, normalized together (OLMoE).
+                (_, true) => Some((
+                    upload_vector(&format!("{attn}.q_norm.weight"), q_dim)?,
+                    upload_vector(&format!("{attn}.k_norm.weight"), kv_dim)?,
+                )),
+                _ => None,
             };
             let (norm_after_attn, mlp_norm, norm_after_mlp) = if architecture.norms_after_blocks {
                 (
@@ -449,35 +515,50 @@ impl CudaBackend {
                 architecture.residual_scale,
                 options.quantization,
             )?;
-            let gate_up_names = match architecture.combined_projections {
-                true => vec![(format!("{p}.mlp.gate_up_proj"), 2 * hidden_dim)],
-                false => vec![
-                    (format!("{p}.mlp.gate_proj"), hidden_dim),
-                    (format!("{p}.mlp.up_proj"), hidden_dim),
-                ],
+            let feed_forward = match (shape.sparse, &architecture.experts) {
+                (true, Some(spec)) => FeedForward::Sparse(upload_experts(
+                    &gpu,
+                    &st,
+                    &mut num_params,
+                    &p,
+                    spec,
+                    dim,
+                    batch_rows,
+                    architecture.residual_scale,
+                )?),
+                _ => {
+                    let gate_up_names = match architecture.combined_projections {
+                        true => vec![(format!("{p}.mlp.gate_up_proj"), 2 * hidden_dim)],
+                        false => vec![
+                            (format!("{p}.mlp.gate_proj"), hidden_dim),
+                            (format!("{p}.mlp.up_proj"), hidden_dim),
+                        ],
+                    };
+                    let gate_up = upload_stacked(
+                        &gpu,
+                        &st,
+                        precision,
+                        &mut num_params,
+                        &gate_up_names,
+                        dim,
+                        batch_rows,
+                        1.0,
+                        options.quantization,
+                    )?;
+                    let down = upload_stacked(
+                        &gpu,
+                        &st,
+                        precision,
+                        &mut num_params,
+                        &[(format!("{p}.mlp.down_proj"), dim)],
+                        hidden_dim,
+                        batch_rows,
+                        architecture.residual_scale,
+                        options.quantization,
+                    )?;
+                    FeedForward::Dense { gate_up, down }
+                }
             };
-            let gate_up = upload_stacked(
-                &gpu,
-                &st,
-                precision,
-                &mut num_params,
-                &gate_up_names,
-                dim,
-                batch_rows,
-                1.0,
-                options.quantization,
-            )?;
-            let down = upload_stacked(
-                &gpu,
-                &st,
-                precision,
-                &mut num_params,
-                &[(format!("{p}.mlp.down_proj"), dim)],
-                hidden_dim,
-                batch_rows,
-                architecture.residual_scale,
-                options.quantization,
-            )?;
             layers.push(Layer {
                 attn_norm,
                 qkv,
@@ -485,8 +566,7 @@ impl CudaBackend {
                 o_proj,
                 norm_after_attn,
                 mlp_norm,
-                gate_up,
-                down,
+                feed_forward,
                 norm_after_mlp,
                 k_pool: Pointer::NULL,
                 v_pool: Pointer::NULL,
@@ -534,6 +614,26 @@ impl CudaBackend {
         let attn_out = input_buffer(&gpu, precision, rows, q_dim)?;
         let gate_up = gpu.alloc(rows * 2 * hidden_dim)?;
         let gated = input_buffer(&gpu, precision, rows, hidden_dim)?;
+        let moe = match &architecture.experts {
+            Some(spec) => {
+                let pairs = rows * spec.top_k;
+                let slots = moe_slots(rows, spec);
+                Some(MoeBuffers {
+                    scores: gpu.alloc(rows * spec.count)?,
+                    topk_ids: gpu.alloc(pairs)?,
+                    topk_weights: gpu.alloc(pairs)?,
+                    slot_of: gpu.alloc(pairs)?,
+                    sorted_rows: gpu.alloc(slots)?,
+                    group_expert: gpu.alloc(slots / TILE)?,
+                    num_groups: gpu.alloc(1)?,
+                    x: input_buffer(&gpu, Precision::Bf16, slots, dim)?,
+                    gate_up: gpu.alloc(slots * 2 * spec.hidden)?,
+                    gated: input_buffer(&gpu, Precision::Bf16, slots, spec.hidden)?,
+                    down: gpu.alloc(slots * dim)?,
+                })
+            }
+            None => None,
+        };
         let logits_device = gpu.alloc((logits_rows + PADDING_ROWS) * vocab_size)?;
         let results_device = gpu.alloc(options.max_batch * 2)?;
         let candidate_values_device = gpu.alloc(options.max_batch * MAX_CANDIDATES)?;
@@ -607,6 +707,7 @@ impl CudaBackend {
                 attn_out,
                 gate_up,
                 gated,
+                moe,
                 logits_device,
                 step_buffer,
                 slot_list_buffer: Growing::default(),
@@ -767,6 +868,154 @@ impl CudaBackend {
                 Arg::Float(self.eps),
             ],
         )
+    }
+
+    /// Queue a mixture of experts on the normalized input in `xb`, adding its result to `x`.
+    fn experts(&self, experts: &Experts, batch: usize) -> Result<()> {
+        let moe = self
+            .moe
+            .as_ref()
+            .expect("allocated for a mixture of experts");
+        let spec = self
+            .architecture
+            .experts
+            .expect("a sparse layer has experts");
+        let (count, top_k, hidden, dim) = (spec.count, spec.top_k, spec.hidden, self.dim);
+        self.matmul(&experts.router, self.xb, batch, moe.scores, false)?;
+        self.gpu.launch(
+            self.kernels.moe_route,
+            [batch, 1],
+            &[
+                Arg::Ptr(moe.scores),
+                Arg::Int(count),
+                Arg::Int(top_k),
+                Arg::Int(spec.renormalize as usize),
+                Arg::Ptr(moe.topk_ids),
+                Arg::Ptr(moe.topk_weights),
+            ],
+        )?;
+        self.gpu.launch_blocks(
+            self.kernels.moe_sort,
+            [1, 1],
+            256,
+            &[
+                Arg::Ptr(moe.topk_ids),
+                Arg::Int(batch),
+                Arg::Int(top_k),
+                Arg::Int(count),
+                Arg::Ptr(moe.sorted_rows),
+                Arg::Ptr(moe.slot_of),
+                Arg::Ptr(moe.group_expert),
+                Arg::Ptr(moe.num_groups),
+            ],
+        )?;
+        // Launched for as many slots as there could be; the kernels stop at the real number.
+        let slots = moe_slots(batch, &spec);
+        self.gpu.launch(
+            self.kernels.moe_gather,
+            [slots, 1],
+            &[
+                Arg::Ptr(self.xb),
+                Arg::Int(dim / TILE),
+                Arg::Ptr(moe.sorted_rows),
+                Arg::Ptr(moe.num_groups),
+                Arg::Ptr(moe.x),
+            ],
+        )?;
+        self.moe_matmul(experts.gate_up, 2 * hidden, dim, slots, moe.x, moe.gate_up)?;
+        let gated = match self.architecture.activation {
+            Activation::Silu => self.kernels.moe_swiglu,
+            Activation::Gelu => self.kernels.moe_geglu,
+        };
+        self.gpu.launch(
+            gated,
+            [slots, hidden.div_ceil(SWIGLU_COLUMNS)],
+            &[
+                Arg::Ptr(moe.gate_up),
+                Arg::Ptr(moe.gated),
+                Arg::Int(hidden),
+                Arg::Int(hidden / TILE),
+                Arg::Ptr(moe.num_groups),
+            ],
+        )?;
+        self.moe_matmul(experts.down, dim, hidden, slots, moe.gated, moe.down)?;
+        self.gpu.launch(
+            self.kernels.moe_combine,
+            [batch, 1],
+            &[
+                Arg::Ptr(moe.down),
+                Arg::Int(dim),
+                Arg::Ptr(moe.slot_of),
+                Arg::Ptr(moe.topk_weights),
+                Arg::Int(top_k),
+                Arg::Ptr(self.x),
+            ],
+        )
+    }
+
+    /// Queue `out = W_e x` for each 16-row group of `x` and its expert `e`, with each expert's
+    /// `[m, cols]` weights one after another from `w`.
+    fn moe_matmul(
+        &self,
+        w: Pointer,
+        m: usize,
+        cols: usize,
+        slots: usize,
+        x: Pointer,
+        out: Pointer,
+    ) -> Result<()> {
+        let moe = self
+            .moe
+            .as_ref()
+            .expect("allocated for a mixture of experts");
+        let groups = slots / TILE;
+        let (kernel, tx) = match groups {
+            1 => (self.kernels.moe_matmul_1, 1),
+            2 => (self.kernels.moe_matmul_2, 2),
+            _ => (self.kernels.moe_matmul_4, 4),
+        };
+        self.gpu.launch_blocks(
+            kernel,
+            [groups.div_ceil(tx), m.div_ceil(TILE * WARPS_ACROSS)],
+            32 * WARPS_ACROSS * tx,
+            &[
+                Arg::Ptr(w),
+                Arg::Int(m * cols),
+                Arg::Ptr(moe.group_expert),
+                Arg::Ptr(moe.num_groups),
+                Arg::Int(m),
+                Arg::Int(cols / TILE),
+                Arg::Ptr(x),
+                Arg::Ptr(out),
+            ],
+        )
+    }
+
+    /// Queue the normalization of a whole token's queries, and keys, as OLMoE does: the same
+    /// kernel as for heads, treating each as one big head.
+    fn full_qk_norms(&self, q_weight: Pointer, k_weight: Pointer, batch: usize) -> Result<()> {
+        let (q_dim, kv_dim) = (
+            self.n_heads * self.head_dim,
+            self.n_kv_heads * self.head_dim,
+        );
+        let stride = q_dim + 2 * kv_dim;
+        for (offset, n_q, n_k, len) in [(0, 1, 0, q_dim), (q_dim, 0, 1, kv_dim)] {
+            self.gpu.launch(
+                self.kernels.head_norm,
+                [batch, 1],
+                &[
+                    Arg::Ptr(self.qkv.offset(offset)),
+                    Arg::Int(stride),
+                    Arg::Int(n_q),
+                    Arg::Int(n_k),
+                    Arg::Int(len),
+                    Arg::Ptr(q_weight),
+                    Arg::Ptr(k_weight),
+                    Arg::Float(self.eps),
+                ],
+            )?;
+        }
+        Ok(())
     }
 
     /// Queue the normalization of each head of the queries and keys.
@@ -1008,7 +1257,10 @@ impl CudaBackend {
             self.rmsnorm(self.x, self.xb, layer.attn_norm, batch, Pointer::NULL)?;
             self.matmul(&layer.qkv, self.xb, batch, self.qkv, false)?;
             if let Some((q_weight, k_weight)) = layer.head_norms {
-                self.head_norms(q_weight, k_weight, batch)?;
+                match self.architecture.full_qk_norms {
+                    true => self.full_qk_norms(q_weight, k_weight, batch)?,
+                    false => self.head_norms(q_weight, k_weight, batch)?,
+                }
             }
             self.rope_and_store(layer, batch, step)?;
             self.attention(layer, batch, step)?;
@@ -1016,7 +1268,14 @@ impl CudaBackend {
 
             // MLP block: process each token on its own.
             self.rmsnorm(self.x, self.xb, layer.mlp_norm, batch, Pointer::NULL)?;
-            self.matmul(&layer.gate_up, self.xb, batch, self.gate_up, false)?;
+            let (gate_up, down) = match &layer.feed_forward {
+                FeedForward::Dense { gate_up, down } => (gate_up, down),
+                FeedForward::Sparse(experts) => {
+                    self.experts(experts, batch)?;
+                    continue;
+                }
+            };
+            self.matmul(gate_up, self.xb, batch, self.gate_up, false)?;
             let swiglu_args = [
                 Arg::Ptr(self.gate_up),
                 Arg::Ptr(self.gated),
@@ -1031,7 +1290,7 @@ impl CudaBackend {
                 )?,
                 Precision::F32 => self.gpu.launch(gated, [batch, 1], &swiglu_args[..3])?,
             }
-            self.add_block_output(&layer.down, self.gated, batch, layer.norm_after_mlp)?;
+            self.add_block_output(down, self.gated, batch, layer.norm_after_mlp)?;
         }
         Ok(())
     }
@@ -1491,6 +1750,105 @@ fn upload_stacked(
         scratch,
         scales: Pointer::NULL,
         fp8: false,
+    })
+}
+
+/// The most slots a mixture of experts can need for `rows` rows: every (row, expert) pair, and
+/// each expert's run padded to a whole 16-row group.
+fn moe_slots(rows: usize, spec: &ConfigExperts) -> usize {
+    (rows * spec.top_k + spec.count * (TILE - 1)).next_multiple_of(TILE)
+}
+
+/// Upload a layer's mixture of experts: the router, and every expert's weights in the 16-bit tile
+/// layout, one expert after another.
+#[allow(clippy::too_many_arguments)]
+fn upload_experts(
+    gpu: &Gpu,
+    st: &SafeTensors,
+    num_params: &mut usize,
+    p: &str,
+    spec: &ConfigExperts,
+    dim: usize,
+    batch_rows: usize,
+    residual: f32,
+) -> Result<Experts> {
+    let h = spec.hidden;
+    ensure!(
+        dim.is_multiple_of(TILE) && h.is_multiple_of(TILE),
+        "experts' sizes have to be multiples of 16 on the GPU"
+    );
+    let router_name = match spec.naming {
+        ExpertNaming::Qwen => format!("{p}.mlp.gate"),
+        ExpertNaming::Mixtral => format!("{p}.block_sparse_moe.gate"),
+        ExpertNaming::Granite => format!("{p}.block_sparse_moe.router.layer"),
+    };
+    let router = upload_stacked(
+        gpu,
+        st,
+        Precision::Bf16,
+        num_params,
+        &[(router_name, spec.count)],
+        dim,
+        batch_rows,
+        1.0,
+        None,
+    )?;
+    let scaled = |values: Vec<u16>| -> Vec<u16> {
+        match residual == 1.0 {
+            true => values,
+            false => values
+                .into_iter()
+                .map(|v| f32_to_bf16(bf16_to_f32(v) * residual))
+                .collect(),
+        }
+    };
+    let mut gate_up: Vec<u16> = Vec::with_capacity(spec.count * 2 * h * dim);
+    let mut down: Vec<u16> = Vec::with_capacity(spec.count * dim * h);
+    match spec.naming {
+        ExpertNaming::Granite => {
+            let input_name = format!("{p}.block_sparse_moe.input_linear.weight");
+            let output_name = format!("{p}.block_sparse_moe.output_linear.weight");
+            let input = st.load_bf16(&input_name, &[spec.count, 2 * h, dim])?;
+            let output = st.load_bf16(&output_name, &[spec.count, dim, h])?;
+            for e in 0..spec.count {
+                gate_up.extend(to_tiles(
+                    &input[e * 2 * h * dim..][..2 * h * dim],
+                    2 * h,
+                    dim,
+                ));
+                let expert_down = scaled(output[e * dim * h..][..dim * h].to_vec());
+                down.extend(to_tiles(&expert_down, dim, h));
+            }
+        }
+        ExpertNaming::Qwen | ExpertNaming::Mixtral => {
+            let (prefix, [gate, up, down_name]) = match spec.naming {
+                ExpertNaming::Qwen => (
+                    format!("{p}.mlp.experts"),
+                    ["gate_proj", "up_proj", "down_proj"],
+                ),
+                _ => (format!("{p}.block_sparse_moe.experts"), ["w1", "w3", "w2"]),
+            };
+            for e in 0..spec.count {
+                let mut stacked =
+                    st.load_bf16(&format!("{prefix}.{e}.{gate}.weight"), &[h, dim])?;
+                stacked.extend(st.load_bf16(&format!("{prefix}.{e}.{up}.weight"), &[h, dim])?);
+                gate_up.extend(to_tiles(&stacked, 2 * h, dim));
+                let expert_down =
+                    st.load_bf16(&format!("{prefix}.{e}.{down_name}.weight"), &[dim, h])?;
+                down.extend(to_tiles(&scaled(expert_down), dim, h));
+            }
+        }
+    }
+    *num_params += spec.count * 3 * h * dim;
+    let upload = |values: &[u16]| -> Result<Pointer> {
+        let device = gpu.alloc(values.len().div_ceil(2))?;
+        gpu.write_now(device, values)?;
+        Ok(device)
+    };
+    Ok(Experts {
+        router,
+        gate_up: upload(&gate_up)?,
+        down: upload(&down)?,
     })
 }
 

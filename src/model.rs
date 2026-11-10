@@ -139,13 +139,13 @@ impl Mlp {
 
 /// What a layer's feed-forward block is.
 enum FeedForward {
-    Dense(Box<Mlp>),
+    Dense(Mlp),
     /// A mixture of experts (see [`crate::config::Experts`]).
     Sparse {
         router: Linear,
         experts: Vec<Mlp>,
         /// An expert every token goes through, scaled by `sigmoid(gate(x))`.
-        shared: Option<(Mlp, Linear)>,
+        shared: Option<Box<(Mlp, Linear)>>,
     },
 }
 
@@ -162,7 +162,7 @@ impl FeedForward {
                     + experts.iter().map(Mlp::num_params).sum::<usize>()
                     + shared
                         .as_ref()
-                        .map_or(0, |(mlp, gate)| mlp.num_params() + gate.num_params())
+                        .map_or(0, |shared| shared.0.num_params() + shared.1.num_params())
             }
         }
     }
@@ -246,14 +246,14 @@ fn load_experts(
         }
     };
     let shared = match spec.shared_hidden {
-        Some(hidden) => Some((
+        Some(hidden) => Some(Box::new((
             mlp(
                 &format!("{p}.mlp.shared_expert"),
                 ["gate_proj", "up_proj", "down_proj"],
                 hidden,
             )?,
             Linear::load(st, &format!("{p}.mlp.shared_expert_gate"), 1, dim)?,
-        )),
+        ))),
         None => None,
     };
     Ok(FeedForward::Sparse {
@@ -539,7 +539,7 @@ impl Model {
                 mlp_norm,
                 feed_forward: match (shape.sparse, &architecture.experts) {
                     (true, Some(spec)) => load_experts(&st, &p, spec, dim, residual)?,
-                    _ => FeedForward::Dense(Box::new(Mlp {
+                    _ => FeedForward::Dense(Mlp {
                         gate_proj: gate_proj.context("a dense layer needs gate_proj")?,
                         up_proj: up_proj.context("a dense layer needs up_proj")?,
                         down_proj: Linear::load_scaled(
@@ -549,7 +549,7 @@ impl Model {
                             hidden_dim,
                             residual,
                         )?,
-                    })),
+                    }),
                 },
                 norm_after_mlp,
                 rope_table: shape.rope_table,
@@ -821,7 +821,7 @@ impl Model {
                     experts,
                     shared,
                 } => {
-                    let shared = shared.as_ref();
+                    let shared = shared.as_deref();
                     self.experts(
                         pool,
                         router,

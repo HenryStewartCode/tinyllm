@@ -4,7 +4,8 @@ A small LLM serving engine in Rust, built on the same ideas as
 [SGLang](https://github.com/sgl-project/sglang): continuous batching, a radix-tree prefix cache
 and fast structured output, behind OpenAI-, Anthropic- and Ollama-compatible APIs. It runs
 Llama-style models (Llama 2/3, Qwen2.5, Qwen3, Mistral, SmolLM2/3, Phi-3, Granite, Gemma 1–3,
-TinyLlama), reasoning models, and embedding models straight from Hugging Face checkpoints, on
+TinyLlama), mixtures of experts (Qwen3-MoE, Mixtral, OLMoE, Granite MoE, Qwen2-MoE), reasoning
+models, and embedding models straight from Hugging Face checkpoints, on
 NVIDIA GPUs or on the CPU, with no ML framework underneath. Everything from weight loading and
 tokenization to the GPU and SIMD kernels and the HTTP server is here, in about 18,000 lines
 including tests. See [How it compares with SGLang](#how-it-compares-with-sglang) for what's still
@@ -46,6 +47,8 @@ cargo run --release -- -m models/SmolLM2-135M-Instruct --chat
 | `HuggingFaceTB/SmolLM2-360M-Instruct`, `SmolLM2-1.7B-Instruct` | 720 MB, 3.4 GB | | same architecture as the 135M |
 | `TinyLlama/TinyLlama-1.1B-Chat-v1.0` | 2.2 GB | | Llama 2 style tokenizer |
 | `google/gemma-3-1b-it`, `gemma-2-2b-it` | 2 GB, 5 GB | | gated. Checked with random weights only. |
+| `ibm-granite/granite-3.1-1b-a400m-instruct` | 2.7 GB | ~36 tok/s (4 cores) | a mixture of 32 experts, 8 per token. Verified. |
+| `allenai/OLMoE-1B-7B-0924-Instruct` | 14 GB | | 64 experts, 8 per token. Checked with random weights. |
 
 "Verified" means checked against Hugging Face's reference implementation (see
 [Correctness](#correctness)); the others use the same architecture and tokenizer code but
@@ -178,6 +181,19 @@ Whether a model thinks is worked out from its chat template and vocabulary; `--r
 (`qwen3`, `deepseek-r1`, `none`) overrides that. A template that opens the block itself, or closes
 an empty one to turn thinking off, is noticed from how the prompt ends. The Anthropic API's
 `thinking` blocks and Ollama's `thinking` field come from the same place.
+
+### Mixtures of experts
+
+Qwen3-MoE, Mixtral, OLMoE and Granite MoE run on the CPU and the GPU, and Qwen2-MoE (with its
+shared expert) on the CPU. A router scores the experts for each token, which goes through its best
+few. Rows are grouped by expert, so each expert's weights are read once per step for all the rows
+it has; on the GPU, choosing, grouping, multiplying and adding up all happen in kernels whose
+launches don't depend on which experts were chosen, so CUDA graphs can still replay a step. Each
+token's results are added up in order of expert, so batching changes nothing. The GPU keeps
+experts' weights 16-bit.
+
+On an RTX 2000 Ada, Granite 3.1's 1B mixture (400M parameters active per token) generates 159
+tokens/s for one request and 4,314 for 128 at once.
 
 ### Embeddings
 
@@ -431,7 +447,12 @@ Checked against Hugging Face `transformers` (float32) and `tokenizers`:
 - **Every architecture:** random-weight models built by `transformers` for Llama, Qwen3 (with and
   without sliding windows), Mistral with a window, Phi-3, Granite, SmolLM3, Gemma, Gemma 2 (with
   soft-capping, and with 256-wide heads) and Gemma 3 (alternating sliding and global layers) match
-  to within 4e-4 on the CPU and the GPU in 32 bits, and batching never changes a result.
+  to within 4e-4 on the CPU and the GPU in 32 bits, and batching never changes a result. So do
+  mixtures of experts (Qwen3-MoE, Qwen2-MoE, Mixtral, OLMoE, Granite MoE: within 2.2e-7 on the
+  CPU, and on the GPU in 16 bits as closely as `transformers`' own 16-bit mode).
+- **A real mixture of experts:** Granite 3.1 1B-A400M matches 32-bit `transformers` to within
+  2.2e-4 on the CPU, and its greedy generations are identical for 32 tokens on the CPU and the GPU
+  (where `transformers`' 16-bit mode diverged after one token on one prompt).
 - **Embeddings:** Qwen3-Embedding-0.6B gives vectors with cosine similarity 1.000000 to
   `transformers`' in 32 bits (largest difference 3e-7), on the CPU and GPU, and at least 0.99996 in
   16 bits.
@@ -502,16 +523,16 @@ missing is breadth, and the last 10–20% of single-stream speed.
 | Tool calling, with `tool_choice` and strict schemas | yes, with parsers for many model families | yes, for the families that run here: Qwen and Hermes, Mistral, Llama 3 |
 | Reasoning parsers, thinking budgets | yes, for many families | yes, for `<think>` models (Qwen3, SmolLM3, DeepSeek-R1 and others) |
 | Speculative decoding | yes: EAGLE, MTP, draft models, n-grams | n-grams only, with replies exactly as without it |
-| Architectures | many, including mixture-of-experts | dense Llama-style (Llama, Mistral, Qwen2/3, SmolLM2/3, Phi-3, Granite, Gemma 1–3); **no mixture-of-experts** |
+| Architectures | many | Llama-style (Llama, Mistral, Qwen2/3, SmolLM2/3, Phi-3, Granite, Gemma 1–3) and mixtures of experts (Qwen3-MoE, Qwen2-MoE, Mixtral, OLMoE, Granite MoE). **No DeepSeek (MLA), GPT-OSS, hybrid attention models** |
 | Sliding-window attention, logit soft-capping | yes | yes |
 | Embedding models | yes | yes, with last-token pooling |
 | Vision, rerank, reward models | yes | **no** |
 | Multi-GPU, multi-node, router | yes | **no** |
 | The SGL frontend language (`gen`, `select`, `fork`) | yes | **no** |
 
-Biggest gaps first, the plan is: mixture-of-experts models, overlapping CPU scheduling with GPU
-work, a Metal backend for Apple GPUs, LoRA adapters, 4-bit weights (AWQ/GPTQ), then draft-model
-speculative decoding.
+Biggest gaps first, the plan is: overlapping CPU scheduling with GPU work, a Metal backend for
+Apple GPUs, LoRA adapters, 4-bit weights (AWQ/GPTQ), DeepSeek's attention (MLA), then
+draft-model speculative decoding.
 
 Other limitations: only BPE tokenizers are supported (not SentencePiece Unigram or WordPiece,
 though that covers the Llama family), embeddings only use last-token pooling, and sliding windows
