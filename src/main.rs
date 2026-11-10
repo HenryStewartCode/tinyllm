@@ -75,6 +75,9 @@ enum SpeculativeArg {
     None,
     /// Copy what followed the last few tokens earlier in the text (SGLang's NGRAM)
     Ngram,
+    /// Guess with a smaller model that shares the tokenizer, given by
+    /// --speculative-draft-model-path (SGLang's STANDALONE)
+    Standalone,
 }
 
 /// How to separate a reasoning model's thinking from its answer.
@@ -208,6 +211,11 @@ struct Args {
     #[arg(long, default_value_t = 6)]
     speculative_num_draft_tokens: usize,
 
+    /// The smaller model that guesses ahead for --speculative-algorithm standalone. It needs the
+    /// same tokenizer as the model
+    #[arg(long)]
+    speculative_draft_model_path: Option<PathBuf>,
+
     /// A LoRA adapter (a PEFT directory) that requests can choose by naming it as their model,
     /// or in `lora_path`: NAME=PATH, or just PATH to name it after its directory. Repeat for more.
     /// Without --serve, the first one is used
@@ -245,7 +253,14 @@ fn main() -> Result<()> {
         .batch_size
         .unwrap_or(if on_gpu { 512 } else { 64 })
         .max(1);
-    let cache_bytes = args.cache_mb.map(|mb| mb << 20);
+    let standalone = args.speculative_algorithm == SpeculativeArg::Standalone;
+    // On an NVIDIA GPU the cache takes what's left unless told otherwise, which would leave
+    // nothing for a draft model's.
+    let cache_bytes = match (args.cache_mb, standalone && device == Device::Cuda) {
+        (Some(mb), _) => Some(mb << 20),
+        (None, true) => Some(2048 << 20),
+        (None, false) => None,
+    };
 
     let cpu = |cache_bytes: Option<usize>| -> Result<(Config, usize, Box<dyn Backend>)> {
         let bytes = cache_bytes.unwrap_or_else(|| default_cache_mb() << 20);
@@ -342,12 +357,26 @@ fn main() -> Result<()> {
         ctx_size: args.ctx_size.unwrap_or(config.max_position_embeddings),
         speculative: match args.speculative_algorithm {
             SpeculativeArg::None => None,
-            SpeculativeArg::Ngram => Some(Speculative {
+            SpeculativeArg::Ngram | SpeculativeArg::Standalone => Some(Speculative {
                 draft_tokens: args.speculative_num_draft_tokens,
                 // Past this many rows a batch stops being nearly free.
                 max_draft_rows: if device == Device::Cuda { 64 } else { 16 },
             }),
         },
+    };
+    let draft = match (standalone, &args.speculative_draft_model_path) {
+        (true, Some(path)) => Some(load_draft(
+            path,
+            &*backend,
+            &tokenizer,
+            &args,
+            threads,
+            batch_size.max(parallel + 8),
+        )?),
+        (true, None) => {
+            bail!("--speculative-algorithm standalone needs --speculative-draft-model-path")
+        }
+        (false, _) => None,
     };
     let params = GenerateParams {
         // Without the server, the first adapter (if any) is the one to use.
@@ -373,7 +402,13 @@ fn main() -> Result<()> {
         ),
         ..Default::default()
     };
-    let engine = engine::start(backend, tokenizer.clone(), engine_config, config.vocab_size);
+    let engine = engine::start(
+        backend,
+        draft,
+        tokenizer.clone(),
+        engine_config,
+        config.vocab_size,
+    );
 
     if args.serve {
         let model_name = args.model.file_name().map_or_else(
@@ -452,6 +487,69 @@ fn main() -> Result<()> {
         cli.generate(tokenizer.encode(prompt, true), false)?;
         Ok(())
     }
+}
+
+/// Load the draft model for speculative decoding on the same kind of device as the model, with a
+/// cache that has every slot the model's does (the two keep a token in the same slot).
+fn load_draft(
+    path: &std::path::Path,
+    model: &dyn Backend,
+    tokenizer: &Tokenizer,
+    args: &Args,
+    threads: usize,
+    max_batch: usize,
+) -> Result<Box<dyn Backend>> {
+    let config = Config::load(path)?;
+    let draft_tokenizer = Tokenizer::load(path)?;
+    let sample =
+        "Hello, world! The quick brown fox jumps over the lazy dog. 1234 ½ 你好 <|im_end|>";
+    if draft_tokenizer.encode(sample, true) != tokenizer.encode(sample, true) {
+        bail!(
+            "the draft model {} needs the same tokenizer as the model",
+            path.display()
+        );
+    }
+    let described = model.describe();
+    let (on_cuda, on_metal) = (described.contains("(CUDA"), described.contains("(Metal"));
+    let element = match (on_cuda, args.precision) {
+        (true, PrecisionArg::Bf16) => 2,
+        _ => 4,
+    };
+    let per_token =
+        2 * config.num_hidden_layers * config.n_kv_heads() * config.head_dim() * element;
+    // A page to spare, since GPU caches come in whole pages.
+    let cache_bytes = (model.capacity() + 64) * per_token;
+    let draft: Box<dyn Backend> = if on_cuda {
+        let options = cuda::Options {
+            quantization: None,
+            precision: match args.precision {
+                PrecisionArg::Bf16 => cuda::Precision::Bf16,
+                PrecisionArg::F32 => cuda::Precision::F32,
+            },
+            max_batch,
+            cache_bytes: Some(cache_bytes),
+            host_threads: threads,
+        };
+        Box::new(CudaBackend::load(path, &options)?.backend)
+    } else if on_metal {
+        let options = metal::Options {
+            cache_bytes,
+            host_threads: threads,
+        };
+        Box::new(MetalBackend::load(path, &options)?.backend)
+    } else {
+        Box::new(CpuBackend::load(path, threads, cache_bytes)?.backend)
+    };
+    if draft.page_size() != model.page_size() || draft.capacity() < model.capacity() {
+        bail!("the draft model's cache doesn't line up with the model's");
+    }
+    eprintln!(
+        "Guessing ahead with the draft model {} ({} layers) on {}",
+        path.display(),
+        config.num_hidden_layers,
+        draft.describe()
+    );
+    Ok(draft)
 }
 
 /// How many threads to use by default. Using every core is counterproductive: a section of work

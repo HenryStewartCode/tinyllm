@@ -1599,6 +1599,8 @@ impl CudaBackend {
     }
 
     fn try_forward(&mut self, rows: &[Row]) -> Result<()> {
+        // Another backend (a draft model's) may have made its own context current.
+        self.gpu.attach()?;
         let batch = rows.len();
         assert!(batch <= self.max_batch, "batch larger than the buffers");
         let step = self.upload_step(rows)?;

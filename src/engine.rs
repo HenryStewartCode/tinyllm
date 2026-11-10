@@ -281,6 +281,7 @@ impl EngineHandle {
 /// Start an engine on its own thread.
 pub fn start(
     backend: Box<dyn Backend>,
+    draft: Option<Box<dyn Backend>>,
     tokenizer: Arc<Tokenizer>,
     config: EngineConfig,
     vocab_size: usize,
@@ -298,7 +299,9 @@ pub fn start(
     std::thread::Builder::new()
         .name("tinyllm-engine".to_string())
         .stack_size(STACK_BYTES)
-        .spawn(move || Engine::new(backend, tokenizer, config, stats, vocab_size).run(receiver))
+        .spawn(move || {
+            Engine::new(backend, draft, tokenizer, config, stats, vocab_size).run(receiver)
+        })
         .expect("couldn't start the engine thread");
     handle
 }
@@ -309,6 +312,8 @@ struct Sequence {
     tokens: Vec<u32>,
     /// KV slots for `tokens[..slots.len()]`. The rest haven't been through the model yet.
     slots: Vec<u32>,
+    /// How many of those the draft model has been through too (at most `slots.len()`).
+    draft_len: usize,
     /// The sequence's place in the prefix cache, which keeps its shared slots from being evicted.
     pinned: Option<NodeId>,
     /// How many of `tokens` the prefix cache has been told about.
@@ -432,6 +437,9 @@ impl Sequence {
 
 struct Engine {
     backend: Box<dyn Backend>,
+    /// A small model that guesses tokens ahead for speculative decoding, if there is one. It
+    /// keeps its keys and values in the same slots of its own pool as the model does in its.
+    draft: Option<Box<dyn Backend>>,
     tokenizer: Arc<Tokenizer>,
     config: EngineConfig,
     stats: Arc<Stats>,
@@ -446,6 +454,7 @@ struct Engine {
 impl Engine {
     fn new(
         backend: Box<dyn Backend>,
+        draft: Option<Box<dyn Backend>>,
         tokenizer: Arc<Tokenizer>,
         config: EngineConfig,
         stats: Arc<Stats>,
@@ -454,6 +463,7 @@ impl Engine {
         Self {
             cache: PrefixCache::new(config.cache_tokens, backend.page_size()),
             backend,
+            draft,
             tokenizer,
             config,
             stats,
@@ -466,6 +476,9 @@ impl Engine {
 
     fn run(mut self, commands: mpsc::Receiver<Command>) {
         self.backend.attach();
+        if let Some(draft) = &mut self.draft {
+            draft.attach();
+        }
         loop {
             if self.active.is_empty() && self.waiting.is_empty() {
                 // Nothing to do: wait for something to arrive.
@@ -548,6 +561,7 @@ impl Engine {
         self.waiting.push_back(Sequence {
             tokens,
             slots: Vec::new(),
+            draft_len: 0,
             pinned: None,
             prompt_len,
             prompt_committed: false,
@@ -779,6 +793,7 @@ impl Engine {
             seq.draft = 0;
             self.retire(&mut seq);
             seq.slots.clear();
+            seq.draft_len = 0;
             seq.prompt_committed = false;
             self.stats.retractions.fetch_add(1, Relaxed);
             self.waiting.push_front(seq);
@@ -886,6 +901,9 @@ impl Engine {
         if per_sequence == 0 {
             return;
         }
+        if self.draft.is_some() {
+            return self.propose_with_draft(per_sequence);
+        }
         let limit = self.config.ctx_size.min(self.config.cache_tokens);
         for seq in &mut self.active {
             if seq.draft > 0 || seq.pending() != 1 || !seq.can_speculate() {
@@ -900,6 +918,147 @@ impl Engine {
             let guesses = index.propose(&seq.tokens, per_sequence.min(room)).to_vec();
             seq.draft = guesses.len();
             seq.tokens.extend(guesses);
+        }
+    }
+
+    /// Guess up to `per_sequence` tokens ahead for each sequence that's generating, with the draft
+    /// model. It first catches up on the sequence's tokens that the model has been through
+    /// since it last ran (in their own slots), then runs the newest token and each guess in turn
+    /// in slots borrowed for the purpose. Each guess is sampled exactly as the model will sample
+    /// that position (the same settings, and the same random draw), so the better the draft
+    /// model, the more often the guesses turn out right.
+    fn propose_with_draft(&mut self, per_sequence: usize) {
+        let limit = self.config.ctx_size.min(self.config.cache_tokens);
+        let chosen: Vec<usize> = (0..self.active.len())
+            .filter(|&i| {
+                let seq = &self.active[i];
+                seq.draft == 0 && seq.pending() == 1 && seq.can_speculate()
+            })
+            .collect();
+        if chosen.is_empty() {
+            return;
+        }
+        let page_size = self.cache.page_size();
+        let draft = self.draft.as_mut().expect("checked by the caller");
+
+        // Catch up, a batch at a time.
+        let budget = self.config.max_batch.max(1);
+        loop {
+            let mut rows = Vec::new();
+            let mut taken = Vec::new();
+            for &i in &chosen {
+                let seq = &self.active[i];
+                let start = seq.draft_len;
+                let end = seq
+                    .slots
+                    .len()
+                    .min(start + budget.saturating_sub(rows.len()));
+                for pos in start..end {
+                    rows.push(Row {
+                        token: seq.tokens[pos],
+                        slots: &seq.slots[..=pos],
+                        want_logits: false,
+                        sampling: LogitUse::All,
+                        adapter: seq.params.adapter,
+                    });
+                }
+                taken.push((i, end));
+            }
+            if rows.is_empty() {
+                break;
+            }
+            draft.forward(&rows);
+            drop(rows);
+            for (i, end) in taken {
+                self.active[i].draft_len = end;
+            }
+        }
+
+        // Borrow slots for the newest token and the guesses after it, page by page as the
+        // sequence would use them.
+        let mut borrowed: Vec<(usize, Vec<u32>)> = Vec::new();
+        let mut new_pages = Vec::new();
+        for &i in &chosen {
+            let seq = &self.active[i];
+            let room = (seq.params.max_tokens.saturating_sub(seq.generated + 1))
+                .min(limit.saturating_sub(seq.tokens.len() + 1))
+                .min(per_sequence);
+            if room == 0 {
+                continue;
+            }
+            let first = seq.slots.len();
+            let pages = (first + room).div_ceil(page_size) - first.div_ceil(page_size);
+            new_pages.clear();
+            if !self.cache.allocate(pages, &mut new_pages) {
+                continue;
+            }
+            let mut fresh = new_pages.iter().copied();
+            let mut slots = Vec::with_capacity(room);
+            for position in first..first + room {
+                let page = match position % page_size {
+                    0 => fresh.next().expect("counted above"),
+                    _ => match slots.last() {
+                        Some(&slot) => slot / page_size as u32,
+                        None => seq.slots[position - 1] / page_size as u32,
+                    },
+                };
+                slots.push(page * page_size as u32 + (position % page_size) as u32);
+            }
+            borrowed.push((i, slots));
+        }
+
+        // The newest token, then each guess in turn.
+        let longest = borrowed
+            .iter()
+            .map(|(_, slots)| slots.len())
+            .max()
+            .unwrap_or(0);
+        let mut lists: Vec<Vec<u32>> = Vec::new();
+        for round in 0..longest {
+            lists.clear();
+            let going: Vec<usize> = (0..borrowed.len())
+                .filter(|&b| round < borrowed[b].1.len())
+                .collect();
+            for &b in &going {
+                let (i, slots) = &borrowed[b];
+                let seq = &self.active[*i];
+                let mut list = seq.slots.clone();
+                list.extend_from_slice(&slots[..=round]);
+                lists.push(list);
+            }
+            let rows: Vec<Row> = (going.iter().zip(&lists))
+                .map(|(&b, list)| {
+                    let seq = &self.active[borrowed[b].0];
+                    Row {
+                        token: *seq.tokens.last().expect("a sequence has tokens"),
+                        slots: list,
+                        want_logits: true,
+                        sampling: seq.sampler.logit_use(seq.generated + round),
+                        adapter: seq.params.adapter,
+                    }
+                })
+                .collect();
+            draft.forward(&rows);
+            drop(rows);
+            for (row, &b) in going.iter().enumerate() {
+                let seq = &mut self.active[borrowed[b].0];
+                let logits = draft.logits(row);
+                let guess = seq
+                    .sampler
+                    .sample(logits, &seq.tokens, seq.generated + round, None);
+                seq.tokens.push(guess);
+                seq.draft += 1;
+            }
+        }
+
+        // Give the borrowed slots back: the model gets its own when it checks the guesses.
+        for (i, slots) in borrowed {
+            let first = self.active[i].slots.len();
+            for (offset, slot) in slots.iter().enumerate() {
+                if (first + offset).is_multiple_of(page_size) {
+                    self.cache.free_page(slot / page_size as u32);
+                }
+            }
         }
     }
 
@@ -945,6 +1104,7 @@ impl Engine {
             position += page_size;
         }
         seq.slots.truncate(keep);
+        seq.draft_len = seq.draft_len.min(keep);
     }
 
     /// Add the sampled token to its sequence. Returns why the sequence ended, if it has.
@@ -1069,6 +1229,9 @@ impl Engine {
 
     /// Give the sequence's computed tokens to the prefix cache, as far as whole pages go.
     fn commit_into(cache: &mut PrefixCache, seq: &mut Sequence) {
+        // Committing can swap the sequence's slots for shared ones, which the draft model may
+        // not have been through, so it starts again (going over the same tokens is harmless).
+        seq.draft_len = 0;
         if let Some(pinned) = seq.pinned {
             let whole = seq.slots.len() - seq.slots.len() % cache.page_size();
             let adapter = seq.params.adapter;

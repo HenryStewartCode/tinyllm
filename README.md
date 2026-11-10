@@ -282,6 +282,21 @@ All 20 replies were identical with and without guessing, in each case. Requests 
 logprobs or thinking budgets don't guess, and the number of guesses per step is capped so that
 large batches don't spend their time checking guesses.
 
+`--speculative-algorithm standalone --speculative-draft-model-path DIR` guesses with a smaller
+model that shares the tokenizer instead, as SGLang's STANDALONE does. It keeps each token's keys and
+values in the same slot of its own cache as the model does, catches up on what the model has
+accepted, and samples each guess exactly as the model will sample that position (the same
+settings and the same random draw), so a good draft's guesses are often right even at a nonzero
+temperature. With the model as its own draft, every guess is right. Qwen2.5-0.5B guessing 4 tokens
+ahead for Qwen2.5-7B (AWQ) on the RTX 2000 Ada:
+
+| | 1 request | 4 at once |
+|---|---|---|
+| tok/s without / with | 37 / 59 (1.6×) | 138 / 180 (1.3×) |
+
+60% of the guesses were right, and the 20 replies were again identical. Without `--cache-mb`, the
+model's cache gets 2 GiB on an NVIDIA GPU, leaving room for the draft model's.
+
 ### LoRA adapters
 
 `--lora NAME=PATH` (repeat it for more) loads a LoRA adapter in the PEFT format that Hugging Face
@@ -389,7 +404,8 @@ cargo run --release -- -m models/Qwen2.5-0.5B-Instruct --chat --system "You are 
 | `--ctx-size N` | model max | longest allowed conversation, in tokens |
 | `--threads N` | performance cores − 2 | CPU worker threads (on a GPU, all available, for choosing tokens) |
 | `--parallel N` | 32 CPU, 128 GPU | requests in progress at once |
-| `--speculative-algorithm A` | none | `ngram` to guess tokens ahead (see [Speculative decoding](#speculative-decoding)) |
+| `--speculative-algorithm A` | none | `ngram` or `standalone` to guess tokens ahead (see [Speculative decoding](#speculative-decoding)) |
+| `--speculative-draft-model-path DIR` | | the smaller model that guesses for `standalone` |
 | `--speculative-num-draft-tokens N` | 6 | the most tokens to guess ahead per request |
 | `--lora NAME=PATH` | | a LoRA adapter requests can choose (see [LoRA adapters](#lora-adapters)); without `--serve`, the first is used |
 | `--batch-size N` | 64 CPU, 512 GPU | tokens run through the model per step |
@@ -629,7 +645,7 @@ missing is breadth, and the last 10–20% of single-stream speed.
 | Quantized weights | yes: FP8, INT8, AWQ, GPTQ, GGUF, bitsandbytes, MXFP4 and more | FP8 and 4-bit AWQ/GPTQ checkpoints, and 8-bit integers, on the NVIDIA GPU (the CPU and Apple GPU unpack quantized checkpoints to 32 bits); bfloat16 weights stay 16-bit on the CPU. **No GGUF, bitsandbytes, MXFP4, or GPTQ with 8 bits** |
 | Tool calling, with `tool_choice` and strict schemas | yes, with parsers for many model families | yes, for the families that run here: Qwen and Hermes, Mistral, Llama 3, and GPT-OSS's harmony messages |
 | Reasoning parsers, thinking budgets | yes, for many families | yes, for `<think>` models (Qwen3, SmolLM3, DeepSeek-R1 and others) and GPT-OSS's harmony channels (budgets for `<think>` models only) |
-| Speculative decoding | yes: EAGLE, MTP, draft models, n-grams | n-grams only, with replies exactly as without it |
+| Speculative decoding | yes: EAGLE, MTP, draft models, n-grams | draft models and n-grams, with replies exactly as without it. **No EAGLE or MTP** |
 | LoRA adapters | yes, mixed in batches, loaded and unloaded while running | yes, mixed in batches, chosen by `model` or `lora_path`; loaded at start-up only |
 | Architectures | many | Llama-style (Llama, Mistral, Qwen2/3, SmolLM2/3, Phi-3, Granite, Gemma 1–3) and mixtures of experts (Qwen3-MoE, Qwen2-MoE, Mixtral, OLMoE, Granite MoE, GPT-OSS). **No DeepSeek (MLA), hybrid attention models** |
 | Sliding-window attention, logit soft-capping | yes | yes |
@@ -638,7 +654,7 @@ missing is breadth, and the last 10–20% of single-stream speed.
 | Multi-GPU, multi-node, router | yes | **no** |
 | The SGL frontend language (`gen`, `select`, `fork`) | yes | **no** |
 
-Biggest gaps first, the plan is: DeepSeek's attention (MLA), then draft-model speculative
+Biggest gaps first, the plan is: DeepSeek's attention (MLA), then EAGLE-style speculative
 decoding.
 
 Other limitations: only BPE tokenizers are supported (not SentencePiece Unigram or WordPiece,
