@@ -708,7 +708,7 @@ impl Cli {
                     );
                     return Ok(reply);
                 }
-                Event::Embedding(_) => {}
+                Event::Embedding(_) | Event::Scores(_) => {}
                 Event::Error(message) => bail!(message),
             }
         }

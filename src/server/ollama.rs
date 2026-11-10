@@ -389,7 +389,7 @@ async fn reply(app: Arc<App>, job: super::ChatJob, streaming: bool, is_chat: boo
                     }
                     return json_response(StatusCode::OK, &finish(value, &model));
                 }
-                Event::Embedding(_) => {}
+                Event::Embedding(_) | Event::Scores(_) => {}
                 Event::Error(message) => return error(ApiError::invalid(message)),
             }
         }
@@ -440,7 +440,7 @@ async fn reply(app: Arc<App>, job: super::ChatJob, streaming: bool, is_chat: boo
                 }
                 out.push(line(&finish(value, &model)));
             }
-            Event::Embedding(_) => {}
+            Event::Embedding(_) | Event::Scores(_) => {}
             Event::Error(message) => out.push(line(&json!({ "error": message }))),
         }
         stream::iter(out)

@@ -104,6 +104,16 @@ pub struct GenerateParams {
     /// The LoRA adapter to run the model with (see [`crate::lora`]): 0 for none, or the number
     /// it was loaded as.
     pub adapter: u16,
+    /// Instead of generating, send the scores (logits) of these tokens for what follows the
+    /// prompt (see [`Event::Scores`]), as a reranker judging "yes" or "no" uses them.
+    pub score_tokens: Vec<u32>,
+}
+
+impl GenerateParams {
+    /// Whether the request reads something off the prompt rather than generating.
+    fn reads_prompt(&self) -> bool {
+        self.embed || !self.score_tokens.is_empty()
+    }
 }
 
 /// How a reply thinks out loud before it answers (see [`crate::reasoning`]). While it thinks,
@@ -154,6 +164,7 @@ impl Default for GenerateParams {
             skip_special_tokens: true,
             strip_leading_space: false,
             adapter: 0,
+            score_tokens: Vec::new(),
             logprobs: None,
             grammar: None,
             grammar_triggers: Vec::new(),
@@ -225,6 +236,9 @@ pub enum Event {
     /// For a request with [`GenerateParams::embed`]: the final hidden state of the prompt's last
     /// token, after the model's last norm. `Done` follows.
     Embedding(Vec<f32>),
+    /// For a request with [`GenerateParams::score_tokens`]: their scores, in that order. `Done`
+    /// follows.
+    Scores(Vec<f32>),
     Error(String),
 }
 
@@ -400,7 +414,7 @@ impl Sequence {
             && self.constraint.is_none()
             && self.watch.is_none()
             && self.params.logprobs.is_none()
-            && !self.params.embed
+            && !self.params.reads_prompt()
             && match &self.phase {
                 Phase::Answering => true,
                 Phase::Thinking { .. } => self
@@ -442,7 +456,10 @@ impl Sequence {
 
     /// Whether choosing the next token needs every token's score, rather than a shortlist.
     fn needs_all_logits(&self) -> bool {
-        self.constraint.is_some() || self.params.logprobs.is_some() || self.forced().is_some()
+        self.constraint.is_some()
+            || self.params.logprobs.is_some()
+            || self.forced().is_some()
+            || !self.params.score_tokens.is_empty()
     }
 
     /// The tokens that may come next, if they're limited.
@@ -868,7 +885,7 @@ impl Engine {
         let views: Vec<Vec<Logits>> = self
             .active
             .iter()
-            .map(|seq| match (seq.params.embed, seq.logits_row) {
+            .map(|seq| match (seq.params.reads_prompt(), seq.logits_row) {
                 (false, Some(first)) => (first..first + 1 + seq.draft)
                     .map(|row| self.backend.logits(row))
                     .collect(),
@@ -926,6 +943,17 @@ impl Engine {
                         let row = seq.logits_row.expect("checked above");
                         let hidden = self.backend.hidden(row).to_vec();
                         let _ = seq.events.send(Event::Embedding(hidden));
+                        Some(FinishReason::Stop)
+                    }
+                    (false, _) if !seq.params.score_tokens.is_empty() => {
+                        let row = seq.logits_row.expect("checked above");
+                        let scores = match self.backend.logits(row) {
+                            Logits::All(all) => (seq.params.score_tokens.iter())
+                                .map(|&t| all[t as usize])
+                                .collect(),
+                            Logits::Candidates(_) => unreachable!("scores need all the logits"),
+                        };
+                        let _ = seq.events.send(Event::Scores(scores));
                         Some(FinishReason::Stop)
                     }
                     (false, 0) => self.accept_token(i),

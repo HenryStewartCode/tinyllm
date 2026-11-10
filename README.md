@@ -186,6 +186,7 @@ curl http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/jso
 | `POST /v1/chat/completions` | Runs the model's own chat template. Streaming, `n`, logprobs, tool calls, `reasoning_content`. |
 | `POST /v1/completions` | Text or token prompts, one or many. Streaming, `n`, logprobs, `echo`. |
 | `POST /v1/embeddings` | Text or token inputs, `dimensions`, `encoding_format: "base64"`. |
+| `POST /v1/rerank`, `POST /rerank` | `query`, `documents`, `top_n`, `return_documents`, `instruction`: documents ranked by relevance, as Cohere's and Jina's APIs return them. |
 | `POST /v1/messages` | Anthropic's Messages API: content blocks, `tool_use`, extended thinking, streaming events. Also `/v1/messages/count_tokens`. |
 | `POST /api/chat`, `/api/generate`, `/api/embed` | Ollama's API, streaming one JSON object per line. Also `/api/tags`, `/api/show`, `/api/ps`, `/api/version`, `/api/embeddings`. |
 | `GET /v1/models` | |
@@ -271,6 +272,18 @@ batch; `dimensions` cuts the vectors short first, for models trained to allow th
 ```bash
 curl http://127.0.0.1:8000/v1/embeddings -H 'Content-Type: application/json' \
   -d '{"input": ["The capital of China is Beijing.", "Gravity attracts bodies."]}'
+```
+
+### Reranking
+
+`/v1/rerank` ranks documents by how well they answer a query, the way Qwen3-Reranker works: each
+query and document go into its prompt, which asks whether the document meets the query's needs,
+and the score is the chance of "yes" against "no", from the model's scores for those two tokens.
+
+```bash
+tinyllm -m models/Qwen3-Reranker-0.6B --serve
+curl http://127.0.0.1:8000/v1/rerank -H 'Content-Type: application/json' \
+  -d '{"query": "What is the capital of China?", "documents": ["The capital of China is Beijing.", "Gravity attracts bodies."]}'
 ```
 
 ### Speculative decoding
@@ -565,6 +578,8 @@ Checked against Hugging Face `transformers` (float32) and `tokenizers`:
   context. So do
   mixtures of experts (Qwen3-MoE, Qwen2-MoE, Mixtral, OLMoE, Granite MoE: within 2.2e-7 on the
   CPU, and on the GPU in 16 bits as closely as `transformers`' own 16-bit mode).
+- **Reranking:** Qwen3-Reranker-0.6B's scores through `/v1/rerank` are the same as its model
+  card's code with `transformers` gives, to six decimal places.
 - **DeepSeek:** random-weight V2 (group-limited softmax routing) and V3 (query latent, sigmoid
   routing with a correction, YaRN with `mscale`) models match `transformers` to within 3.3e-7 on
   the CPU, and batching changes nothing.
@@ -665,7 +680,8 @@ missing is breadth, and the last 10–20% of single-stream speed.
 | Architectures | many | Llama-style (Llama, Mistral, Qwen2/3, SmolLM2/3, Phi-3, Granite, Gemma 1–3) and mixtures of experts (Qwen3-MoE, Qwen2-MoE, Mixtral, OLMoE, Granite MoE, GPT-OSS, and DeepSeek V2/V3 with latent attention, on the CPU so far). **No hybrid attention models (Qwen3-Next, Jamba)** |
 | Sliding-window attention, logit soft-capping | yes | yes |
 | Embedding models | yes | yes, with last-token pooling |
-| Vision, rerank, reward models | yes | **no** |
+| Rerank models | yes | yes, rerankers that judge with "yes" and "no" (Qwen3-Reranker); **no** cross-encoders with classification heads (BERT-style) |
+| Vision, reward models | yes | **no** |
 | Multi-GPU, multi-node, router | yes | **no** |
 | The SGL frontend language (`gen`, `select`, `fork`) | yes | **no** |
 

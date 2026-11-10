@@ -130,6 +130,8 @@ pub fn serve(server: Server, address: &str) -> Result<()> {
         .route("/get_model_info", get(model_info))
         .route("/get_server_info", get(server_info))
         .route("/flush_cache", post(flush_cache))
+        .route("/v1/rerank", post(rerank))
+        .route("/rerank", post(rerank))
         .route("/load_lora_adapter", post(load_lora_adapter))
         .route("/unload_lora_adapter", post(unload_lora_adapter))
         .route("/health_generate", get(health_generate))
@@ -470,6 +472,7 @@ impl App {
             keep_tokens: Vec::new(),
             thinking: None,
             embed: false,
+            score_tokens: Vec::new(),
         })
     }
 
@@ -719,7 +722,7 @@ async fn collect(
                 results[index].stop_string = stop_string;
                 usage.add(index, &u);
             }
-            Event::Embedding(_) => {}
+            Event::Embedding(_) | Event::Scores(_) => {}
             Event::Error(message) => return Err(ApiError::invalid(message)),
         }
     }
@@ -1120,7 +1123,7 @@ fn stream_events(job: StreamJob) -> impl Stream<Item = Result<Bytes, Infallible>
                     out.push(sse(&chunk));
                 }
             }
-            Event::Embedding(_) => {}
+            Event::Embedding(_) | Event::Scores(_) => {}
             Event::Error(message) => {
                 out.push(sse(&ApiError::invalid(message).body()));
             }
@@ -1485,7 +1488,9 @@ async fn generate(State(app): State<Arc<App>>, body: Bytes) -> Result<Response, 
                     Event::Done { reason, usage, .. } => {
                         sse(&json!({ "text": text, "meta_info": meta(&usage, Some(reason), &id) }))
                     }
-                    Event::Embedding(_) => unreachable!("only embedding requests get these"),
+                    Event::Embedding(_) | Event::Scores(_) => {
+                        unreachable!("only embedding and scoring requests get these")
+                    }
                     Event::Error(message) => sse(&ApiError::invalid(message).body()),
                 };
                 Some((chunk, (receiver, text)))
@@ -1507,7 +1512,7 @@ async fn generate(State(app): State<Arc<App>>, body: Bytes) -> Result<Response, 
                     &json!({ "text": text, "meta_info": meta(&usage, Some(reason), &id) }),
                 ));
             }
-            Event::Embedding(_) => {}
+            Event::Embedding(_) | Event::Scores(_) => {}
             Event::Error(message) => return Err(ApiError::invalid(message)),
         }
     }
@@ -1557,6 +1562,130 @@ async fn server_info(State(app): State<Arc<App>>) -> Response {
             "context_length": app.context_limit(),
         }),
     )
+}
+
+/// `/v1/rerank`, as Cohere's and Jina's APIs (and so most clients) take it.
+#[derive(Deserialize)]
+struct RerankRequest {
+    query: String,
+    /// Strings, or objects with their text in `text`.
+    documents: Vec<Value>,
+    #[serde(default)]
+    top_n: Option<usize>,
+    #[serde(default = "yes")]
+    return_documents: bool,
+    /// What a document should do for the query, in Qwen3-Reranker's prompt.
+    #[serde(default, alias = "instruct")]
+    instruction: Option<String>,
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// Qwen3-Reranker's prompt, around each query and document: the model answers "yes" or "no".
+const RERANK_PREFIX: &str = "<|im_start|>system\nJudge whether the Document meets the requirements \
+    based on the Query and the Instruct provided. Note that the answer can only be \"yes\" or \
+    \"no\".<|im_end|>\n<|im_start|>user\n";
+const RERANK_SUFFIX: &str = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+const RERANK_INSTRUCTION: &str =
+    "Given a web search query, retrieve relevant passages that answer the query";
+
+/// Score how well each document answers the query, as Qwen3-Reranker does: the chance the
+/// model says "yes" rather than "no", from its scores for those two tokens after a prompt
+/// putting the two together.
+async fn rerank(State(app): State<Arc<App>>, body: Bytes) -> Result<Response, ApiError> {
+    let request: RerankRequest = parse_body(&body)?;
+    let tokenizer = &app.server.tokenizer;
+    let (Some(yes), Some(no)) = (tokenizer.token_id("yes"), tokenizer.token_id("no")) else {
+        return Err(ApiError::invalid(
+            "this model's vocabulary has no \"yes\" and \"no\" tokens to rerank with",
+        ));
+    };
+    let texts: Vec<String> = request
+        .documents
+        .iter()
+        .map(|document| match document {
+            Value::String(text) => Ok(text.clone()),
+            other => other["text"]
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| ApiError::invalid("a document must be a string or have a \"text\"")),
+        })
+        .collect::<Result<_, _>>()?;
+    let instruction = request.instruction.as_deref().unwrap_or(RERANK_INSTRUCTION);
+    let (prefix, suffix) = (
+        tokenizer.encode(RERANK_PREFIX, false),
+        tokenizer.encode(RERANK_SUFFIX, false),
+    );
+    let limit = app.context_limit();
+    let mut receivers = Vec::with_capacity(texts.len());
+    for text in &texts {
+        let pair = format!(
+            "<Instruct>: {instruction}\n<Query>: {}\n<Document>: {text}",
+            request.query
+        );
+        let mut tokens = prefix.clone();
+        tokens.extend(tokenizer.encode(&pair, false));
+        tokens.extend_from_slice(&suffix);
+        if tokens.len() >= limit {
+            return Err(ApiError::invalid(format!(
+                "a document makes a prompt of {} tokens, but this model's context limit is {limit}",
+                tokens.len()
+            )));
+        }
+        let params = GenerateParams {
+            score_tokens: vec![no, yes],
+            max_tokens: 1,
+            ..Default::default()
+        };
+        receivers.push(
+            app.start(&tokens, &params, 1)
+                .pop()
+                .expect("one was started"),
+        );
+    }
+    let mut scored = Vec::with_capacity(texts.len());
+    let mut tokens = 0;
+    for (index, mut receiver) in receivers.into_iter().enumerate() {
+        let mut score = None;
+        while let Some(event) = receiver.recv().await {
+            match event {
+                Event::Scores(values) => {
+                    // log_softmax over the pair, then exp: the sigmoid of their difference.
+                    score = Some(1.0 / (1.0 + (values[0] - values[1]).exp()));
+                }
+                Event::Done { usage, .. } => {
+                    tokens += usage.prompt_tokens;
+                    break;
+                }
+                Event::Error(message) => return Err(ApiError::invalid(message)),
+                Event::Text { .. } | Event::Embedding(_) => {}
+            }
+        }
+        let score = score.ok_or_else(|| ApiError::internal("the engine stopped unexpectedly"))?;
+        scored.push((index, score));
+    }
+    scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    scored.truncate(request.top_n.unwrap_or(scored.len()));
+    let results: Vec<Value> = scored
+        .iter()
+        .map(|&(index, score)| {
+            let mut result = json!({ "index": index, "relevance_score": score });
+            if request.return_documents {
+                result["document"] = json!({ "text": texts[index] });
+            }
+            result
+        })
+        .collect();
+    Ok(json_response(
+        StatusCode::OK,
+        &json!({
+            "model": app.server.model_name,
+            "results": results,
+            "usage": { "prompt_tokens": tokens, "total_tokens": tokens },
+        }),
+    ))
 }
 
 /// `/load_lora_adapter` and `/unload_lora_adapter`, as SGLang takes them.
@@ -1706,7 +1835,7 @@ async fn embed(
                     break;
                 }
                 Event::Error(message) => return Err(ApiError::invalid(message)),
-                Event::Text { .. } => {}
+                Event::Text { .. } | Event::Scores(_) => {}
             }
         }
         let mut vector = vector.ok_or_else(|| ApiError::internal("no embedding came back"))?;
@@ -1813,7 +1942,7 @@ async fn health_generate(State(app): State<Arc<App>>) -> Response {
     while let Some(event) = receiver.recv().await {
         match event {
             Event::Done { .. } => return StatusCode::OK.into_response(),
-            Event::Embedding(_) => {}
+            Event::Embedding(_) | Event::Scores(_) => {}
             Event::Error(message) => {
                 return (StatusCode::SERVICE_UNAVAILABLE, message).into_response();
             }
