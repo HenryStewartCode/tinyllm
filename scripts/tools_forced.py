@@ -1,10 +1,10 @@
 """For models that can't be expected to choose tools well: forced calls must still be valid."""
-import json, sys, asyncio
+import json, os, sys, asyncio
 import jsonschema
 from openai import AsyncOpenAI
 base = sys.argv[1]
 c = AsyncOpenAI(base_url=base + "/v1", api_key="none", max_retries=0, timeout=300)
-exec(open("/root/tools_schemas.py").read())
+exec(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools_schemas.py")).read())
 async def one(i, **kw):
     r = await c.chat.completions.create(model="m", messages=[{"role": "user", "content": ASKS[i % len(ASKS)]}], tools=TOOLS, temperature=0.8, seed=i, max_tokens=400, **kw)
     return r.choices[0]

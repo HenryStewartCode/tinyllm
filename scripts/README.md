@@ -16,7 +16,7 @@ laptops slow their GPU as it warms, so timings there are best taken from a cool 
 
 | Script | What it checks |
 |---|---|
-| `compare_random.py HARNESS WORKDIR [case...]` | Every supported architecture, with small random-weight models built by `transformers`: logits on the CPU and GPU against Hugging Face, and bit-identical results whether batched or alone. Needs the SmolLM2 tokenizer at the path at the top. |
+| `compare_random.py HARNESS WORKDIR [case...]` | Every supported architecture, with small random-weight models built by `transformers`: logits on the CPU and GPU against Hugging Face, and bit-identical results whether batched or alone. Needs the SmolLM2 tokenizer, from `models/SmolLM2-135M-Instruct` or wherever `TOKENIZER_DIR` says. |
 | `compare_checkpoint.py HARNESS MODEL_DIR` | A real checkpoint: logits at every position and greedy generations, CPU and GPU, against Hugging Face in 32 and 16 bits. |
 | `compare_int4.py HARNESS INT4_DIR WORKDIR` | A 4-bit AWQ or GPTQ checkpoint: unpacks its weights independently of tinyllm, runs `transformers` on them in 32 bits, and compares logits and greedy generations on the CPU and GPU. |
 | `make_random_checkpoint.py CONFIG_JSON TOKENIZER_DIR OUT_DIR [LAYERS]` | A checkpoint with random bfloat16 weights for any config `transformers` knows, optionally with fewer layers, for measuring speed at a real model's sizes without downloading it. Only the names and shapes come from `transformers`. |

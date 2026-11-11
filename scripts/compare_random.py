@@ -8,7 +8,8 @@ from transformers import AutoConfig, AutoModelForCausalLM
 
 tool, work = sys.argv[1:3]
 only = sys.argv[3:]
-tok_source = "/root/models/SmolLM2-135M-Instruct"
+# Any Llama-style tokenizer will do; by default the one in the repository's models/.
+tok_source = os.environ.get("TOKENIZER_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "models", "SmolLM2-135M-Instruct"))
 vocab = 49152
 common = dict(vocab_size=vocab, hidden_size=256, intermediate_size=512, num_hidden_layers=6, num_attention_heads=8, num_key_value_heads=4,
               max_position_embeddings=2048, bos_token_id=1, eos_token_id=2, pad_token_id=0)
