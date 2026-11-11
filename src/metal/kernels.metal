@@ -33,7 +33,9 @@ inline void load8(device const float *w, ulong at, thread float4 &lo, thread flo
     hi = *(device const float4 *)(w + at + 4);
 }
 
-// One threadgroup per row: x[row] = table[tokens[row]] * scale.
+// One threadgroup per row: x[row] = table[tokens[row]] * scale. A row whose token is NO_TOKEN
+// has its embedding already (an image's, written by the CPU).
+#define NO_TOKEN 0xffffffffu
 struct EmbedArgs {
     uint dim;
     float scale;
@@ -41,6 +43,8 @@ struct EmbedArgs {
 template <typename T>
 inline void embed_rows(device const T *table, device const uint *tokens, device float *x,
                        constant EmbedArgs &a, uint row, uint tid, uint threads) {
+    if (tokens[row] == NO_TOKEN)
+        return;
     const ulong from = (ulong)tokens[row] * a.dim;
     device float *to = x + (ulong)row * a.dim;
     for (uint i = tid; i < a.dim; i += threads)
@@ -570,6 +574,29 @@ kernel void gated(device const float *gate_up [[buffer(0)]], device float *out [
         activated = g / (1.0f + precise::exp(-g));
     }
     out[(ulong)row * a.hidden + i] = activated * u;
+}
+
+// x = GELU(x) for `count` values, with the exact curve: x (1 + erf(x / sqrt 2)) / 2. Metal has
+// no erf, so it's Numerical Recipes' erfc (good to about 1e-7).
+inline float erf_of(float x) {
+    const float z = fabs(x);
+    const float t = 1.0f / (1.0f + 0.5f * z);
+    const float poly =
+        -z * z - 1.26551223f +
+        t * (1.00002368f +
+             t * (0.37409196f +
+                  t * (0.09678418f +
+                       t * (-0.18628806f +
+                            t * (0.27886807f +
+                                 t * (-1.13520398f +
+                                      t * (1.48851587f + t * (-0.82215223f + t * 0.17087277f))))))));
+    const float erfc = t * precise::exp(poly);
+    return x >= 0.0f ? 1.0f - erfc : erfc - 1.0f;
+}
+kernel void gelu_erf(device float *x [[buffer(0)]], constant uint &count [[buffer(1)]],
+                     uint i [[thread_position_in_grid]]) {
+    if (i < count)
+        x[i] = 0.5f * x[i] * (1.0f + erf_of(x[i] * 0.70710678118654752f));
 }
 
 // Scores divided by `divisor`, then soft-capped if `softcap` isn't 0.

@@ -88,6 +88,40 @@ pub struct ImagePart {
 }
 
 impl Multimodal {
+    /// Put each image's tokens where a chat template marked it, with one `image_token` per
+    /// image in `tokens`, in the order of `pictures`. Returns the whole prompt.
+    pub fn expand(
+        tokens: &[u32],
+        image_token: u32,
+        pictures: Vec<crate::vision::Patches>,
+        merge: usize,
+    ) -> anyhow::Result<(Vec<u32>, Self)> {
+        let marked = tokens.iter().filter(|&&t| t == image_token).count();
+        anyhow::ensure!(
+            marked == pictures.len(),
+            "the prompt has places for {marked} images, but {} came with it",
+            pictures.len()
+        );
+        let (mut prompt, mut images) = (Vec::with_capacity(tokens.len()), Vec::new());
+        let mut pictures = pictures.into_iter();
+        for &token in tokens {
+            if token != image_token {
+                prompt.push(token);
+                continue;
+            }
+            let patches = pictures.next().expect("counted above");
+            let (start, count) = (prompt.len(), patches.tokens(merge));
+            prompt.extend((0..count).map(|i| Self::stand_in(patches.hash, i)));
+            images.push(ImagePart {
+                start,
+                tokens: count,
+                patches,
+            });
+        }
+        let multimodal = Self::new(prompt.len(), images, merge);
+        Ok((prompt, multimodal))
+    }
+
     /// The stand-in for token `i` of an image, from the image's hash: never a real token.
     pub fn stand_in(hash: u64, i: usize) -> u32 {
         0x8000_0000 | (hash.wrapping_add(i as u64 * 0x9e37_79b9_7f4a_7c15) >> 33) as u32
@@ -699,7 +733,14 @@ impl Engine {
             )));
             return;
         }
-        if let Some(&bad) = tokens.iter().find(|&&t| t as usize >= self.vocab_size) {
+        // An image's tokens are stand-ins, outside the vocabulary.
+        let in_image = |pos: usize| {
+            (params.multimodal.iter().flat_map(|m| &m.images))
+                .any(|image| (image.start..image.start + image.tokens).contains(&pos))
+        };
+        if let Some((_, &bad)) = (tokens.iter().enumerate())
+            .find(|&(pos, &t)| t as usize >= self.vocab_size && !in_image(pos))
+        {
             let _ = events.send(Event::Error(format!(
                 "token id {bad} is outside the vocabulary"
             )));
@@ -839,6 +880,15 @@ impl Engine {
             .fetch_add(forward_start.elapsed().as_micros() as u64, Relaxed);
         let row_count = rows.len();
         drop(rows);
+        // An image's embeddings aren't needed once all its tokens are through the model.
+        for seq in &mut self.active {
+            let end = seq.slots.len();
+            for (k, image) in (seq.params.multimodal.iter().flat_map(|m| &m.images)).enumerate() {
+                if image.start + image.tokens <= end {
+                    seq.image_embeddings[k] = None;
+                }
+            }
+        }
         if self.eagle() {
             self.keep_features();
         }

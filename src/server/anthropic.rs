@@ -76,6 +76,24 @@ fn unsupported_block(kind: Option<&str>) -> ApiError {
     }
 }
 
+/// An image block's `source` as an OpenAI `image_url` part.
+fn image_part(source: &Value) -> Result<Value, ApiError> {
+    let url = match source["type"].as_str() {
+        Some("base64") => format!(
+            "data:{};base64,{}",
+            source["media_type"].as_str().unwrap_or("image/png"),
+            source["data"].as_str().unwrap_or_default()
+        ),
+        Some("url") => source["url"].as_str().unwrap_or_default().to_string(),
+        _ => {
+            return Err(ApiError::invalid(
+                "an image's source must be base64 or a url",
+            ));
+        }
+    };
+    Ok(json!({ "type": "image_url", "image_url": { "url": url } }))
+}
+
 /// Turn Anthropic's messages into OpenAI's: a system message first, tool results as `tool`
 /// messages, and an assistant's thinking and tool use as `reasoning_content` and `tool_calls`.
 fn openai_messages(request: &MessagesRequest) -> Result<Vec<Value>, ApiError> {
@@ -99,10 +117,13 @@ fn openai_messages(request: &MessagesRequest) -> Result<Vec<Value>, ApiError> {
         };
         match role {
             "user" => {
-                let mut text = String::new();
+                let mut parts = Vec::new();
                 for block in blocks {
                     match block["type"].as_str() {
-                        Some("text") => text.push_str(block["text"].as_str().unwrap_or_default()),
+                        Some("text") => {
+                            parts.push(json!({ "type": "text", "text": block["text"] }))
+                        }
+                        Some("image") => parts.push(image_part(&block["source"])?),
                         Some("tool_result") => {
                             let mut content = text_of(&block["content"])?;
                             if block["is_error"].as_bool() == Some(true) {
@@ -117,8 +138,8 @@ fn openai_messages(request: &MessagesRequest) -> Result<Vec<Value>, ApiError> {
                         other => return Err(unsupported_block(other)),
                     }
                 }
-                if !text.is_empty() {
-                    messages.push(json!({ "role": "user", "content": text }));
+                if !parts.is_empty() {
+                    messages.push(json!({ "role": "user", "content": parts }));
                 }
             }
             "assistant" => {

@@ -39,7 +39,12 @@ pub struct Linear {
 }
 
 impl Linear {
-    pub(crate) fn load(st: &SafeTensors, name: &str, out_dim: usize, in_dim: usize) -> Result<Self> {
+    pub(crate) fn load(
+        st: &SafeTensors,
+        name: &str,
+        out_dim: usize,
+        in_dim: usize,
+    ) -> Result<Self> {
         Self::load_scaled(st, name, out_dim, in_dim, 1.0)
     }
 
@@ -1190,6 +1195,7 @@ impl Model {
             + self.layers.iter().map(per_layer).sum::<usize>()
             + self.norm.len()
             + self.lm_head.as_ref().map_or(0, Linear::num_params)
+            + (self.vision.as_ref()).map_or(0, crate::vision::VisionEncoder::num_params)
     }
 
     /// A mixture of experts: route each row of `ws.xb` to its experts, and leave the weighted

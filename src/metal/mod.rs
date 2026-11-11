@@ -8,6 +8,7 @@
 //! throughout, like the CPU's, so the two agree to within rounding.
 
 mod api;
+mod vision;
 
 use crate::backend::{Backend, LoadedModel, Logits};
 use crate::config::{
@@ -15,7 +16,7 @@ use crate::config::{
     Routing,
 };
 use crate::lora::{LoraAdapter, LoraPair, Module};
-use crate::model::{LogitUse, Row};
+use crate::model::{LogitUse, Row, rope_positions};
 use crate::pool::Pool;
 use crate::safetensors::SafeTensors;
 use anyhow::{Result, bail, ensure};
@@ -24,6 +25,8 @@ use std::cell::Cell;
 use std::path::Path;
 
 const KERNELS: &str = include_str!("kernels.metal");
+/// In place of a token: the row's embedding is already in place (see `embed_rows`).
+const NO_TOKEN: u32 = u32::MAX;
 
 /// Threads that run in lockstep on Apple GPUs.
 const SIMD: usize = 32;
@@ -242,6 +245,7 @@ struct CombineArgs {
 struct Kernels {
     embed_bf16: Pipeline,
     embed_f32: Pipeline,
+    gelu_erf: Pipeline,
     rmsnorm: Pipeline,
     rmsnorm_add: Pipeline,
     head_norm: Pipeline,
@@ -283,6 +287,7 @@ impl Kernels {
         Ok(Self {
             embed_bf16: get("embed_bf16")?,
             embed_f32: get("embed_f32")?,
+            gelu_erf: get("gelu_erf")?,
             rmsnorm: get("rmsnorm")?,
             rmsnorm_add: get("rmsnorm_add")?,
             head_norm: get("head_norm")?,
@@ -908,6 +913,8 @@ pub struct MetalBackend {
     features: Buffer,
     /// How many rows the last forward had.
     last_rows: usize,
+    /// For a vision-language model, its vision encoder.
+    vision: Option<vision::VisionTower>,
 }
 
 /// The matrices LoRA corrections go to, as stacked here, and the modules each stacks.
@@ -1182,12 +1189,17 @@ impl MetalBackend {
             }
         };
         let norm = loader.norm("model.norm.weight", dim, false)?;
+        let vision = match &config.vision_config {
+            Some(c) => Some(vision::VisionTower::load(&loader, c)?),
+            None => None,
+        };
         let num_params = loader.params.get();
 
         // The KV cache gets what was asked for, as long as Metal thinks it'll fit.
         let weight_bytes = |m: &Matrix| m.data.bytes;
         let weights = weight_bytes(&embed)
             + lm_head.as_ref().map_or(0, weight_bytes)
+            + vision.as_ref().map_or(0, vision::VisionTower::weight_bytes)
             + (layers.iter())
                 .map(|l| {
                     let mlp = match &l.feed_forward {
@@ -1290,6 +1302,7 @@ impl MetalBackend {
                 capture: Vec::new(),
                 features,
                 last_rows: 0,
+                vision,
             },
             config,
         })
@@ -1319,7 +1332,7 @@ impl MetalBackend {
         let ws = &self.ws;
         // SAFETY: the GPU finished the last step before `forward` returned, and these are all
         // different buffers.
-        let (tokens, write_slots, row_offset, row_len, logit_rows, cos, sin, lists) = unsafe {
+        let (tokens, write_slots, row_offset, row_len, logit_rows, cos, sin, lists, x) = unsafe {
             (
                 ws.tokens.slice_mut::<u32>(),
                 ws.write_slots.slice_mut::<u32>(),
@@ -1329,6 +1342,7 @@ impl MetalBackend {
                 ws.cos.slice_mut::<f32>(),
                 ws.sin.slice_mut::<f32>(),
                 self.slot_lists.slice_mut::<u32>(),
+                ws.x.slice_mut::<f32>(),
             )
         };
         // SAFETY: as above.
@@ -1347,12 +1361,22 @@ impl MetalBackend {
             lists[offset..offset + visible.len()].copy_from_slice(visible);
             for index in group {
                 let row = &rows[index];
-                assert!(
-                    (row.token as usize) < self.vocab_size,
-                    "token id {} is outside the vocabulary",
-                    row.token
-                );
-                tokens[index] = row.token;
+                // An image's token comes with its embedding, which the embedding kernel leaves.
+                let dim = self.shape.dim;
+                tokens[index] = match row.embedding {
+                    Some(embedding) => {
+                        x[index * dim..(index + 1) * dim].copy_from_slice(embedding);
+                        NO_TOKEN
+                    }
+                    None => {
+                        assert!(
+                            (row.token as usize) < self.vocab_size,
+                            "token id {} is outside the vocabulary",
+                            row.token
+                        );
+                        row.token
+                    }
+                };
                 assert!(
                     (row.adapter as usize) <= self.adapters.len(),
                     "there's no adapter {}",
@@ -1371,12 +1395,12 @@ impl MetalBackend {
                         _ => step.scores = true,
                     }
                 }
-                let position = (row.slots.len() - 1) as f32;
+                let positions = rope_positions(row, self.architecture.mrope, half);
                 for (table, frequencies) in self.architecture.rope_tables.iter().enumerate() {
                     let scale = self.architecture.rope_scales[table];
                     let start = (table * batch + index) * half;
                     for (j, &freq) in frequencies.iter().enumerate() {
-                        let angle = position * freq;
+                        let angle = positions[j] * freq;
                         cos[start + j] = angle.cos() * scale;
                         sin[start + j] = angle.sin() * scale;
                     }
@@ -2421,7 +2445,10 @@ fn encode_matmul(
                 true => &kernels.matmul_vec_bf16[size],
                 false => &kernels.matmul_vec_f32[size],
             };
-            let groups = [w.rows.div_ceil(VEC_GROUP_ROWS), batch.div_ceil(VEC_SIZES[size])];
+            let groups = [
+                w.rows.div_ceil(VEC_GROUP_ROWS),
+                batch.div_ceil(VEC_SIZES[size]),
+            ];
             (pipeline, groups, VEC_THREADS)
         }
         (MatmulKernel::Mma, bf16) => {
@@ -2537,6 +2564,10 @@ impl Backend for MetalBackend {
         memory[..values.len()].copy_from_slice(values);
         eagle.width = width;
         Ok(())
+    }
+
+    fn encode_image(&mut self, patches: &crate::vision::Patches) -> Result<Vec<f32>> {
+        self.encode_image_on_gpu(patches)
     }
 
     fn add_adapter(&mut self, adapter: &LoraAdapter) -> Result<()> {

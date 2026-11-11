@@ -3,7 +3,7 @@
 
 use crate::chat::{self, ChatTemplate};
 use crate::engine::{
-    EngineHandle, Event, FinishReason, GenerateParams, Request, STACK_BYTES, Thinking,
+    EngineHandle, Event, FinishReason, GenerateParams, Multimodal, Request, STACK_BYTES, Thinking,
     TokenLogprob, Usage,
 };
 use crate::grammar::{Grammar, Vocabulary};
@@ -84,6 +84,8 @@ pub struct Server {
     pub adapters: std::sync::RwLock<Adapters>,
     /// The model's configuration, which adapters loaded later are checked against.
     pub config: Arc<crate::config::Config>,
+    /// For a vision-language model, how to read the images that come with prompts.
+    pub images: Option<crate::vision::ImageInput>,
 }
 
 struct App {
@@ -1191,6 +1193,12 @@ fn prepare_chat(app: &App, request: &ChatRequest) -> Result<ChatPrompt, ApiError
     }
     // Some templates only understand plain strings, so a text-only list of parts is joined.
     let mut messages: Vec<Value> = request.messages.iter().map(flatten_content).collect();
+    let sources = take_images(&mut messages)?;
+    let images = match (&app.server.images, sources.is_empty()) {
+        (_, true) => None,
+        (Some(images), false) => Some(images),
+        (None, false) => return Err(ApiError::invalid("this model can't read images")),
+    };
     tools::prepare_messages(&mut messages).map_err(ApiError::invalid)?;
     // GPT-OSS's template looks for its markers in every message's content, which it can't do
     // when a tool-calling message's content is null, as OpenAI's clients send it.
@@ -1225,7 +1233,25 @@ fn prepare_chat(app: &App, request: &ChatRequest) -> Result<ChatPrompt, ApiError
             )
             .map_err(|err| ApiError::invalid(format!("{err:#}")))?;
         let tokens = chat::encode_rendered(&app.server.tokenizer, &text);
+        let (tokens, multimodal) = match images {
+            None => (tokens, None),
+            Some(images) => {
+                let invalid = |err: anyhow::Error| ApiError::invalid(format!("{err:#}"));
+                let pictures = (sources.iter().enumerate())
+                    .map(|(i, source)| {
+                        (images.prepare(source))
+                            .with_context(|| format!("image {}", i + 1))
+                            .map_err(invalid)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let (tokens, multimodal) =
+                    Multimodal::expand(&tokens, images.image_token, pictures, images.merge)
+                        .map_err(invalid)?;
+                (tokens, Some(Arc::new(multimodal)))
+            }
+        };
         let mut params = app.params(&request.sampling, tokens.len())?;
+        params.multimodal = multimodal;
         if let (Some(grammar), Some(reading)) = (&plan.grammar, &tool_reading) {
             let spec = format!(
                 "calls:{}",
@@ -1343,6 +1369,36 @@ fn openai_message(app: &App, reply: &Reply, tool_format: Option<ToolFormat>) -> 
         message["reasoning_content"] = reply.reasoning.clone().into();
     }
     message
+}
+
+/// Take the images out of a conversation, leaving the `{"type": "image"}` parts chat templates
+/// look for in their place, and return each one's data URL (or base64), in order. Images come
+/// as OpenAI's `image_url` parts, or as `image` parts (with the image as `image`, `url` or
+/// `base64`) like transformers' and Qwen's own.
+fn take_images(messages: &mut [Value]) -> Result<Vec<String>, ApiError> {
+    let mut sources = Vec::new();
+    for message in messages {
+        let Some(parts) = message.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for part in parts {
+            let source = match part["type"].as_str() {
+                Some("image_url") => {
+                    (part["image_url"]["url"].as_str()).or(part["image_url"].as_str())
+                }
+                Some("image") => ["image", "url", "base64"]
+                    .iter()
+                    .find_map(|key| part[key].as_str()),
+                _ => continue,
+            };
+            let source = source.ok_or_else(|| {
+                ApiError::invalid("an image_url part needs its image, as image_url.url")
+            })?;
+            sources.push(source.to_string());
+            *part = json!({ "type": "image" });
+        }
+    }
+    Ok(sources)
 }
 
 /// Replace a `content` list of `{"type": "text", "text": ...}` parts with one string.

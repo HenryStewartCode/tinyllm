@@ -41,7 +41,10 @@ inputs = processor(text=[prompt], images=[image], return_tensors="pt")
 model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_dir, dtype=torch.float32).eval()
 with torch.no_grad():
     reference = model(**inputs).logits[0].numpy()
-    generated = model.generate(**inputs, max_new_tokens=steps, do_sample=False)[0, inputs["input_ids"].shape[1]:].tolist()
+    # Plain greedy: generate() would otherwise apply the repetition penalty in the model's
+    # generation_config.json, which the harness's greedy reply doesn't.
+    generated = model.generate(**inputs, max_new_tokens=steps, do_sample=False,
+                               repetition_penalty=1.0)[0, inputs["input_ids"].shape[1]:].tolist()
     # Its reply appended to the prompt, for comparing logits along the same reply below.
     full = torch.cat([inputs["input_ids"], torch.tensor([generated])], dim=1)
     types = torch.cat([inputs["mm_token_type_ids"], torch.zeros(1, len(generated), dtype=inputs["mm_token_type_ids"].dtype)], dim=1)
@@ -59,8 +62,14 @@ differences = np.abs(logits - reference).max(axis=1)
 print(f"largest logit difference: {differences.max():.2e} (image tokens {differences[image_rows].max():.2e}, "
       f"last token {differences[-1]:.2e}); logits up to {np.abs(reference).max():.1f}")
 print(f"top-1 agrees at {(logits.argmax(1) == reference.argmax(1)).mean():.0%} of positions")
+# The harness carries on past the end of the reply, where transformers stops.
+eos = json.load(open(os.path.join(model_dir, "generation_config.json"))).get("eos_token_id", [])
+stops = set(eos if isinstance(eos, list) else [eos])
+ended = next((i + 1 for i, t in enumerate(ours["greedy"]) if t in stops), len(ours["greedy"]))
+ours["greedy"] = ours["greedy"][:ended]
+ours["text"] = processor.decode(ours["greedy"])
 same = next((i for i, (a, b) in enumerate(zip(ours["greedy"], generated)) if a != b), min(len(generated), len(ours["greedy"])))
-print(f"greedy: {same}/{steps} the same")
+print(f"greedy: {same} of {len(generated)} tokens the same")
 print("transformers:", repr(processor.decode(generated)))
 print("tinyllm:     ", repr(ours["text"]))
 

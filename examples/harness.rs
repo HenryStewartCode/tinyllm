@@ -361,7 +361,10 @@ fn main() {
             let text = &args[6];
             let tokenizer = Tokenizer::load(dir).unwrap();
             let config = Config::load(dir).unwrap();
-            let vision = config.vision_config.clone().expect("a vision-language model");
+            let vision = config
+                .vision_config
+                .clone()
+                .expect("a vision-language model");
             let image_token = config.image_token_id.unwrap_or(151655);
             let patches = tinyllm::vision::Preprocessor::load(dir)
                 .unwrap()
@@ -396,10 +399,16 @@ fn main() {
             b.attach();
             let t0 = Instant::now();
             let embeddings = b.encode_image(&image.patches).unwrap();
-            eprintln!("encoded the image ({count} tokens) in {:.2}s", t0.elapsed().as_secs_f64());
+            eprintln!(
+                "encoded the image ({count} tokens) in {:.2}s",
+                t0.elapsed().as_secs_f64()
+            );
             let dim = embeddings.len() / count;
-            let multimodal =
-                tinyllm::engine::Multimodal::new(prompt_len, vec![image], vision.spatial_merge_size);
+            let multimodal = tinyllm::engine::Multimodal::new(
+                prompt_len,
+                vec![image],
+                vision.spatial_merge_size,
+            );
             let position = |i: usize| match multimodal.positions.get(i) {
                 Some(&p) => p,
                 None => [(i as i64 + multimodal.delta) as u32; 3],
@@ -421,12 +430,16 @@ fn main() {
             b.forward(&rows);
             let mut file = std::fs::File::create(out_path).unwrap();
             for i in 0..plen {
-                let Logits::All(l) = b.logits(i) else { panic!() };
+                let Logits::All(l) = b.logits(i) else {
+                    panic!()
+                };
                 for v in l {
                     file.write_all(&v.to_le_bytes()).unwrap();
                 }
             }
-            let Logits::All(last) = b.logits(plen - 1) else { panic!() };
+            let Logits::All(last) = b.logits(plen - 1) else {
+                panic!()
+            };
             let mut token = argmax(last);
             let mut greedy = Vec::new();
             for step in 0..n {
@@ -442,7 +455,9 @@ fn main() {
                     embedding: None,
                 }];
                 b.forward(&rows);
-                let Logits::All(l) = b.logits(0) else { panic!() };
+                let Logits::All(l) = b.logits(0) else {
+                    panic!()
+                };
                 token = argmax(l);
             }
             println!(

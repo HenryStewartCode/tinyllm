@@ -134,19 +134,27 @@ fn thinking_kwargs(think: Option<&Value>) -> Option<Map<String, Value>> {
 }
 
 /// Ollama's messages are OpenAI's, except that tool calls' arguments are objects and images
-/// come separately.
+/// (base64) come separately, ahead of the text as Ollama puts them.
 fn openai_messages(messages: &[Value]) -> Result<Vec<Value>, ApiError> {
     let mut out = Vec::with_capacity(messages.len());
     for (i, message) in messages.iter().enumerate() {
-        if message["images"]
-            .as_array()
-            .is_some_and(|images| !images.is_empty())
-        {
-            return Err(ApiError::invalid("images aren't supported by this model"));
-        }
         let mut message = message.clone();
         if let Some(map) = message.as_object_mut() {
-            map.remove("images");
+            if let Some(Value::Array(images)) = map.remove("images")
+                && !images.is_empty()
+            {
+                let mut parts: Vec<Value> = (images.iter())
+                    .map(|image| json!({ "type": "image", "image": image }))
+                    .collect();
+                match map.get("content") {
+                    Some(Value::String(text)) => {
+                        parts.push(json!({ "type": "text", "text": text }))
+                    }
+                    Some(Value::Null) | None => {}
+                    Some(_) => return Err(ApiError::invalid("a message's content must be text")),
+                }
+                map.insert("content".into(), parts.into());
+            }
             if let Some(thinking) = map.remove("thinking") {
                 map.insert("reasoning_content".into(), thinking);
             }
@@ -252,12 +260,11 @@ pub(super) async fn generate(State(app): State<Arc<App>>, body: Bytes) -> Respon
         Ok(body) => body,
         Err(err) => return error(err),
     };
-    if body
-        .images
-        .as_ref()
-        .is_some_and(|images| !images.is_empty())
-    {
-        return error(ApiError::invalid("images aren't supported by this model"));
+    let images = body.images.clone().unwrap_or_default();
+    if !images.is_empty() && (body.raw || app.server.template.is_none()) {
+        return error(ApiError::invalid(
+            "images need the chat template, not a raw prompt",
+        ));
     }
     if body
         .suffix
@@ -291,7 +298,14 @@ pub(super) async fn generate(State(app): State<Arc<App>>, body: Bytes) -> Respon
     if let Some(system) = &body.system {
         messages.push(json!({ "role": "system", "content": system }));
     }
-    messages.push(json!({ "role": "user", "content": body.prompt }));
+    let content = match images.is_empty() {
+        true => Value::String(body.prompt.clone()),
+        false => (images.iter())
+            .map(|image| json!({ "type": "image", "image": image }))
+            .chain([json!({ "type": "text", "text": body.prompt })])
+            .collect(),
+    };
+    messages.push(json!({ "role": "user", "content": content }));
     let request = ChatRequest {
         messages,
         chat_template_kwargs: thinking_kwargs(body.think.as_ref()),

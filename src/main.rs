@@ -501,6 +501,7 @@ fn main() -> Result<()> {
                 num_params,
                 adapters: std::sync::RwLock::new(Adapters::new(adapter_names)),
                 config: Arc::new(config.clone()),
+                images: tinyllm::vision::ImageInput::load(&args.model, &config)?,
             },
             &format!("{}:{}", args.host, args.port),
         );

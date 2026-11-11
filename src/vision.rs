@@ -127,6 +127,88 @@ impl Preprocessor {
     }
 }
 
+/// What a server needs to take images with a prompt: how to prepare them, and the token a chat
+/// template puts where each one goes.
+pub struct ImageInput {
+    pub preprocessor: Preprocessor,
+    pub image_token: u32,
+    /// How many patches a side of each of the language model's image tokens covers.
+    pub merge: usize,
+}
+
+impl ImageInput {
+    /// For a vision-language model; `None` for any other.
+    pub fn load(dir: &Path, config: &crate::config::Config) -> Result<Option<Self>> {
+        let Some(vision) = &config.vision_config else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            preprocessor: Preprocessor::load(dir)?,
+            image_token: config
+                .image_token_id
+                .context("config.json has no image_token_id")?,
+            merge: vision.spatial_merge_size,
+        }))
+    }
+
+    /// Read an image a request sent, as a data URL or bare base64, and cut it into patches.
+    pub fn prepare(&self, source: &str) -> Result<Patches> {
+        self.preprocessor.prepare(&decode(&image_bytes(source)?)?)
+    }
+}
+
+/// The bytes of an image a request sent: a data URL (`data:image/png;base64,...`) or bare base64.
+pub fn image_bytes(source: &str) -> Result<Vec<u8>> {
+    let source = source.trim();
+    let data = match source.strip_prefix("data:") {
+        Some(url) => {
+            let (kind, data) = url.split_once(',').context("a data URL needs a comma")?;
+            ensure!(
+                kind.ends_with(";base64"),
+                "an image's data URL must be base64"
+            );
+            data
+        }
+        None if source.starts_with("http://") || source.starts_with("https://") => bail!(
+            "images can't be fetched from URLs yet: send the image itself, as a data URL \
+             (data:image/png;base64,...)"
+        ),
+        None => source,
+    };
+    base64_decode(data).context("the image isn't valid base64")
+}
+
+/// Decode base64 in either alphabet (standard or URL-safe), padded or not, ignoring whitespace.
+pub fn base64_decode(text: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(text.len() / 4 * 3);
+    let (mut buffer, mut bits) = (0u32, 0);
+    for (i, byte) in text.bytes().enumerate() {
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            b' ' | b'\t' | b'\r' | b'\n' => continue,
+            // Padding ends the data.
+            b'=' => {
+                return text.as_bytes()[i..]
+                    .iter()
+                    .all(|b| b"= \t\r\n".contains(b))
+                    .then_some(out);
+            }
+            _ => return None,
+        };
+        buffer = (buffer << 6 | value as u32) & 0xffff;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buffer >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
 /// An image, as 8-bit RGB, row by row.
 #[derive(Clone)]
 pub struct Picture {
@@ -284,7 +366,11 @@ fn fnv1a(bytes: impl Iterator<Item = u8>) -> u64 {
 /// Where each window's blocks are once they're put window by window (each window's blocks in
 /// rows, windows in rows), and where each window starts in patches, as transformers' Qwen2.5-VL
 /// works them out: `order[i]` is the block that goes `i`-th.
-pub fn window_order(grid: [usize; 3], merge: usize, window_blocks: usize) -> (Vec<usize>, Vec<usize>) {
+pub fn window_order(
+    grid: [usize; 3],
+    merge: usize,
+    window_blocks: usize,
+) -> (Vec<usize>, Vec<usize>) {
     let [t, h, w] = grid;
     let (blocks_h, blocks_w) = (h / merge, w / merge);
     let windows_h = blocks_h.div_ceil(window_blocks);
@@ -355,13 +441,14 @@ pub struct VisionEncoder {
     merger_fc2: Linear,
 }
 
-const EPS: f32 = 1e-6;
+/// The vision encoder's RMS norms' epsilon.
+pub const EPS: f32 = 1e-6;
 
 impl VisionEncoder {
     pub fn load(st: &SafeTensors, config: &VisionConfig) -> Result<Self> {
         let c = config;
         let (d, inner) = (c.hidden_size, c.intermediate_size);
-        let patch_len = c.in_channels * c.temporal_patch_size * c.patch_size * c.patch_size;
+        let patch_len = c.patch_len();
         // The patch embedding is a convolution with as many weights as a patch has values.
         let name = "visual.patch_embed.proj.weight";
         let shape = [
@@ -402,7 +489,8 @@ impl VisionEncoder {
     }
 
     pub fn num_params(&self) -> usize {
-        self.patch_embed.num_params()
+        self.merger_norm.len()
+            + self.patch_embed.num_params()
             + self.merger_fc1.num_params()
             + self.merger_fc2.num_params()
             + (self.blocks.iter())
@@ -423,63 +511,18 @@ impl VisionEncoder {
         let c = &self.config;
         let (d, heads) = (c.hidden_size, c.num_heads);
         let head_dim = d / heads;
-        let m = c.spatial_merge_size;
-        let unit = m * m;
-        let patch_len = c.in_channels * c.temporal_patch_size * c.patch_size * c.patch_size;
-        let n = patches.grid.iter().product::<usize>();
-        ensure!(
-            patches.values.len() == n * patch_len && n % unit == 0,
-            "the patches don't match the vision encoder"
-        );
-        if head_dim % 4 != 0 {
-            bail!("vision heads of {head_dim} don't split in four for 2D RoPE");
-        }
-        // Blocks go window by window, and so does everything about them.
-        let (order, windows) = window_order(patches.grid, m, c.window_size / m / c.patch_size);
-        let reorder = |values: &[f32], width: usize| -> Vec<f32> {
-            let block = unit * width;
-            (order.iter())
-                .flat_map(|&b| &values[b * block..(b + 1) * block])
-                .copied()
-                .collect()
-        };
+        let unit = c.spatial_merge_size * c.spatial_merge_size;
+        let Layout {
+            order,
+            windows,
+            input,
+            cos,
+            sin,
+        } = layout(c, patches)?;
+        let n = input.len() / c.patch_len();
         let mut scratch = Vec::new();
         let mut x = vec![0.0; n * d];
-        self.patch_embed
-            .forward(pool, &mut x, &mut scratch, &reorder(&patches.values, patch_len));
-
-        // 2D RoPE: each head's first quarter of frequencies turns with the patch's row, the
-        // second with its column (then the same again, for the rotation's other half).
-        let quarter = head_dim / 4;
-        let inv_freq: Vec<f64> = (0..quarter)
-            .map(|k| 1.0 / 10000f64.powf((2 * k) as f64 / (head_dim / 2) as f64))
-            .collect();
-        let [_, grid_h, grid_w] = patches.grid;
-        let mut positions = Vec::with_capacity(n * 2);
-        for frame in 0..patches.grid[0] {
-            let _ = frame;
-            for by in 0..grid_h / m {
-                for bx in 0..grid_w / m {
-                    for iy in 0..m {
-                        for ix in 0..m {
-                            positions.push((by * m + iy) as f32);
-                            positions.push((bx * m + ix) as f32);
-                        }
-                    }
-                }
-            }
-        }
-        let positions = reorder(&positions, 2);
-        let half = head_dim / 2;
-        let (mut cos, mut sin) = (vec![0.0; n * half], vec![0.0; n * half]);
-        for i in 0..n {
-            for j in 0..half {
-                let (axis, k) = (j / quarter, j % quarter);
-                let angle = positions[i * 2 + axis] as f64 * inv_freq[k];
-                cos[i * half + j] = angle.cos() as f32;
-                sin[i * half + j] = angle.sin() as f32;
-            }
-        }
+        self.patch_embed.forward(pool, &mut x, &mut scratch, &input);
 
         let whole = [0, n];
         let mut normed = vec![0.0; n * d];
@@ -505,7 +548,9 @@ impl VisionEncoder {
             rope(pool, &mut q, d, head_dim, &cos, &sin);
             rope(pool, &mut k, d, head_dim, &cos, &sin);
             segment_attention(pool, &mut attended, (&q, &k, &v), heads, segments);
-            block.proj.forward(pool, &mut added, &mut scratch, &attended);
+            block
+                .proj
+                .forward(pool, &mut added, &mut scratch, &attended);
             add_rows(pool, &mut x, &added, d);
             rmsnorm(pool, &mut normed, &x, &block.norm2, EPS);
             block.gate.forward(pool, &mut gate, &mut scratch, &normed);
@@ -525,14 +570,105 @@ impl VisionEncoder {
         hidden.iter_mut().for_each(|v| *v = gelu(*v));
         let out_dim = c.out_hidden_size;
         let mut out = vec![0.0; tokens * out_dim];
-        self.merger_fc2.forward(pool, &mut out, &mut scratch, &hidden);
-        // Back from window order to the image's.
-        let mut result = vec![0.0; tokens * out_dim];
-        for (i, &b) in order.iter().enumerate() {
-            result[b * out_dim..(b + 1) * out_dim].copy_from_slice(&out[i * out_dim..(i + 1) * out_dim]);
-        }
-        Ok(result)
+        self.merger_fc2
+            .forward(pool, &mut out, &mut scratch, &hidden);
+        Ok(unorder(&order, &out))
     }
+}
+
+/// How the encoder goes through an image: block by block in `order` (window by window), with
+/// each patch's 2D RoPE rotation. The same for the GPUs.
+pub struct Layout {
+    /// The image's blocks of patches, in the order the encoder takes them.
+    pub order: Vec<usize>,
+    /// Where each window starts, in patches, then where the last ends.
+    pub windows: Vec<usize>,
+    /// The patches' values in that order, `[patches, patch_len]`.
+    pub input: Vec<f32>,
+    /// Each patch's rotations, `[patches, head_dim / 2]`: the first quarter of each head's
+    /// frequencies turn with the patch's row, the second with its column (then the same again,
+    /// for the rotation's other half).
+    pub cos: Vec<f32>,
+    pub sin: Vec<f32>,
+}
+
+impl VisionConfig {
+    /// How many values a patch has.
+    pub fn patch_len(&self) -> usize {
+        self.in_channels * self.temporal_patch_size * self.patch_size * self.patch_size
+    }
+}
+
+/// Work out how the encoder goes through `patches` (see [`Layout`]).
+pub fn layout(c: &VisionConfig, patches: &Patches) -> Result<Layout> {
+    let head_dim = c.hidden_size / c.num_heads;
+    let m = c.spatial_merge_size;
+    let unit = m * m;
+    let patch_len = c.patch_len();
+    let n = patches.grid.iter().product::<usize>();
+    ensure!(
+        patches.values.len() == n * patch_len && n % unit == 0,
+        "the patches don't match the vision encoder"
+    );
+    ensure!(
+        head_dim.is_multiple_of(4),
+        "vision heads of {head_dim} don't split in four for 2D RoPE"
+    );
+    let (order, windows) = window_order(patches.grid, m, c.window_size / m / c.patch_size);
+    let reorder = |values: &[f32], width: usize| -> Vec<f32> {
+        let block = unit * width;
+        (order.iter())
+            .flat_map(|&b| &values[b * block..(b + 1) * block])
+            .copied()
+            .collect()
+    };
+    let quarter = head_dim / 4;
+    let inv_freq: Vec<f64> = (0..quarter)
+        .map(|k| 1.0 / 10000f64.powf((2 * k) as f64 / (head_dim / 2) as f64))
+        .collect();
+    let [frames, grid_h, grid_w] = patches.grid;
+    let mut positions = Vec::with_capacity(n * 2);
+    for _ in 0..frames {
+        for by in 0..grid_h / m {
+            for bx in 0..grid_w / m {
+                for iy in 0..m {
+                    for ix in 0..m {
+                        positions.push((by * m + iy) as f32);
+                        positions.push((bx * m + ix) as f32);
+                    }
+                }
+            }
+        }
+    }
+    let positions = reorder(&positions, 2);
+    let half = head_dim / 2;
+    let (mut cos, mut sin) = (vec![0.0; n * half], vec![0.0; n * half]);
+    for i in 0..n {
+        for j in 0..half {
+            let (axis, k) = (j / quarter, j % quarter);
+            let angle = positions[i * 2 + axis] as f64 * inv_freq[k];
+            cos[i * half + j] = angle.cos() as f32;
+            sin[i * half + j] = angle.sin() as f32;
+        }
+    }
+    let input = reorder(&patches.values, patch_len);
+    Ok(Layout {
+        order,
+        windows,
+        input,
+        cos,
+        sin,
+    })
+}
+
+/// The encoder's output, one row a block in window order, put back in the image's order.
+pub fn unorder(order: &[usize], out: &[f32]) -> Vec<f32> {
+    let width = out.len() / order.len().max(1);
+    let mut result = vec![0.0; out.len()];
+    for (i, &b) in order.iter().enumerate() {
+        result[b * width..(b + 1) * width].copy_from_slice(&out[i * width..(i + 1) * width]);
+    }
+    result
 }
 
 /// Attention with no causal mask, each row seeing the rows of its own segment: `segments` holds
@@ -585,10 +721,19 @@ mod tests {
     #[test]
     fn sizes_follow_transformers() {
         // A size already in whole blocks stays; others round to the nearest block.
-        assert_eq!(smart_resize(448, 336, 28, 3136, 12845056).unwrap(), (448, 336));
-        assert_eq!(smart_resize(500, 375, 28, 3136, 12845056).unwrap(), (504, 364));
+        assert_eq!(
+            smart_resize(448, 336, 28, 3136, 12845056).unwrap(),
+            (448, 336)
+        );
+        assert_eq!(
+            smart_resize(500, 375, 28, 3136, 12845056).unwrap(),
+            (504, 364)
+        );
         // Too many pixels shrinks it, keeping its shape as far as blocks allow.
-        assert_eq!(smart_resize(4000, 3000, 28, 3136, 1003520).unwrap(), (1148, 840));
+        assert_eq!(
+            smart_resize(4000, 3000, 28, 3136, 1003520).unwrap(),
+            (1148, 840)
+        );
         // Too few grows it.
         assert_eq!(smart_resize(20, 20, 28, 3136, 12845056).unwrap(), (56, 56));
     }
@@ -606,8 +751,28 @@ mod tests {
     }
 
     #[test]
+    fn base64_reads_both_alphabets() {
+        assert_eq!(base64_decode("aGVsbG8=").unwrap(), b"hello");
+        assert_eq!(base64_decode("aGVsbG8").unwrap(), b"hello");
+        assert_eq!(base64_decode("aGVs\nbG8h").unwrap(), b"hello!");
+        assert_eq!(base64_decode("-_8=").unwrap(), [0xfb, 0xff]);
+        assert_eq!(base64_decode("+/8=").unwrap(), [0xfb, 0xff]);
+        assert!(base64_decode("aGV*").is_none());
+        assert!(base64_decode("aG=Vs").is_none());
+        let url = "data:image/png;base64,aGVsbG8=";
+        assert_eq!(image_bytes(url).unwrap(), b"hello");
+        assert!(image_bytes("https://example.com/cat.png").is_err());
+        assert!(image_bytes("data:image/png,hello").is_err());
+    }
+
+    #[test]
     fn erf_is_accurate() {
-        for (x, expected) in [(0.0, 0.0), (0.5, 0.520_499_877_8), (1.0, 0.842_700_792_9), (-2.0, -0.995_322_265)] {
+        for (x, expected) in [
+            (0.0, 0.0),
+            (0.5, 0.520_499_877_8),
+            (1.0, 0.842_700_792_9),
+            (-2.0, -0.995_322_265),
+        ] {
             assert!((erf(x) - expected).abs() < 2e-7, "erf({x}) = {}", erf(x));
         }
     }
