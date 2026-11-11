@@ -140,7 +140,7 @@ On an M1 Max with Qwen3-0.6B, in tokens per second:
 | | 1 request | 8 at once | 32 at once | 64 at once | Reading a prompt |
 |---|---|---|---|---|---|
 | CPU, 4 threads | 65 | 186 | 200 | | 280 |
-| Apple GPU | 110 | 581 | 851 | 1,016 | 2,200–2,700 |
+| Apple GPU | 147 | 642 | 851 | 1,016 | 2,200–2,700 |
 
 For small batches (up to 8 rows), each lane of the matrix kernel takes one weight row and each of a
 threadgroup's 8 simdgroups one run of its columns, so all the lanes of a simdgroup read the same
