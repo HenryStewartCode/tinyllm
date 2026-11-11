@@ -185,66 +185,79 @@ inline void finish_output(device float *out, device const float *bias, constant 
     *at = a.accumulate ? *at + value : value;
 }
 
-// For small batches: each simdgroup takes VEC_ROWS weight rows, with one lane per (row, run),
-// and up to VEC_BATCH rows of x.
-#define VEC_ROWS (SIMD / RANGES)
+// For small batches: each threadgroup of RANGES simdgroups takes SIMD weight rows, one per lane,
+// and up to B rows of x (1, 2, 4, 6 or 8), and simdgroup s works out run s of each of them. So every lane of
+// a simdgroup reads the same columns of x at the same time, which the hardware fetches once for
+// all of them, and each weight is read once. A lane goes through its run a column at a time,
+// doing every row of x's multiply-add for that column together: separate sums, so they don't
+// wait for each other, each still added up in column order. The runs' sums meet in threadgroup
+// memory and the first simdgroup adds them up in order.
 #define VEC_BATCH 8
-#define VEC_STEP 4
-template <typename W>
+#define VEC_STEP 2
+#define VEC_THREADS (RANGES * SIMD)
+#define VEC_PARTIALS (RANGES * VEC_BATCH * SIMD)
+template <uint B, typename W>
 inline void matmul_vec_rows(device const W *w, device const float *x, device float *out,
-                            device const float *bias, constant MatmulArgs &a, uint2 group,
-                            uint simd, uint simds, uint lane) {
-    const uint run = lane % RANGES;
-    const uint m = (group.x * simds + simd) * VEC_ROWS + lane / RANGES;
-    const uint b0 = group.y * VEC_BATCH;
-    const uint rows = min((uint)VEC_BATCH, a.batch - b0);
+                            device const float *bias, constant MatmulArgs &a,
+                            threadgroup float *partial, uint2 group, uint simd, uint lane) {
+    const uint run = simd;
+    const uint m = group.x * SIMD + lane;
+    const uint b0 = group.y * B;
+    const uint rows = min(B, a.batch - b0);
     const uint groups = a.n / 8, length = run_length(groups);
     const uint first = min(run * length, groups), last = min(first + length, groups);
-    float acc[VEC_BATCH];
-    for (uint b = 0; b < VEC_BATCH; b++)
-        acc[b] = 0.0f;
-    // Lanes past the last weight row read it again, and don't store anything. VEC_STEP groups
-    // are loaded at a time, so that more of the weights are on their way at once.
+    // Lanes past the last weight row read it again, and don't store anything; rows of x past
+    // the batch's last read it again, and aren't kept.
     const ulong row = (ulong)min(m, a.m - 1) * a.n;
+    device const float4 *xs[B];
+    for (uint b = 0; b < B; b++)
+        xs[b] = (device const float4 *)(x + (ulong)(b0 + min(b, rows - 1)) * a.n);
+    float acc[B];
+    for (uint b = 0; b < B; b++)
+        acc[b] = 0.0f;
+    // VEC_STEP groups of weights are loaded at a time, so that more are on their way at once.
     for (uint g = first; g < last; g += VEC_STEP) {
-        const uint count = min((uint)VEC_STEP, last - g);
         float4 lo[VEC_STEP], hi[VEC_STEP];
         for (uint u = 0; u < VEC_STEP; u++)
             load8(w, row + min(g + u, last - 1) * 8, lo[u], hi[u]);
-        for (uint b = 0; b < VEC_BATCH; b++) {
-            if (b < rows) {
-                device const float4 *xb = (device const float4 *)(x + (ulong)(b0 + b) * a.n + g * 8);
-                float sum = acc[b];
-                for (uint u = 0; u < VEC_STEP; u++) {
-                    if (u < count) {
-                        const float4 x0 = xb[2 * u], x1 = xb[2 * u + 1];
-                        sum = fma(lo[u].x, x0.x, sum);
-                        sum = fma(lo[u].y, x0.y, sum);
-                        sum = fma(lo[u].z, x0.z, sum);
-                        sum = fma(lo[u].w, x0.w, sum);
-                        sum = fma(hi[u].x, x1.x, sum);
-                        sum = fma(hi[u].y, x1.y, sum);
-                        sum = fma(hi[u].z, x1.z, sum);
-                        sum = fma(hi[u].w, x1.w, sum);
-                    }
-                }
-                acc[b] = sum;
+        for (uint u = 0; u < VEC_STEP; u++) {
+            if (g + u >= last)
+                break;
+            float4 x0[B], x1[B];
+            for (uint b = 0; b < B; b++) {
+                x0[b] = xs[b][2 * (g + u)];
+                x1[b] = xs[b][2 * (g + u) + 1];
             }
+            for (uint b = 0; b < B; b++)
+                acc[b] = fma(lo[u].x, x0[b].x, acc[b]);
+            for (uint b = 0; b < B; b++)
+                acc[b] = fma(lo[u].y, x0[b].y, acc[b]);
+            for (uint b = 0; b < B; b++)
+                acc[b] = fma(lo[u].z, x0[b].z, acc[b]);
+            for (uint b = 0; b < B; b++)
+                acc[b] = fma(lo[u].w, x0[b].w, acc[b]);
+            for (uint b = 0; b < B; b++)
+                acc[b] = fma(hi[u].x, x1[b].x, acc[b]);
+            for (uint b = 0; b < B; b++)
+                acc[b] = fma(hi[u].y, x1[b].y, acc[b]);
+            for (uint b = 0; b < B; b++)
+                acc[b] = fma(hi[u].z, x1[b].z, acc[b]);
+            for (uint b = 0; b < B; b++)
+                acc[b] = fma(hi[u].w, x1[b].w, acc[b]);
         }
     }
-    // The lane with a row's first run adds the others to it, in order.
-    const uint base = lane - run;
-    for (uint b = 0; b < VEC_BATCH; b++) {
-        if (b < rows) {
-            float total = acc[b];
-            for (uint r = 1; r < RANGES; r++) {
-                const float part = simd_shuffle(acc[b], base + r);
-                if (r * length < groups)
-                    total += part;
-            }
-            if (run == 0 && m < a.m)
-                finish_output(out, bias, a, b0 + b, m, total);
+    for (uint b = 0; b < rows; b++)
+        partial[(run * B + b) * SIMD + lane] = acc[b];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (run != 0 || m >= a.m)
+        return;
+    for (uint b = 0; b < rows; b++) {
+        float total = partial[b * SIMD + lane];
+        for (uint r = 1; r < RANGES; r++) {
+            if (r * length < groups)
+                total += partial[(r * B + b) * SIMD + lane];
         }
+        finish_output(out, bias, a, b0 + b, m, total);
     }
 }
 
@@ -351,14 +364,21 @@ inline void matmul_mma_rows(device const W *w, device const float *x, device flo
         device float *out [[buffer(2)]], device const float *bias [[buffer(3)]],                   \
         constant MatmulArgs &a [[buffer(4)]], uint2 group [[threadgroup_position_in_grid]],        \
         uint simd [[simdgroup_index_in_threadgroup]]
-kernel void matmul_vec_bf16(MATMUL_ARGS(ushort), uint simds [[simdgroups_per_threadgroup]],
-                            uint lane [[thread_index_in_simdgroup]]) {
-    matmul_vec_rows(w, x, out, bias, a, group, simd, simds, lane);
-}
-kernel void matmul_vec_f32(MATMUL_ARGS(float), uint simds [[simdgroups_per_threadgroup]],
-                           uint lane [[thread_index_in_simdgroup]]) {
-    matmul_vec_rows(w, x, out, bias, a, group, simd, simds, lane);
-}
+// matmul_vecB_bf16 and matmul_vecB_f32 for B rows of x per threadgroup.
+#define MATMUL_VEC(B)                                                                              \
+    kernel void matmul_vec##B##_bf16(MATMUL_ARGS(ushort), uint lane [[thread_index_in_simdgroup]]) { \
+        threadgroup float partial[VEC_PARTIALS];                                                   \
+        matmul_vec_rows<B>(w, x, out, bias, a, partial, group, simd, lane);                        \
+    }                                                                                              \
+    kernel void matmul_vec##B##_f32(MATMUL_ARGS(float), uint lane [[thread_index_in_simdgroup]]) { \
+        threadgroup float partial[VEC_PARTIALS];                                                   \
+        matmul_vec_rows<B>(w, x, out, bias, a, partial, group, simd, lane);                        \
+    }
+MATMUL_VEC(1)
+MATMUL_VEC(2)
+MATMUL_VEC(4)
+MATMUL_VEC(6)
+MATMUL_VEC(8)
 kernel void matmul_mma_bf16(MATMUL_ARGS(ushort), uint tid [[thread_index_in_threadgroup]]) {
     threadgroup float shared[MM_SHARED];
     matmul_mma_rows(w, x, out, bias, a, shared, group, simd, tid);
@@ -825,15 +845,15 @@ kernel void moe_gather(device const float4 *x [[buffer(0)]], device const int *s
         return;                                                                                    \
     const ulong expert = group_expert[group.y];                                                    \
     device const float *expert_bias = bias + (a.has_bias ? expert * a.m : 0);
-kernel void moe_matmul_vec_bf16(MOE_MATMUL_ARGS(ushort), uint simds [[simdgroups_per_threadgroup]],
-                                uint lane [[thread_index_in_simdgroup]]) {
+kernel void moe_matmul_vec_bf16(MOE_MATMUL_ARGS(ushort), uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float partial[VEC_PARTIALS];
     EXPERT_WEIGHTS
-    matmul_vec_rows(w + expert * a.m * a.n, x, out, expert_bias, a, group, simd, simds, lane);
+    matmul_vec_rows<VEC_BATCH>(w + expert * a.m * a.n, x, out, expert_bias, a, partial, group, simd, lane);
 }
-kernel void moe_matmul_vec_f32(MOE_MATMUL_ARGS(float), uint simds [[simdgroups_per_threadgroup]],
-                               uint lane [[thread_index_in_simdgroup]]) {
+kernel void moe_matmul_vec_f32(MOE_MATMUL_ARGS(float), uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float partial[VEC_PARTIALS];
     EXPERT_WEIGHTS
-    matmul_vec_rows(w + expert * a.m * a.n, x, out, expert_bias, a, group, simd, simds, lane);
+    matmul_vec_rows<VEC_BATCH>(w + expert * a.m * a.n, x, out, expert_bias, a, partial, group, simd, lane);
 }
 kernel void moe_matmul_mma_bf16(MOE_MATMUL_ARGS(ushort), uint tid [[thread_index_in_threadgroup]]) {
     threadgroup float shared[MM_SHARED];
@@ -907,15 +927,15 @@ struct HeadArgs {
     device const W *head_w = w + head * h.w_stride;                                                \
     device const float *head_x = x + head * h.x_stride;                                            \
     device float *head_out = out + head * h.out_offset;
-kernel void matmul_heads_vec_bf16(HEADS_ARGS(ushort), uint simds [[simdgroups_per_threadgroup]],
-                                  uint lane [[thread_index_in_simdgroup]]) {
+kernel void matmul_heads_vec_bf16(HEADS_ARGS(ushort), uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float partial[VEC_PARTIALS];
     HEAD_PARTS(ushort)
-    matmul_vec_rows(head_w, head_x, head_out, bias, a, group, simd, simds, lane);
+    matmul_vec_rows<VEC_BATCH>(head_w, head_x, head_out, bias, a, partial, group, simd, lane);
 }
-kernel void matmul_heads_vec_f32(HEADS_ARGS(float), uint simds [[simdgroups_per_threadgroup]],
-                                 uint lane [[thread_index_in_simdgroup]]) {
+kernel void matmul_heads_vec_f32(HEADS_ARGS(float), uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float partial[VEC_PARTIALS];
     HEAD_PARTS(float)
-    matmul_vec_rows(head_w, head_x, head_out, bias, a, group, simd, simds, lane);
+    matmul_vec_rows<VEC_BATCH>(head_w, head_x, head_out, bias, a, partial, group, simd, lane);
 }
 kernel void matmul_heads_mma_bf16(HEADS_ARGS(ushort), uint tid [[thread_index_in_threadgroup]]) {
     threadgroup float shared[MM_SHARED];

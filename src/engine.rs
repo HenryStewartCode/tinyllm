@@ -1228,7 +1228,13 @@ impl Engine {
             })
             .collect();
         let draft = self.draft.as_mut().expect("checked by the caller");
-        let dim = self.active.iter().map(|s| s.feature_width).max().unwrap_or(0) / 3;
+        let dim = self
+            .active
+            .iter()
+            .map(|s| s.feature_width)
+            .max()
+            .unwrap_or(0)
+            / 3;
         // The head's output for each guessing sequence's last row, for its next guess.
         let mut outputs: Vec<Vec<f32>> = vec![Vec::new(); self.active.len()];
 
@@ -1362,7 +1368,8 @@ impl Engine {
                 let i = borrowed[b].0;
                 let seq = &mut self.active[i];
                 let logits = draft.logits(row);
-                let guess = (seq.sampler).sample(logits, &seq.tokens, seq.generated + round + 1, None);
+                let guess =
+                    (seq.sampler).sample(logits, &seq.tokens, seq.generated + round + 1, None);
                 seq.tokens.push(guess);
                 seq.draft += 1;
                 outputs[i] = draft.features(row).to_vec();

@@ -602,9 +602,15 @@ impl CudaBackend {
                 "DeepSeek's latent attention needs 16-bit precision on the GPU"
             );
             ensure!(
-                [l.kv_lora_rank, l.rope, l.nope, l.v, l.q_lora_rank.unwrap_or(0)]
-                    .iter()
-                    .all(|size| size.is_multiple_of(TILE)),
+                [
+                    l.kv_lora_rank,
+                    l.rope,
+                    l.nope,
+                    l.v,
+                    l.q_lora_rank.unwrap_or(0)
+                ]
+                .iter()
+                .all(|size| size.is_multiple_of(TILE)),
                 "latent attention's sizes have to be multiples of 16 on the GPU"
             );
             ensure!(
@@ -873,7 +879,10 @@ impl CudaBackend {
                 precision,
                 &mut num_params,
                 // An EAGLE head scores its own, smaller, vocabulary.
-                &[("lm_head".to_string(), eagle.map_or(vocab_size, |e| e.draft_vocab))],
+                &[(
+                    "lm_head".to_string(),
+                    eagle.map_or(vocab_size, |e| e.draft_vocab),
+                )],
                 dim,
                 batch_rows,
                 1.0,
@@ -1231,7 +1240,10 @@ impl CudaBackend {
         batch: usize,
         step: &StepPointers,
     ) -> Result<()> {
-        let l = self.architecture.latent.expect("a latent layer has latent attention");
+        let l = self
+            .architecture
+            .latent
+            .expect("a latent layer has latent attention");
         let buffers = (self.latent_buffers.as_ref()).expect("allocated for latent attention");
         let (n, rank, rope, nope, v) = (self.n_heads, l.kv_lora_rank, l.rope, l.nope, l.v);
         let head_width = nope + rope;
@@ -1329,7 +1341,13 @@ impl CudaBackend {
             ],
         )?;
         // Each head's blend of latents through its value matrix, gathered for o_proj.
-        self.matmul_heads(latent.absorb_v, (v, rank), buffers.blended, batch, buffers.values)?;
+        self.matmul_heads(
+            latent.absorb_v,
+            (v, rank),
+            buffers.blended,
+            batch,
+            buffers.values,
+        )?;
         self.gpu.launch(
             self.kernels.heads_to_tiles,
             [batch, 1],
@@ -2196,7 +2214,11 @@ impl CudaBackend {
             )?;
         }
         // Column `dim` of a tile-layout row starts `dim / 16` whole tiles in.
-        norm(self.x, eagle.wide.offset(dim / TILE * TILE * TILE / 2), eagle.hidden_norm)
+        norm(
+            self.x,
+            eagle.wide.offset(dim / TILE * TILE * TILE / 2),
+            eagle.hidden_norm,
+        )
     }
 
     /// Record the kernels of one forward pass for this batch size.
@@ -3052,7 +3074,10 @@ fn upload_absorbed(
     n_heads: usize,
 ) -> Result<(Pointer, Pointer)> {
     let (rank, per_head) = (l.kv_lora_rank, l.nope + l.v);
-    let kv_b = st.load(&format!("{attn}.kv_b_proj.weight"), &[n_heads * per_head, rank])?;
+    let kv_b = st.load(
+        &format!("{attn}.kv_b_proj.weight"),
+        &[n_heads * per_head, rank],
+    )?;
     *num_params += kv_b.len();
     let (mut keys, mut values) = (Vec::new(), Vec::new());
     for head in kv_b.chunks_exact(per_head * rank) {
@@ -3063,7 +3088,10 @@ fn upload_absorbed(
             }
         }
         keys.extend(to_tiles(&transposed, rank, l.nope));
-        let value: Vec<u16> = head[l.nope * rank..].iter().map(|&v| f32_to_bf16(v)).collect();
+        let value: Vec<u16> = head[l.nope * rank..]
+            .iter()
+            .map(|&v| f32_to_bf16(v))
+            .collect();
         values.extend(to_tiles(&value, l.v, rank));
     }
     let upload = |values: &[u16]| -> Result<Pointer> {
@@ -3366,7 +3394,9 @@ impl Backend for CudaBackend {
 
     fn features(&self, row: usize) -> &[f32] {
         let width = self.capture.len() * self.dim;
-        self.features.get(row * width..(row + 1) * width).unwrap_or(&[])
+        self.features
+            .get(row * width..(row + 1) * width)
+            .unwrap_or(&[])
     }
 
     fn set_hidden_inputs(&mut self, width: usize, values: &[f32]) -> Result<()> {

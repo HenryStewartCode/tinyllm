@@ -140,7 +140,15 @@ On an M1 Max with Qwen3-0.6B, in tokens per second:
 | | 1 request | 8 at once | 32 at once | 64 at once | Reading a prompt |
 |---|---|---|---|---|---|
 | CPU, 4 threads | 65 | 186 | 200 | | 280 |
-| Apple GPU | 126 | 374 | 851 | 1,016 | 2,200–2,700 |
+| Apple GPU | 110 | 581 | 851 | 1,016 | 2,200–2,700 |
+
+For small batches (up to 8 rows), each lane of the matrix kernel takes one weight row and each of a
+threadgroup's 8 simdgroups one run of its columns, so all the lanes of a simdgroup read the same
+values of the batch at once, which the GPU fetches once for all of them; a kernel is compiled for 1,
+2, 4, 6 and 8 rows, so none does more rows than it has. On Qwen3-4B, a step for 5 or 8 rows now
+costs 1.5–1.6× one for a single row, rather than 2–3×: 23.5 tokens/s for one request (16.8
+before), 79 for 5 at once (40) and 118 for 8 (43). Results are bit-identical to before. Qwen3-0.6B
+gained at 8 at once (581 from 374) but lost at one request (110 from 126), which is still to fix.
 
 Mixtures of experts run on Metal too (all the families below except GPT-OSS), and so does DeepSeek's
 latent attention: with 64 GB of memory, the real DeepSeek-V2-Lite-Chat (16B parameters, 31 GB)
@@ -358,10 +366,10 @@ the same requests, at 44 and 38 tok/s; its EAGLE crashes on sampled requests on 
 whose CUDA toolkit can't compile its sampling kernel. The head's first guess agrees with the
 model's own next token 69–75% of the time on the model's replies (`harness eagle`), the same on
 the CPU and both GPUs, and all 20 test replies were identical with and without it on the NVIDIA
-GPU and the Apple GPU. On the Apple GPU (an M1 Max) the head accepts just as many tokens a step but
-helps much less, 1.1–1.2× for greedy replies, and sampled ones come out slower, because checking 5
-tokens there takes twice as long as checking one: its matrix kernel for small batches doesn't yet
-run at the speed of reading the weights.
+GPU and the Apple GPU. On the Apple GPU (an M1 Max) the head accepts just as many tokens a step;
+since its small-batch matrix kernel was rebuilt (see Apple GPUs), checking 5 tokens there costs about the
+same as checking one in the matrix products, but EAGLE's measured gain on the Mac has so far been
+small and uneven (1.0–1.2× for greedy replies), which is still to be looked into.
 
 ### LoRA adapters
 

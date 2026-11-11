@@ -1384,13 +1384,19 @@ impl Model {
         // the embedding, each normalized.
         if let Some(eagle) = &self.eagle {
             let width = ws.hidden_width;
-            assert_eq!(ws.hidden_in.len(), batch * width, "an EAGLE head needs hidden states");
+            assert_eq!(
+                ws.hidden_in.len(),
+                batch * width,
+                "an EAGLE head needs hidden states"
+            );
             let (left, right) = &mut ws.halves;
             left.resize(batch * dim, 0.0);
             right.resize(batch * dim, 0.0);
             rmsnorm(pool, left, &ws.x, &self.layers[0].attn_norm, eps);
             match width == 3 * dim {
-                true => eagle.fc.forward(pool, &mut ws.x, &mut ws.scratch, &ws.hidden_in),
+                true => eagle
+                    .fc
+                    .forward(pool, &mut ws.x, &mut ws.scratch, &ws.hidden_in),
                 false => {
                     assert_eq!(width, dim, "an EAGLE head's hidden states are 1 or 3 wide");
                     ws.x.copy_from_slice(&ws.hidden_in);

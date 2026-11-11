@@ -162,9 +162,10 @@ impl SafeTensors {
         {
             let other = Self::open(fallback)?;
             let name = "model.embed_tokens.weight";
-            let entry = other.tensors.get(name).with_context(|| {
-                format!("{} has no embeddings to borrow", fallback.display())
-            })?;
+            let entry = other
+                .tensors
+                .get(name)
+                .with_context(|| format!("{} has no embeddings to borrow", fallback.display()))?;
             st.files.push(other.files[entry.file].clone());
             let mut entry = entry.clone();
             entry.file = st.files.len() - 1;

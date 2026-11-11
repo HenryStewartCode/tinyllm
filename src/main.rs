@@ -405,7 +405,9 @@ fn main() -> Result<()> {
             batch_size.max(parallel + 8),
         )?),
         (true, None) => {
-            bail!("--speculative-algorithm standalone and eagle3 need --speculative-draft-model-path")
+            bail!(
+                "--speculative-algorithm standalone and eagle3 need --speculative-draft-model-path"
+            )
         }
         (false, _) => None,
     };

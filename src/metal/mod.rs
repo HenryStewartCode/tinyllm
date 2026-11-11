@@ -27,12 +27,14 @@ const KERNELS: &str = include_str!("kernels.metal");
 
 /// Threads that run in lockstep on Apple GPUs.
 const SIMD: usize = 32;
-/// Weight rows each simdgroup of the small-batch matrix kernel takes (`VEC_ROWS`).
-const VEC_ROWS: usize = 4;
-/// Rows of the batch it takes at once (`VEC_BATCH`).
-const VEC_BATCH: usize = 8;
-/// Threads per group for it.
+/// The small-batch matrix kernel's threadgroups: one simdgroup for each of the `RANGES` runs of
+/// columns (`VEC_THREADS`), and a weight row for each lane.
 const VEC_THREADS: usize = 256;
+const VEC_GROUP_ROWS: usize = SIMD;
+/// How many rows of x the versions of it take at once.
+const VEC_SIZES: [usize; 5] = [1, 2, 4, 6, 8];
+/// Rows of x each of its threadgroups takes (`VEC_BATCH`).
+const VEC_BATCH: usize = 8;
 /// Rows of the batch and weight rows in each tile of the big-batch matrix kernel (`MM_BN` and
 /// `MM_BM`), and its threads per group (`MM_THREADS`).
 const MM_BN: usize = 32;
@@ -243,8 +245,9 @@ struct Kernels {
     rmsnorm: Pipeline,
     rmsnorm_add: Pipeline,
     head_norm: Pipeline,
-    matmul_vec_bf16: Pipeline,
-    matmul_vec_f32: Pipeline,
+    /// For 1, 2, 4, 6 and 8 rows of x per threadgroup (`VEC_SIZES`).
+    matmul_vec_bf16: [Pipeline; 5],
+    matmul_vec_f32: [Pipeline; 5],
     matmul_mma_bf16: Pipeline,
     matmul_mma_f32: Pipeline,
     rope_store: Pipeline,
@@ -283,8 +286,20 @@ impl Kernels {
             rmsnorm: get("rmsnorm")?,
             rmsnorm_add: get("rmsnorm_add")?,
             head_norm: get("head_norm")?,
-            matmul_vec_bf16: get("matmul_vec_bf16")?,
-            matmul_vec_f32: get("matmul_vec_f32")?,
+            matmul_vec_bf16: [
+                get("matmul_vec1_bf16")?,
+                get("matmul_vec2_bf16")?,
+                get("matmul_vec4_bf16")?,
+                get("matmul_vec6_bf16")?,
+                get("matmul_vec8_bf16")?,
+            ],
+            matmul_vec_f32: [
+                get("matmul_vec1_f32")?,
+                get("matmul_vec2_f32")?,
+                get("matmul_vec4_f32")?,
+                get("matmul_vec6_f32")?,
+                get("matmul_vec8_f32")?,
+            ],
             matmul_mma_bf16: get("matmul_mma_bf16")?,
             matmul_mma_f32: get("matmul_mma_f32")?,
             rope_store: get("rope_store")?,
@@ -399,7 +414,10 @@ struct LatentBuffers {
 
 enum FeedForward {
     /// gate_proj and up_proj as one matrix, for the same reason as `qkv`, then down_proj.
-    Dense { gate_up: Matrix, down: Matrix },
+    Dense {
+        gate_up: Matrix,
+        down: Matrix,
+    },
     Sparse(Box<Experts>),
 }
 
@@ -670,7 +688,10 @@ impl Loader<'_> {
 /// (`[heads][rank, nope]`), and value matrix (`[heads][v, rank]`).
 fn split_absorbed<T: Copy>(kv_b: &[T], l: LatentAttention) -> (Vec<T>, Vec<T>) {
     let rank = l.kv_lora_rank;
-    let (mut keys, mut values) = (Vec::with_capacity(kv_b.len()), Vec::with_capacity(kv_b.len()));
+    let (mut keys, mut values) = (
+        Vec::with_capacity(kv_b.len()),
+        Vec::with_capacity(kv_b.len()),
+    );
     for head in kv_b.chunks_exact((l.nope + l.v) * rank) {
         for c in 0..rank {
             keys.extend((0..l.nope).map(|i| head[i * rank + c]));
@@ -760,9 +781,13 @@ impl Loader<'_> {
             ),
         };
         let stack = |parts: &[(String, usize, usize)], rows: usize, cols: usize, scale: f32| {
-            let bf16 = parts.iter().all(|(name, _, _)| self.st.dtype(name) == Some("BF16"));
+            let bf16 = parts
+                .iter()
+                .all(|(name, _, _)| self.st.dtype(name) == Some("BF16"));
             let total: usize = parts.iter().map(|(_, rows, _)| rows).sum();
-            let data = self.device.buffer(total * cols * if bf16 { 2 } else { 4 })?;
+            let data = self
+                .device
+                .buffer(total * cols * if bf16 { 2 } else { 4 })?;
             let mut at = 0;
             for (name, part_rows, part_cols) in parts {
                 // A stacked tensor is `[experts, rows, cols]`.
@@ -818,7 +843,11 @@ impl Loader<'_> {
                     )?,
                     self.matrix(&[(format!("{prefix}.down_proj"), dim)], hidden, scale)?,
                     match spec.shared_gated {
-                        true => Some(self.matrix(&[(format!("{p}.mlp.shared_expert_gate"), 1)], dim, 1.0)?),
+                        true => Some(self.matrix(
+                            &[(format!("{p}.mlp.shared_expert_gate"), 1)],
+                            dim,
+                            1.0,
+                        )?),
                         false => None,
                     },
                 ))
@@ -941,9 +970,15 @@ impl MetalBackend {
             ensure!(
                 l.kv_lora_rank <= 512
                     && l.kv_lora_rank + l.rope <= 640
-                    && [l.kv_lora_rank, l.rope, l.nope, l.v, l.q_lora_rank.unwrap_or(0)]
-                        .iter()
-                        .all(|size| size.is_multiple_of(8)),
+                    && [
+                        l.kv_lora_rank,
+                        l.rope,
+                        l.nope,
+                        l.v,
+                        l.q_lora_rank.unwrap_or(0)
+                    ]
+                    .iter()
+                    .all(|size| size.is_multiple_of(8)),
                 "the Metal kernels need a latent of at most 512 and sizes in multiples of 8"
             );
         }
@@ -971,8 +1006,17 @@ impl MetalBackend {
         ensure!(
             [&kernels.matmul_mma_bf16, &kernels.matmul_mma_f32]
                 .iter()
-                .all(|kernel| kernel.max_threads >= MM_THREADS),
-            "this GPU can't run the Metal matrix kernel"
+                .all(|kernel| kernel.max_threads >= MM_THREADS)
+                && (kernels.matmul_vec_bf16.iter())
+                    .chain(&kernels.matmul_vec_f32)
+                    .chain([
+                        &kernels.moe_matmul_vec_bf16,
+                        &kernels.moe_matmul_vec_f32,
+                        &kernels.matmul_heads_vec_bf16,
+                        &kernels.matmul_heads_vec_f32,
+                    ])
+                    .all(|kernel| kernel.max_threads >= VEC_THREADS),
+            "this GPU can't run the Metal matrix kernels"
         );
         ensure!(
             kernels.attention.max_threads >= ATT_SIMDS * SIMD
@@ -1041,13 +1085,20 @@ impl MetalBackend {
                             Some(rank) => (format!("{attn}.q_a_proj"), rank),
                             None => (format!("{attn}.q_proj"), n_heads * (l.nope + l.rope)),
                         },
-                        (format!("{attn}.kv_a_proj_with_mqa"), l.kv_lora_rank + l.rope),
+                        (
+                            format!("{attn}.kv_a_proj_with_mqa"),
+                            l.kv_lora_rank + l.rope,
+                        ),
                     ];
                     let (absorb_k, absorb_v) = loader.absorbed(&attn, l, n_heads)?;
                     Some(LatentLayer {
                         q_low: match l.q_lora_rank {
                             Some(rank) => Some((
-                                loader.norm(&format!("{attn}.q_a_layernorm.weight"), rank, false)?,
+                                loader.norm(
+                                    &format!("{attn}.q_a_layernorm.weight"),
+                                    rank,
+                                    false,
+                                )?,
                                 loader.matrix(
                                     &[(format!("{attn}.q_b_proj"), n_heads * (l.nope + l.rope))],
                                     rank,
@@ -1163,7 +1214,9 @@ impl MetalBackend {
         let capacity = (cache_bytes / kv_bytes_per_token).clamp(16, u32::MAX as usize);
         for layer in &mut layers {
             match latent {
-                Some(l) => layer.k_pool = device.buffer(capacity * (l.kv_lora_rank + l.rope) * 4)?,
+                Some(l) => {
+                    layer.k_pool = device.buffer(capacity * (l.kv_lora_rank + l.rope) * 4)?
+                }
                 None => {
                     layer.k_pool = device.buffer(capacity * kv_dim * 4)?;
                     layer.v_pool = device.buffer(capacity * kv_dim * 4)?;
@@ -1351,7 +1404,11 @@ impl MetalBackend {
                 "an EAGLE head needs its hidden states first"
             );
             reserve(&self.device, &mut eagle.wide, rows.len() * 2 * dim * 4)?;
-            reserve(&self.device, &mut eagle.draft_logits, step.n_logits.max(1) * eagle.draft_vocab * 4)?;
+            reserve(
+                &self.device,
+                &mut eagle.draft_logits,
+                step.n_logits.max(1) * eagle.draft_vocab * 4,
+            )?;
         }
         if !self.capture.is_empty() {
             let bytes = rows.len() * self.capture.len() * dim * 4;
@@ -1561,7 +1618,10 @@ impl MetalBackend {
         batch: usize,
         on: &dyn Fn(Part) -> bool,
     ) {
-        let l = self.architecture.latent.expect("a latent layer has latent attention");
+        let l = self
+            .architecture
+            .latent
+            .expect("a latent layer has latent attention");
         let (ws, k) = (&self.ws, &self.kernels);
         let b = ws.latent.as_ref().expect("allocated for latent attention");
         let (n, rank, rope, nope, v) = (self.n_heads, l.kv_lora_rank, l.rope, l.nope, l.v);
@@ -1626,7 +1686,14 @@ impl MetalBackend {
         // Each head's query through its key matrix, to score against latents directly.
         let key = rank + rope;
         if on(Part::Matmuls) {
-            self.matmul_heads(e, &latent.absorb_k, &b.q_nope, &b.query, batch, (n * key, key));
+            self.matmul_heads(
+                e,
+                &latent.absorb_k,
+                &b.q_nope,
+                &b.query,
+                batch,
+                (n * key, key),
+            );
         }
         if on(Part::Attention) {
             e.set_pipeline(&k.attention_latent);
@@ -1651,7 +1718,14 @@ impl MetalBackend {
         }
         // Each head's blend of latents through its value matrix, into its place in attn_out.
         if on(Part::Matmuls) {
-            self.matmul_heads(e, &latent.absorb_v, &b.blended, &ws.attn_out, batch, (n * v, v));
+            self.matmul_heads(
+                e,
+                &latent.absorb_v,
+                &b.blended,
+                &ws.attn_out,
+                batch,
+                (n * v, v),
+            );
         }
     }
 
@@ -1677,8 +1751,8 @@ impl MetalBackend {
                     true => &k.matmul_heads_vec_bf16,
                     false => &k.matmul_heads_vec_f32,
                 };
-                let threads = threads(pipeline, VEC_THREADS);
-                let rows_per_group = threads / SIMD * VEC_ROWS;
+                let threads = VEC_THREADS;
+                let rows_per_group = VEC_GROUP_ROWS;
                 let groups = [w.rows.div_ceil(rows_per_group), batch.div_ceil(VEC_BATCH)];
                 (pipeline, groups, threads)
             }
@@ -1687,7 +1761,11 @@ impl MetalBackend {
                     true => &k.matmul_heads_mma_bf16,
                     false => &k.matmul_heads_mma_f32,
                 };
-                (pipeline, [w.rows.div_ceil(MM_BM), batch.div_ceil(MM_BN)], MM_THREADS)
+                (
+                    pipeline,
+                    [w.rows.div_ceil(MM_BM), batch.div_ceil(MM_BN)],
+                    MM_THREADS,
+                )
             }
         };
         e.set_pipeline(pipeline);
@@ -1950,8 +2028,8 @@ impl MetalBackend {
                     true => &k.moe_matmul_vec_bf16,
                     false => &k.moe_matmul_vec_f32,
                 };
-                let threads = threads(pipeline, VEC_THREADS);
-                let rows_per_group = threads / SIMD * VEC_ROWS;
+                let threads = VEC_THREADS;
+                let rows_per_group = VEC_GROUP_ROWS;
                 let groups = [w.rows.div_ceil(rows_per_group), slots / VEC_BATCH];
                 (pipeline, groups, threads)
             }
@@ -1960,7 +2038,11 @@ impl MetalBackend {
                     true => &k.moe_matmul_mma_bf16,
                     false => &k.moe_matmul_mma_f32,
                 };
-                (pipeline, [w.rows.div_ceil(MM_BM), slots / MM_BN], MM_THREADS)
+                (
+                    pipeline,
+                    [w.rows.div_ceil(MM_BM), slots / MM_BN],
+                    MM_THREADS,
+                )
             }
         };
         e.set_pipeline(pipeline);
@@ -2318,14 +2400,16 @@ fn encode_matmul(
 ) {
     let (pipeline, groups, threads) = match (kernel, w.bf16) {
         (MatmulKernel::Vec, bf16) => {
+            // The fewest rows of x per threadgroup that take the whole batch, up to 8.
+            let size = (VEC_SIZES.iter())
+                .position(|&rows| rows >= batch)
+                .unwrap_or(VEC_SIZES.len() - 1);
             let pipeline = match bf16 {
-                true => &kernels.matmul_vec_bf16,
-                false => &kernels.matmul_vec_f32,
+                true => &kernels.matmul_vec_bf16[size],
+                false => &kernels.matmul_vec_f32[size],
             };
-            let threads = threads(pipeline, VEC_THREADS);
-            let rows_per_group = threads / SIMD * VEC_ROWS;
-            let groups = [w.rows.div_ceil(rows_per_group), batch.div_ceil(VEC_BATCH)];
-            (pipeline, groups, threads)
+            let groups = [w.rows.div_ceil(VEC_GROUP_ROWS), batch.div_ceil(VEC_SIZES[size])];
+            (pipeline, groups, VEC_THREADS)
         }
         (MatmulKernel::Mma, bf16) => {
             let pipeline = match bf16 {
@@ -2574,13 +2658,30 @@ mod tests {
     fn metal_matmul_speed() {
         let device = Device::open().unwrap();
         let kernels = Kernels::find(&device, &device.compile(KERNELS).unwrap()).unwrap();
-        for (m, n) in [
-            (151936, 1024),
-            (4096, 1024),
-            (6144, 1024),
-            (1024, 2048),
-            (1024, 3072),
-        ] {
+        // Qwen3-0.6B's output projection and layers, then Qwen3-4B's layers; SHAPES=m×n,... for
+        // others.
+        let shapes: Vec<(usize, usize)> = std::env::var("SHAPES").map_or(
+            vec![
+                (151936, 1024),
+                (4096, 1024),
+                (6144, 1024),
+                (1024, 2048),
+                (1024, 3072),
+                (6144, 2560),
+                (2560, 4096),
+                (19456, 2560),
+                (2560, 9728),
+            ],
+            |list| {
+                (list.split(','))
+                    .map(|shape| {
+                        let (m, n) = shape.split_once('x').unwrap();
+                        (m.parse().unwrap(), n.parse().unwrap())
+                    })
+                    .collect()
+            },
+        );
+        for (m, n) in shapes {
             let w = Matrix {
                 data: device.buffer(m * n * 2).unwrap(),
                 bf16: true,

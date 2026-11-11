@@ -123,7 +123,11 @@ fn main() {
             head.capture_layers(&[0]).unwrap();
             let best = |logits: Logits| match logits {
                 Logits::All(l) => argmax(l),
-                Logits::Candidates(c) => c.iter().fold((f32::MIN, 0), |m, x| if x.0 > m.0 { *x } else { m }).1,
+                Logits::Candidates(c) => {
+                    c.iter()
+                        .fold((f32::MIN, 0), |m, x| if x.0 > m.0 { *x } else { m })
+                        .1
+                }
             };
             let slots: Vec<u32> = (0..room as u32).collect();
             let rows: Vec<Row> = (0..n)
@@ -172,7 +176,9 @@ fn main() {
                 .collect();
             head.forward(&rows);
             let guesses: Vec<u32> = (0..n).map(|p| best(head.logits(p))).collect();
-            let right = (0..n - 1).filter(|&p| guesses[p] == predicted[p + 1]).count();
+            let right = (0..n - 1)
+                .filter(|&p| guesses[p] == predicted[p + 1])
+                .count();
             println!(
                 "{} | the head's next guess matches the model's {right} of {} times ({:.0}%)",
                 head.describe(),
@@ -212,8 +218,16 @@ fn main() {
                 drafted.push(best(head.logits(0)));
                 hidden = head.features(0).to_vec();
             }
-            let run = drafted.iter().zip(&continuation[1..]).take_while(|(a, b)| a == b).count();
-            println!("model continues {:?}\nhead drafts     {:?} ({run} right in a row)", &continuation[1..], drafted);
+            let run = drafted
+                .iter()
+                .zip(&continuation[1..])
+                .take_while(|(a, b)| a == b)
+                .count();
+            println!(
+                "model continues {:?}\nhead drafts     {:?} ({run} right in a row)",
+                &continuation[1..],
+                drafted
+            );
         }
         "tokenize" => {
             let tok = Tokenizer::load(Path::new(&args[2])).unwrap();

@@ -551,7 +551,10 @@ impl Config {
 
     /// What makes this an EAGLE-3 draft head, if it is one.
     fn eagle3(&self) -> Option<Eagle3> {
-        let named = self.architectures.iter().any(|name| name.contains("Eagle3"));
+        let named = self
+            .architectures
+            .iter()
+            .any(|name| name.contains("Eagle3"));
         named.then(|| Eagle3 {
             draft_vocab: self.draft_vocab_size.unwrap_or(self.vocab_size),
         })
@@ -564,9 +567,18 @@ impl Config {
     pub fn eagle_layers(&self, model_layers: usize) -> Vec<usize> {
         let named = (self.eagle_config.as_ref())
             .and_then(|config| config["eagle_aux_hidden_state_layer_ids"].as_array())
-            .map(|ids| ids.iter().filter_map(Value::as_u64).map(|id| id as usize).collect());
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(Value::as_u64)
+                    .map(|id| id as usize)
+                    .collect()
+            });
         named.unwrap_or_else(|| {
-            vec![1, (model_layers / 2).saturating_sub(1), model_layers.saturating_sub(4)]
+            vec![
+                1,
+                (model_layers / 2).saturating_sub(1),
+                model_layers.saturating_sub(4),
+            ]
         })
     }
 
