@@ -39,7 +39,7 @@ pub struct Linear {
 }
 
 impl Linear {
-    fn load(st: &SafeTensors, name: &str, out_dim: usize, in_dim: usize) -> Result<Self> {
+    pub(crate) fn load(st: &SafeTensors, name: &str, out_dim: usize, in_dim: usize) -> Result<Self> {
         Self::load_scaled(st, name, out_dim, in_dim, 1.0)
     }
 
@@ -98,20 +98,20 @@ impl Linear {
     }
 
     /// Apply the layer to every row of `x`.
-    fn forward(&self, pool: &Pool, out: &mut [f32], scratch: &mut Vec<f32>, x: &[f32]) {
+    pub(crate) fn forward(&self, pool: &Pool, out: &mut [f32], scratch: &mut Vec<f32>, x: &[f32]) {
         matmul(pool, out, scratch, &self.weight, x);
         if let Some(bias) = &self.bias {
             add_bias(out, bias);
         }
     }
 
-    fn num_params(&self) -> usize {
+    pub(crate) fn num_params(&self) -> usize {
         self.weight.len() + self.bias.as_ref().map_or(0, Vec::len)
     }
 
     /// One of several matrices stored together in one tensor, `[count, rows, cols]` (or one
     /// piece of such a matrix), taken from `values`, which are bfloat16 if `half` is.
-    fn from_part(full: &[f32], half: &[u16], rows: usize, cols: usize) -> Self {
+    pub(crate) fn from_part(full: &[f32], half: &[u16], rows: usize, cols: usize) -> Self {
         Self {
             weight: match half.is_empty() {
                 true => Matrix::from_rows(full, rows, cols),
@@ -546,6 +546,8 @@ pub struct Model {
     adapters: Vec<Adapter>,
     /// What an EAGLE-3 draft head has that a model doesn't, if this is one.
     eagle: Option<EagleHead>,
+    /// A vision-language model's image encoder.
+    vision: Option<crate::vision::VisionEncoder>,
 }
 
 /// An EAGLE-3 draft head's own parts (see [`crate::config::Eagle3`]). Its one layer is
@@ -576,6 +578,23 @@ struct Latent {
     kv_a_norm: Vec<f32>,
     /// `kv_b_proj`: each head's unrotated key and its value, `[heads * (nope + v), kv_lora_rank]`.
     kv_b: Linear,
+}
+
+/// The position each of a row's `half` RoPE frequencies turns with: its place in its sequence,
+/// or, with multimodal RoPE, the frequencies' share of its time, height and width positions.
+pub fn rope_positions(row: &Row, mrope: Option<[usize; 3]>, half: usize) -> Vec<f32> {
+    let plain = (row.slots.len() - 1) as f32;
+    match (row.position, mrope) {
+        (Some(p), Some([t, h, _])) => (0..half)
+            .map(|i| match i {
+                _ if i < t => p[0] as f32,
+                _ if i < t + h => p[1] as f32,
+                _ => p[2] as f32,
+            })
+            .collect(),
+        (Some(p), None) => vec![p[0] as f32; half],
+        (None, _) => vec![plain; half],
+    }
 }
 
 /// The model token id of each of an EAGLE-3 head's `draft_vocab` output rows: row `i` is token
@@ -628,6 +647,11 @@ pub struct Row<'a> {
     /// The LoRA adapter to apply (see [`crate::lora`]): 0 for none, or the number the backend
     /// loaded it as.
     pub adapter: u16,
+    /// Where RoPE puts the token, if not at `slots.len() - 1`: its time, height and width for
+    /// multimodal RoPE (all three the same for text).
+    pub position: Option<[u32; 3]>,
+    /// What to use instead of the token's embedding (a piece of an image, say), if anything.
+    pub embedding: Option<&'a [f32]>,
 }
 
 /// What a row's logits are needed for.
@@ -1019,6 +1043,10 @@ impl Model {
             "an EAGLE-3 head has one layer and an output projection of its own"
         );
 
+        let vision = match &config.vision_config {
+            Some(vision) => Some(crate::vision::VisionEncoder::load(&st, vision)?),
+            None => None,
+        };
         Ok(Self {
             config,
             embed_tokens,
@@ -1037,7 +1065,16 @@ impl Model {
             vocab_size,
             adapters: Vec::new(),
             eagle,
+            vision,
         })
+    }
+
+    /// Put an image through the vision encoder (see [`crate::vision`]).
+    pub fn encode_image(&self, pool: &Pool, patches: &crate::vision::Patches) -> Result<Vec<f32>> {
+        match &self.vision {
+            Some(vision) => vision.encode(pool, patches),
+            None => anyhow::bail!("this model can't read images"),
+        }
     }
 
     /// Add a LoRA adapter, which rows then ask for by its number (the first is 1).
@@ -1355,24 +1392,28 @@ impl Model {
         ws.sin.resize(tables * batch * half, 0.0);
 
         for (r, row) in rows.iter().enumerate() {
-            let t = row.token as usize;
-            assert!(
-                t < self.vocab_size,
-                "token id {} is outside the vocabulary",
-                row.token
-            );
             let embedding = &mut ws.x[r * dim..(r + 1) * dim];
-            self.embed_tokens.weight.copy_row(t, embedding);
-            if self.architecture.embedding_scale != 1.0 {
-                let scale = self.architecture.embedding_scale;
-                embedding.iter_mut().for_each(|v| *v *= scale);
+            if let Some(given) = row.embedding {
+                embedding.copy_from_slice(given);
+            } else {
+                let t = row.token as usize;
+                assert!(
+                    t < self.vocab_size,
+                    "token id {} is outside the vocabulary",
+                    row.token
+                );
+                self.embed_tokens.weight.copy_row(t, embedding);
+                if self.architecture.embedding_scale != 1.0 {
+                    let scale = self.architecture.embedding_scale;
+                    embedding.iter_mut().for_each(|v| *v *= scale);
+                }
             }
-            let pos = (row.slots.len() - 1) as f32;
+            let positions = rope_positions(row, self.architecture.mrope, half);
             for (table, frequencies) in self.architecture.rope_tables.iter().enumerate() {
                 let scale = self.architecture.rope_scales[table];
                 let start = (table * batch + r) * half;
                 for (i, &freq) in frequencies.iter().enumerate() {
-                    let angle = pos * freq;
+                    let angle = positions[i] * freq;
                     ws.cos[start + i] = angle.cos() * scale;
                     ws.sin[start + i] = angle.sin() * scale;
                 }

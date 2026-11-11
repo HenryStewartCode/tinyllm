@@ -139,6 +139,8 @@ fn main() {
                     want_logits: true,
                     sampling: LogitUse::All,
                     adapter: 0,
+                    position: None,
+                    embedding: None,
                 })
                 .collect();
             model.attach();
@@ -174,6 +176,8 @@ fn main() {
                     want_logits: true,
                     sampling: LogitUse::All,
                     adapter: 0,
+                    position: None,
+                    embedding: None,
                 })
                 .collect();
             head.forward(&rows);
@@ -187,6 +191,26 @@ fn main() {
                 n - 1,
                 100.0 * right as f64 / (n - 1) as f64
             );
+            // How often the model's token is among the head's best k guesses.
+            let ranks: Vec<usize> = (0..n - 1)
+                .map(|p| match head.logits(p) {
+                    Logits::All(scores) => {
+                        let target = scores[predicted[p + 1] as usize];
+                        scores.iter().filter(|&&s| s > target).count()
+                    }
+                    Logits::Candidates(_) => usize::MAX,
+                })
+                .collect();
+            let within =
+                |k: usize| ranks.iter().filter(|&&r| r < k).count() as f64 / ranks.len() as f64;
+            println!(
+                "among the head's best 1, 2, 3, 4, 8: {:.0}% {:.0}% {:.0}% {:.0}% {:.0}%",
+                100.0 * within(1),
+                100.0 * within(2),
+                100.0 * within(3),
+                100.0 * within(4),
+                100.0 * within(8)
+            );
             // Drafting on from the end: the model's greedy continuation, and the head's.
             let mut continuation = vec![predicted[n - 1]];
             for step in 0..AHEAD {
@@ -197,6 +221,8 @@ fn main() {
                     want_logits: true,
                     sampling: LogitUse::All,
                     adapter: 0,
+                    position: None,
+                    embedding: None,
                 }];
                 model.attach();
                 model.forward(&row);
@@ -213,6 +239,8 @@ fn main() {
                     want_logits: true,
                     sampling: LogitUse::All,
                     adapter: 0,
+                    position: None,
+                    embedding: None,
                 }];
                 head.attach();
                 head.set_hidden_inputs(hidden.len(), &hidden).unwrap();
@@ -264,6 +292,8 @@ fn main() {
                     want_logits: true,
                     sampling: LogitUse::All,
                     adapter: adapter(),
+                    position: None,
+                    embedding: None,
                 })
                 .collect();
             b.attach();
@@ -312,6 +342,8 @@ fn main() {
                     want_logits: true,
                     sampling: LogitUse::All,
                     adapter: adapter(),
+                    position: None,
+                    embedding: None,
                 })
                 .collect();
             for (name, seconds) in backend.profile(&rows).unwrap() {
@@ -319,6 +351,105 @@ fn main() {
             }
         }
         // Greedy generation one token at a time.
+        // A prompt with an image (Qwen2.5-VL): `vlm MODEL IMAGE OUT N TEXT` runs the chat prompt
+        // for the image and TEXT, writes the logits at every position to OUT, and prints the
+        // token ids (each image token as the image placeholder) and N greedy tokens after.
+        "vlm" => {
+            let dir = Path::new(&args[2]);
+            let picture = tinyllm::vision::decode(&std::fs::read(&args[3]).unwrap()).unwrap();
+            let (out_path, n) = (&args[4], args[5].parse::<usize>().unwrap());
+            let text = &args[6];
+            let tokenizer = Tokenizer::load(dir).unwrap();
+            let config = Config::load(dir).unwrap();
+            let vision = config.vision_config.clone().expect("a vision-language model");
+            let image_token = config.image_token_id.unwrap_or(151655);
+            let patches = tinyllm::vision::Preprocessor::load(dir)
+                .unwrap()
+                .prepare(&picture)
+                .unwrap();
+            let count = patches.tokens(vision.spatial_merge_size);
+            let prompt = format!(
+                "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n\
+                 <|vision_start|><|image_pad|><|vision_end|>{text}<|im_end|>\n<|im_start|>assistant\n"
+            );
+            let mut ids = Vec::new();
+            for id in tokenizer.encode(&prompt, false) {
+                match id == image_token {
+                    true => ids.extend(std::iter::repeat_n(image_token, count)),
+                    false => ids.push(id),
+                }
+            }
+            let start = ids.iter().position(|&id| id == image_token).unwrap();
+            // VLM_FORCE=a,b,c: a reply to go on with, whose logits are written too.
+            let prompt_len = ids.len();
+            if let Ok(forced) = std::env::var("VLM_FORCE") {
+                ids.extend(forced.split(',').map(|t| t.parse::<u32>().unwrap()));
+            }
+            let image = tinyllm::engine::ImagePart {
+                start,
+                tokens: count,
+                patches,
+            };
+            let plen = ids.len();
+            let total = plen + n + 1;
+            let (mut b, _) = open(dir, total, plen.max(8));
+            b.attach();
+            let t0 = Instant::now();
+            let embeddings = b.encode_image(&image.patches).unwrap();
+            eprintln!("encoded the image ({count} tokens) in {:.2}s", t0.elapsed().as_secs_f64());
+            let dim = embeddings.len() / count;
+            let multimodal =
+                tinyllm::engine::Multimodal::new(prompt_len, vec![image], vision.spatial_merge_size);
+            let position = |i: usize| match multimodal.positions.get(i) {
+                Some(&p) => p,
+                None => [(i as i64 + multimodal.delta) as u32; 3],
+            };
+            let slots: Vec<u32> = (0..total as u32).collect();
+            let rows: Vec<Row> = (0..plen)
+                .map(|i| Row {
+                    token: ids[i],
+                    slots: &slots[..=i],
+                    want_logits: true,
+                    sampling: LogitUse::All,
+                    adapter: 0,
+                    position: Some(position(i)),
+                    embedding: (start..start + count)
+                        .contains(&i)
+                        .then(|| &embeddings[(i - start) * dim..(i - start + 1) * dim]),
+                })
+                .collect();
+            b.forward(&rows);
+            let mut file = std::fs::File::create(out_path).unwrap();
+            for i in 0..plen {
+                let Logits::All(l) = b.logits(i) else { panic!() };
+                for v in l {
+                    file.write_all(&v.to_le_bytes()).unwrap();
+                }
+            }
+            let Logits::All(last) = b.logits(plen - 1) else { panic!() };
+            let mut token = argmax(last);
+            let mut greedy = Vec::new();
+            for step in 0..n {
+                greedy.push(token);
+                let at = plen + step;
+                let rows = [Row {
+                    token,
+                    slots: &slots[..=at],
+                    want_logits: true,
+                    sampling: LogitUse::All,
+                    adapter: 0,
+                    position: Some(position(at)),
+                    embedding: None,
+                }];
+                b.forward(&rows);
+                let Logits::All(l) = b.logits(0) else { panic!() };
+                token = argmax(l);
+            }
+            println!(
+                "{}",
+                serde_json::json!({"tokens": ids, "greedy": greedy, "text": tokenizer.decode(&greedy)})
+            );
+        }
         "greedy" => {
             let dir = Path::new(&args[2]);
             let n: usize = args[3].parse().unwrap();
@@ -335,6 +466,8 @@ fn main() {
                     want_logits: i + 1 == plen,
                     sampling: LogitUse::All,
                     adapter: adapter(),
+                    position: None,
+                    embedding: None,
                 })
                 .collect();
             b.forward(&rows);
@@ -353,6 +486,8 @@ fn main() {
                     want_logits: true,
                     sampling: LogitUse::All,
                     adapter: adapter(),
+                    position: None,
+                    embedding: None,
                 }];
                 b.forward(&rows);
             }
@@ -401,6 +536,8 @@ fn main() {
                         want_logits: i + 1 == p.len(),
                         sampling: LogitUse::All,
                         adapter: adapter(),
+                        position: None,
+                        embedding: None,
                     }]);
                 }
                 for _ in 0..steps {
@@ -413,6 +550,8 @@ fn main() {
                         want_logits: true,
                         sampling: LogitUse::All,
                         adapter: adapter(),
+                        position: None,
+                        embedding: None,
                     }]);
                 }
                 alone.push(got);
@@ -439,6 +578,8 @@ fn main() {
                         want_logits: i + 1 == p.len(),
                         sampling: LogitUse::All,
                         adapter: adapter(),
+                        position: None,
+                        embedding: None,
                     })
                 })
                 .collect();
@@ -467,6 +608,8 @@ fn main() {
                         want_logits: true,
                         sampling: LogitUse::All,
                         adapter: adapter(),
+                        position: None,
+                        embedding: None,
                     })
                     .collect();
                 b.forward(&rows);
@@ -499,6 +642,8 @@ fn main() {
                             want_logits: i == 15,
                             sampling: LogitUse::All,
                             adapter: adapter(),
+                            position: None,
+                            embedding: None,
                         })
                     })
                     .collect();
@@ -540,6 +685,8 @@ fn main() {
                             want_logits: true,
                             sampling,
                             adapter: adapter(),
+                            position: None,
+                            embedding: None,
                         })
                         .collect();
                     b.forward(&rows);
@@ -574,6 +721,8 @@ fn main() {
                             want_logits: i + 1 == n,
                             sampling: LogitUse::All,
                             adapter: adapter(),
+                            position: None,
+                            embedding: None,
                         })
                         .collect();
                     b.forward(&rows);
@@ -611,6 +760,8 @@ fn main() {
                         want_logits: i + 1 == p.len(),
                         sampling: LogitUse::All,
                         adapter: adapter(),
+                        position: None,
+                        embedding: None,
                     })
                     .collect();
                 for c in rows.chunks(chunk) {
@@ -631,6 +782,8 @@ fn main() {
                         want_logits: true,
                         sampling: LogitUse::All,
                         adapter: adapter(),
+                        position: None,
+                        embedding: None,
                     }]);
                 }
                 out
@@ -648,6 +801,8 @@ fn main() {
                         want_logits: i + 1 == other.len(),
                         sampling: LogitUse::All,
                         adapter: adapter(),
+                        position: None,
+                        embedding: None,
                     })
                     .collect();
                 b.forward(&rows);
@@ -663,6 +818,8 @@ fn main() {
                         want_logits: true,
                         sampling: LogitUse::All,
                         adapter: adapter(),
+                        position: None,
+                        embedding: None,
                     }]);
                 }
             }

@@ -67,6 +67,77 @@ pub enum SchedulePolicy {
 /// Past this many waiting requests, `Lpm` scheduling falls back to first come, first served.
 const LPM_MAX_QUEUE: usize = 128;
 
+/// What a prompt with images needs besides its tokens. Each image's tokens in the prompt are
+/// stand-ins that tell images apart (so the prefix cache only reuses work for the same image),
+/// and the model reads the vision encoder's output for them instead of embeddings; every token
+/// has a 3D position for multimodal RoPE.
+pub struct Multimodal {
+    pub images: Vec<ImagePart>,
+    /// Each prompt token's position: time, height and width.
+    pub positions: Vec<[u32; 3]>,
+    /// How far a generated token's position is past its index in the sequence.
+    pub delta: i64,
+}
+
+/// An image in a prompt.
+pub struct ImagePart {
+    /// Where its tokens start in the prompt.
+    pub start: usize,
+    pub tokens: usize,
+    pub patches: crate::vision::Patches,
+}
+
+impl Multimodal {
+    /// The stand-in for token `i` of an image, from the image's hash: never a real token.
+    pub fn stand_in(hash: u64, i: usize) -> u32 {
+        0x8000_0000 | (hash.wrapping_add(i as u64 * 0x9e37_79b9_7f4a_7c15) >> 33) as u32
+    }
+
+    /// Work out every token's position, given the prompt with each image's tokens in place, as
+    /// transformers' Qwen2.5-VL does: text counts up one a token; an image's tokens take its
+    /// grid's rows and columns (and its time), all starting from where the text had got to,
+    /// after which the text carries on from past the image's larger side.
+    pub fn new(prompt_len: usize, images: Vec<ImagePart>, merge: usize) -> Self {
+        let mut positions = Vec::with_capacity(prompt_len);
+        let mut current = 0u32;
+        let mut next_image = images.iter().peekable();
+        let mut i = 0;
+        while i < prompt_len {
+            match next_image.peek() {
+                Some(image) if image.start == i => {
+                    let [t, h, w] = image.patches.grid;
+                    let (h, w) = (h / merge, w / merge);
+                    for frame in 0..t {
+                        for row in 0..h {
+                            for col in 0..w {
+                                positions.push([
+                                    current + frame as u32,
+                                    current + row as u32,
+                                    current + col as u32,
+                                ]);
+                            }
+                        }
+                    }
+                    current += h.max(w) as u32;
+                    i += image.tokens;
+                    next_image.next();
+                }
+                _ => {
+                    positions.push([current; 3]);
+                    current += 1;
+                    i += 1;
+                }
+            }
+        }
+        let delta = current as i64 - prompt_len as i64;
+        Self {
+            images,
+            positions,
+            delta,
+        }
+    }
+}
+
 /// Settings for speculative decoding.
 #[derive(Clone, Copy, Debug)]
 pub struct Speculative {
@@ -110,6 +181,8 @@ pub struct GenerateParams {
     /// Instead of generating, send the scores (logits) of these tokens for what follows the
     /// prompt (see [`Event::Scores`]), as a reranker judging "yes" or "no" uses them.
     pub score_tokens: Vec<u32>,
+    /// For a prompt with images: what goes with its tokens (see [`Multimodal`]).
+    pub multimodal: Option<Arc<Multimodal>>,
 }
 
 impl GenerateParams {
@@ -168,6 +241,7 @@ impl Default for GenerateParams {
             strip_leading_space: false,
             adapter: 0,
             score_tokens: Vec::new(),
+            multimodal: None,
             logprobs: None,
             grammar: None,
             grammar_triggers: Vec::new(),
@@ -368,6 +442,9 @@ struct Sequence {
     /// How many of those the draft model has been through too (at most `slots.len()`). For an
     /// EAGLE head, position `p` is the model's features there and the token at `p + 1`.
     draft_len: usize,
+    /// For a prompt with images, each image's tokens' embeddings from the vision encoder, once
+    /// it's been through them.
+    image_embeddings: Vec<Option<Vec<f32>>>,
     /// For an EAGLE head: the model's features for each position from `draft_len` on that it
     /// hasn't been through yet, `feature_width` a position.
     features: Vec<f32>,
@@ -405,6 +482,31 @@ struct Sequence {
 }
 
 impl Sequence {
+    /// Where RoPE puts token `pos`, for a prompt with images.
+    fn position(&self, pos: usize) -> Option<[u32; 3]> {
+        let m = self.params.multimodal.as_ref()?;
+        Some(match m.positions.get(pos) {
+            Some(&p) => p,
+            None => [(pos as i64 + m.delta) as u32; 3],
+        })
+    }
+
+    /// The embedding to use for token `pos` of a sequence with these settings and image
+    /// embeddings, if it's part of an image. (Not a method, so that it only borrows those.)
+    fn embedding<'a>(
+        params: &GenerateParams,
+        image_embeddings: &'a [Option<Vec<f32>>],
+        pos: usize,
+    ) -> Option<&'a [f32]> {
+        let m = params.multimodal.as_ref()?;
+        let (k, image) = (m.images.iter().enumerate())
+            .find(|(_, image)| (image.start..image.start + image.tokens).contains(&pos))?;
+        let embeddings = image_embeddings[k].as_ref()?;
+        let dim = embeddings.len() / image.tokens;
+        let at = (pos - image.start) * dim;
+        embeddings.get(at..at + dim)
+    }
+
     fn pending(&self) -> usize {
         self.tokens.len() - self.slots.len()
     }
@@ -423,6 +525,7 @@ impl Sequence {
             && self.watch.is_none()
             && self.params.logprobs.is_none()
             && !self.params.reads_prompt()
+            && self.params.multimodal.is_none()
             && match &self.phase {
                 Phase::Answering => true,
                 Phase::Thinking { .. } => self
@@ -627,6 +730,8 @@ impl Engine {
             tokens,
             slots: Vec::new(),
             draft_len: 0,
+            image_embeddings: (params.multimodal.as_ref())
+                .map_or(Vec::new(), |m| m.images.iter().map(|_| None).collect()),
             features: Vec::new(),
             feature_width: 0,
             pinned: None,
@@ -667,6 +772,35 @@ impl Engine {
             return;
         }
 
+        // Images go through the vision encoder before the batch that first needs them.
+        let mut failed = Vec::new();
+        for (i, seq) in self.active.iter_mut().enumerate() {
+            let Some(m) = seq.params.multimodal.clone() else {
+                continue;
+            };
+            let end = seq.slots.len();
+            for (k, image) in m.images.iter().enumerate() {
+                let needed = image.start < end && end - seq.take < image.start + image.tokens;
+                if needed && seq.image_embeddings[k].is_none() {
+                    match self.backend.encode_image(&image.patches) {
+                        Ok(embeddings) => seq.image_embeddings[k] = Some(embeddings),
+                        Err(error) => {
+                            failed.push((i, format!("{error:#}")));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        for (i, error) in failed.into_iter().rev() {
+            let mut seq = self.active.remove(i);
+            let _ = seq.events.send(Event::Error(error));
+            self.retire(&mut seq);
+        }
+        if self.active.is_empty() {
+            return;
+        }
+
         // Run the batch.
         let mut rows = Vec::new();
         let mut logits_rows = 0;
@@ -693,6 +827,8 @@ impl Engine {
                         (false, true) => LogitUse::All,
                         (false, false) => seq.sampler.logit_use(generated),
                     },
+                    position: seq.position(pos),
+                    embedding: Sequence::embedding(&seq.params, &seq.image_embeddings, pos),
                 });
             }
         }
@@ -1099,6 +1235,8 @@ impl Engine {
                         want_logits: false,
                         sampling: LogitUse::All,
                         adapter: 0,
+                        position: None,
+                        embedding: None,
                     });
                 }
                 taken.push((i, end));
@@ -1174,6 +1312,8 @@ impl Engine {
                         want_logits: true,
                         sampling: seq.sampler.logit_use(seq.generated + round),
                         adapter: 0,
+                        position: None,
+                        embedding: None,
                     }
                 })
                 .collect();
@@ -1266,6 +1406,8 @@ impl Engine {
                         want_logits: last,
                         sampling: seq.sampler.logit_use(seq.generated),
                         adapter: 0,
+                        position: None,
+                        embedding: None,
                     });
                 }
                 hidden.extend_from_slice(&seq.features[..count * width]);
@@ -1356,6 +1498,8 @@ impl Engine {
                         want_logits: true,
                         sampling: seq.sampler.logit_use(seq.generated + round + 1),
                         adapter: 0,
+                        position: None,
+                        embedding: None,
                     }
                 })
                 .collect();

@@ -33,7 +33,7 @@ mkdir -p "$dest"
 echo "Downloading $repo into $dest"
 fetch config.json required
 fetch tokenizer.json required
-for file in tokenizer_config.json generation_config.json chat_template.jinja; do
+for file in tokenizer_config.json generation_config.json chat_template.jinja chat_template.json preprocessor_config.json; do
   fetch "$file" optional || true
 done
 if fetch model.safetensors.index.json optional; then

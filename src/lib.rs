@@ -53,3 +53,4 @@ pub mod server;
 pub mod speculative;
 pub mod tokenizer;
 pub mod tools;
+pub mod vision;

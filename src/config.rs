@@ -26,6 +26,7 @@ const SUPPORTED_MODEL_TYPES: &[&str] = &[
     "gpt_oss",
     "deepseek_v2",
     "deepseek_v3",
+    "qwen2_5_vl",
 ];
 
 #[derive(Debug, Clone, Deserialize)]
@@ -112,6 +113,11 @@ pub struct Config {
     #[serde(default)]
     architectures: Vec<String>,
     draft_vocab_size: Option<usize>,
+
+    // Vision-language models (Qwen2.5-VL).
+    pub vision_config: Option<VisionConfig>,
+    /// The token that stands for one piece of an image in a prompt.
+    pub image_token_id: Option<u32>,
     eagle_config: Option<Value>,
     topk_method: Option<String>,
     n_group: Option<usize>,
@@ -155,6 +161,9 @@ struct RopeScaling {
     mscale_all_dim: Option<f64>,
     attention_factor: Option<f64>,
     truncate: Option<bool>,
+    /// Multimodal RoPE: how many of a head's rotation frequencies follow each of a token's three
+    /// positions (time, height and width in an image).
+    mrope_section: Option<Vec<usize>>,
 }
 
 impl RopeScaling {
@@ -262,6 +271,45 @@ pub struct LatentAttention {
     pub v: usize,
 }
 
+/// A vision-language model's image encoder (Qwen2.5-VL's vision transformer; see
+/// [`crate::vision`]).
+#[derive(Debug, Clone, Deserialize)]
+pub struct VisionConfig {
+    pub depth: usize,
+    pub hidden_size: usize,
+    pub intermediate_size: usize,
+    pub num_heads: usize,
+    /// The width of what it hands the language model: the model's `hidden_size`.
+    pub out_hidden_size: usize,
+    #[serde(default = "default_patch_size")]
+    pub patch_size: usize,
+    #[serde(default = "default_merge_size")]
+    pub spatial_merge_size: usize,
+    #[serde(default = "default_merge_size")]
+    pub temporal_patch_size: usize,
+    #[serde(default = "default_channels", alias = "in_chans")]
+    pub in_channels: usize,
+    /// Most layers only attend within windows of this many pixels on a side...
+    #[serde(default = "default_window")]
+    pub window_size: usize,
+    /// ...but these attend across the whole image.
+    #[serde(default)]
+    pub fullatt_block_indexes: Vec<usize>,
+}
+
+fn default_patch_size() -> usize {
+    14
+}
+fn default_merge_size() -> usize {
+    2
+}
+fn default_channels() -> usize {
+    3
+}
+fn default_window() -> usize {
+    112
+}
+
 /// An EAGLE-3 draft head: one decoder layer that guesses a model's next tokens from the model's
 /// own residual streams (after three of its layers, low, middle and high), which `fc` folds into
 /// one hidden state. Each row's layer input is that hidden state, normalized with `hidden_norm`,
@@ -343,6 +391,10 @@ pub struct Architecture {
     pub latent: Option<LatentAttention>,
     /// What makes this an EAGLE-3 draft head rather than a model, if it is one.
     pub eagle3: Option<Eagle3>,
+    /// Multimodal RoPE (Qwen2.5-VL): of each head's rotation frequencies, the first `[0]` turn
+    /// with a token's time position, the next `[1]` with its height and the last `[2]` with its
+    /// width. Text has all three the same, which is plain RoPE.
+    pub mrope: Option<[usize; 3]>,
     /// The mixture of experts in the layers marked `sparse`, if the model has one.
     pub experts: Option<Experts>,
     /// The RoPE speed of each element pair in a head: one list per kind of layer.
@@ -542,11 +594,27 @@ impl Config {
             attention_sinks: model_type == "gpt_oss",
             latent: self.latent()?,
             eagle3: self.eagle3(),
+            mrope: self.mrope()?,
             experts: self.experts()?,
             rope_tables,
             rope_scales,
             layers,
         })
+    }
+
+    /// Multimodal RoPE's split of the rotation frequencies, if the model uses it.
+    fn mrope(&self) -> Result<Option<[usize; 3]>> {
+        let scaling = self.rope_parameters_or_scaling();
+        let Some(scaling) = scaling.filter(|s| s.kind() == "mrope") else {
+            return Ok(None);
+        };
+        let section = scaling.mrope_section.clone().unwrap_or(vec![16, 24, 24]);
+        let half = self.head_dim() / 2;
+        ensure!(
+            section.len() == 3 && section.iter().sum::<usize>() == half,
+            "mrope_section {section:?} doesn't split the {half} rotation frequencies in three"
+        );
+        Ok(Some([section[0], section[1], section[2]]))
     }
 
     /// What makes this an EAGLE-3 draft head, if it is one.
@@ -735,7 +803,7 @@ impl Config {
         let sliding = match self.model_type.as_str() {
             // These have no kinds of layer: a window, if there is one, is for all of them.
             "mistral" | "phi3" => self.window_size().is_some(),
-            "qwen2" | "qwen3" => {
+            "qwen2" | "qwen3" | "qwen2_5_vl" => {
                 self.use_sliding_window.unwrap_or(false)
                     && l >= self.max_window_layers.unwrap_or(28)
             }
@@ -754,7 +822,9 @@ impl Config {
     fn window_size(&self) -> Option<usize> {
         match (self.model_type.as_str(), self.sliding_window) {
             // Mistral and Qwen and Gemma 3 have a default, where others have none.
-            ("mistral" | "qwen2" | "qwen3" | "smollm3" | "gemma3_text", None) => Some(4096),
+            ("mistral" | "qwen2" | "qwen3" | "smollm3" | "gemma3_text" | "qwen2_5_vl", None) => {
+                Some(4096)
+            }
             ("gpt_oss", None) => Some(128),
             (_, setting) => setting.flatten(),
         }
@@ -812,7 +882,8 @@ impl Config {
         if let Some(scaling) = scaling {
             let factor = scaling.factor.unwrap_or(1.0);
             match scaling.kind() {
-                "default" => {}
+                // Multimodal RoPE turns at the usual speeds (see `mrope`).
+                "default" | "mrope" => {}
                 "linear" => inv_freq.iter_mut().for_each(|f| *f /= factor),
                 "llama3" => {
                     // Llama 3.1+: slow down the low-frequency pairs, leave the high-frequency

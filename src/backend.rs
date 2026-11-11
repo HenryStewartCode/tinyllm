@@ -57,6 +57,12 @@ pub trait Backend: Send {
         &[]
     }
 
+    /// Put an image through the model's vision encoder: its tokens' embeddings, `[tokens, dim]`,
+    /// for rows to use (see [`Row::embedding`](crate::model::Row::embedding)).
+    fn encode_image(&mut self, _patches: &crate::vision::Patches) -> Result<Vec<f32>> {
+        bail!("{} can't read images yet", self.describe())
+    }
+
     /// For an EAGLE-3 head: the hidden state each row of the next `forward` starts from,
     /// `width` floats a row. That's its model's kept features (`3 * dim`), which the head folds
     /// into one, or the head's own features (`dim`) from the row for the position before.
@@ -149,6 +155,10 @@ impl Backend for CpuBackend {
     fn capture_layers(&mut self, layers: &[usize]) -> Result<()> {
         self.workspace.capture_layers(layers);
         Ok(())
+    }
+
+    fn encode_image(&mut self, patches: &crate::vision::Patches) -> Result<Vec<f32>> {
+        self.model.encode_image(self.workspace.pool(), patches)
     }
 
     fn features(&self, row: usize) -> &[f32] {

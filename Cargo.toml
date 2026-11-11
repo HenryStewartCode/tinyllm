@@ -10,6 +10,7 @@ axum = "0.8.9"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 clap = { version = "4.6.7", features = ["derive"] }
 fancy-regex = "0.20.0"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 futures-util = "0.3"
 minijinja = { version = "3.1.0", features = ["loop_controls", "preserve_order", "serde"] }
 minijinja-contrib = { version = "3.1.0", features = ["pycompat"] }

@@ -473,6 +473,7 @@ impl App {
             thinking: None,
             embed: false,
             score_tokens: Vec::new(),
+            multimodal: None,
         })
     }
 
