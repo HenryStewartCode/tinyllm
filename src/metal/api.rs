@@ -200,6 +200,11 @@ impl Device {
     }
 
     /// How much memory the GPU should use, by Metal's reckoning.
+    /// The largest buffer the GPU can have, in bytes.
+    pub fn max_buffer_bytes(&self) -> usize {
+        msg!(self.device.0, c"maxBufferLength"; usize)
+    }
+
     pub fn recommended_memory(&self) -> usize {
         msg!(self.device.0, c"recommendedMaxWorkingSetSize"; u64) as usize
     }

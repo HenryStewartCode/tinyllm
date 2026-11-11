@@ -46,6 +46,8 @@ fn open_with(
     max_batch: usize,
 ) -> (Box<dyn Backend>, Config) {
     let threads = env_usize("THREADS", 4);
+    // CACHE_TOKENS=n gives the KV cache room for n tokens instead.
+    let cache_tokens = env_usize("CACHE_TOKENS", cache_tokens);
     let config = Config::load(dir).unwrap();
     // Keys and values per token: DeepSeek's latent attention has its own widths.
     let per_layer = match config.architecture().unwrap().latent {
@@ -284,20 +286,29 @@ fn main() {
             let batch: usize = args[4].parse().unwrap();
             let config = Config::load(dir).unwrap();
             let kv_dim = config.n_kv_heads() * config.head_dim();
+            let tokens = env_usize("CACHE_TOKENS", batch * (context + 1) + batch);
             let options = metal::Options {
-                cache_bytes: batch * (context + 1) * 2 * config.num_hidden_layers * kv_dim * 4,
+                cache_bytes: tokens * 2 * config.num_hidden_layers * kv_dim * 4,
                 host_threads: 4,
                 weights_from: None,
             };
             let LoadedModel { mut backend, .. } = MetalBackend::load(dir, &options).unwrap();
-            let slots: Vec<Vec<u32>> = (0..batch)
-                .map(|b| ((b * context) as u32..((b + 1) * context) as u32).collect())
-                .collect();
-            let rows: Vec<Row> = slots
-                .iter()
-                .map(|slots| Row {
+            // SAME_SEQUENCE=1: the rows are one sequence's last positions (as when checking
+            // guesses), rather than one row from each of `batch` sequences.
+            let same = std::env::var("SAME_SEQUENCE").is_ok();
+            let slots: Vec<Vec<u32>> = match same {
+                true => vec![(0..(context + batch) as u32).collect()],
+                false => (0..batch)
+                    .map(|b| ((b * context) as u32..((b + 1) * context) as u32).collect())
+                    .collect(),
+            };
+            let rows: Vec<Row> = (0..batch)
+                .map(|b| Row {
                     token: 100,
-                    slots,
+                    slots: match same {
+                        true => &slots[0][..context + b + 1],
+                        false => &slots[b],
+                    },
                     want_logits: true,
                     sampling: LogitUse::All,
                     adapter: adapter(),

@@ -10,7 +10,9 @@ cargo build --release --example harness      # target/release/examples/harness
 ```
 
 `DEVICE=cpu|cuda|metal` and `PRECISION=bf16|f32` choose where the harness runs the model, and
-`harness profile MODEL CONTEXT BATCH` shows where an Apple GPU's step time goes.
+`harness profile MODEL CONTEXT BATCH` shows where an Apple GPU's step time goes (`SAME_SEQUENCE=1`
+makes the rows one sequence's, as when checking guesses). `CACHE_TOKENS=n` sizes the KV cache. Apple
+laptops slow their GPU as it warms, so timings there are best taken from a cool start.
 
 | Script | What it checks |
 |---|---|

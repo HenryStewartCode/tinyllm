@@ -356,9 +356,12 @@ struct Layer {
     feed_forward: FeedForward,
     /// The same as `norm_after_attn`, for the MLP.
     norm_after_mlp: Option<Buffer>,
-    /// With latent attention, `k_pool` is the cache of latents and `v_pool` is unused.
-    k_pool: Buffer,
-    v_pool: Buffer,
+    /// Which of the KV cache's buffers (`MetalBackend::kv_cache`) has the layer's keys and
+    /// values, and where they start in it, in bytes. With latent attention, `k_offset` is where
+    /// its latents are and `v_offset` is unused.
+    kv_buffer: usize,
+    k_offset: usize,
+    v_offset: usize,
     rope_table: usize,
     /// How many tokens it can see.
     window: usize,
@@ -882,6 +885,8 @@ pub struct MetalBackend {
     ws: Workspace,
     /// The KV slots each sequence in the batch can see, one list after another.
     slot_lists: Buffer,
+    /// Every layer's keys and values (see `Layer::kv_buffer`).
+    kv_cache: Vec<Buffer>,
     /// `[rows that want logits, vocab]`
     logits: Buffer,
     /// Final hidden states `[rows that want logits, dim]`, when any want them.
@@ -1141,8 +1146,9 @@ impl MetalBackend {
                 feed_forward,
                 norm_after_mlp,
                 // Allocated below, once the weights' size is known.
-                k_pool: device.buffer(0)?,
-                v_pool: device.buffer(0)?,
+                kv_buffer: 0,
+                k_offset: 0,
+                v_offset: 0,
                 rope_table: shape.rope_table,
                 window: shape.window.unwrap_or(u32::MAX as usize),
                 latent: latent_layer,
@@ -1212,16 +1218,22 @@ impl MetalBackend {
             None => 2 * layers.len() * kv_dim * 4,
         };
         let capacity = (cache_bytes / kv_bytes_per_token).clamp(16, u32::MAX as usize);
-        for layer in &mut layers {
-            match latent {
-                Some(l) => {
-                    layer.k_pool = device.buffer(capacity * (l.kv_lora_rank + l.rope) * 4)?
-                }
-                None => {
-                    layer.k_pool = device.buffer(capacity * kv_dim * 4)?;
-                    layer.v_pool = device.buffer(capacity * kv_dim * 4)?;
-                }
+        // As few buffers as hold the whole cache, each layer's keys and values in turn: Apple
+        // GPUs run everything noticeably slower with many large buffers in use (a fifth slower
+        // with two for each of Qwen3-0.6B's layers) than with one.
+        let per_layer = match latent {
+            Some(l) => capacity * (l.kv_lora_rank + l.rope) * 4,
+            None => 2 * capacity * kv_dim * 4,
+        };
+        let layers_per_buffer = (device.max_buffer_bytes() / per_layer).max(1);
+        let mut kv_cache = Vec::new();
+        for chunk in layers.chunks_mut(layers_per_buffer) {
+            for (l, layer) in chunk.iter_mut().enumerate() {
+                layer.kv_buffer = kv_cache.len();
+                layer.k_offset = l * per_layer;
+                layer.v_offset = l * per_layer + per_layer / 2;
             }
+            kv_cache.push(device.buffer(chunk.len() * per_layer)?);
         }
 
         let experts = architecture.experts.as_ref();
@@ -1250,6 +1262,7 @@ impl MetalBackend {
             num_params,
             backend: Self {
                 slot_lists: device.buffer(1 << 16)?,
+                kv_cache,
                 lora_hidden: device.buffer(16)?,
                 logits: device.buffer(vocab_size * 4)?,
                 hidden: device.buffer(dim * 4)?,
@@ -1679,7 +1692,7 @@ impl MetalBackend {
             e.set_buffer(2, &ws.cos, table);
             e.set_buffer(3, &ws.sin, table);
             e.set_buffer(4, &ws.write_slots, 0);
-            e.set_buffer(5, &layer.k_pool, 0);
+            e.set_buffer(5, &self.kv_cache[layer.kv_buffer], layer.k_offset);
             e.set_bytes(6, &args(stride));
             e.dispatch([batch, 1], NORM_THREADS);
         }
@@ -1698,7 +1711,7 @@ impl MetalBackend {
         if on(Part::Attention) {
             e.set_pipeline(&k.attention_latent);
             e.set_buffer(0, &b.query, 0);
-            e.set_buffer(1, &layer.k_pool, 0);
+            e.set_buffer(1, &self.kv_cache[layer.kv_buffer], layer.k_offset);
             e.set_buffer(2, &self.slot_lists, 0);
             e.set_buffer(3, &ws.row_offset, 0);
             e.set_buffer(4, &ws.row_len, 0);
@@ -2315,8 +2328,8 @@ impl MetalBackend {
         e.set_buffer(1, &ws.cos, table);
         e.set_buffer(2, &ws.sin, table);
         e.set_buffer(3, &ws.write_slots, 0);
-        e.set_buffer(4, &layer.k_pool, 0);
-        e.set_buffer(5, &layer.v_pool, 0);
+        e.set_buffer(4, &self.kv_cache[layer.kv_buffer], layer.k_offset);
+        e.set_buffer(5, &self.kv_cache[layer.kv_buffer], layer.v_offset);
         e.set_bytes(
             6,
             &RopeArgs {
@@ -2336,8 +2349,8 @@ impl MetalBackend {
         let (ws, shape) = (&self.ws, self.shape);
         e.set_pipeline(&self.kernels.attention);
         e.set_buffer(0, &ws.qkv, 0);
-        e.set_buffer(1, &layer.k_pool, 0);
-        e.set_buffer(2, &layer.v_pool, 0);
+        e.set_buffer(1, &self.kv_cache[layer.kv_buffer], layer.k_offset);
+        e.set_buffer(2, &self.kv_cache[layer.kv_buffer], layer.v_offset);
         e.set_buffer(3, &self.slot_lists, 0);
         e.set_buffer(4, &ws.row_offset, 0);
         e.set_buffer(5, &ws.row_len, 0);
