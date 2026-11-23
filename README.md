@@ -6,7 +6,7 @@ and fast structured output, behind OpenAI-, Anthropic- and Ollama-compatible API
 Llama-style models (Llama 2/3, Qwen2.5, Qwen3, Mistral, SmolLM2/3, Phi-3, Granite, Gemma 1–3,
 TinyLlama), mixtures of experts (Qwen3-MoE, Mixtral, OLMoE, Granite MoE, Qwen2-MoE, GPT-OSS,
 DeepSeek V2 and V3),
-reasoning models, and embedding models straight from Hugging Face checkpoints, on
+reasoning models, embedding models, and Qwen2.5-VL (which reads pictures) straight from Hugging Face checkpoints, on
 NVIDIA GPUs, Apple GPUs or the CPU, with no ML framework underneath. Everything from weight loading and
 tokenization to the GPU and SIMD kernels and the HTTP server is here, in about 18,000 lines
 including tests. See [How it compares with SGLang](#how-it-compares-with-sglang) for what's still
@@ -45,6 +45,7 @@ cargo run --release -- -m models/SmolLM2-135M-Instruct --chat
 | `HuggingFaceTB/SmolLM3-3B` | 6 GB | | reasoning model. Verified. |
 | `microsoft/Phi-3-mini-4k-instruct` | 7.6 GB | | Verified. |
 | `Qwen/Qwen3-Embedding-0.6B` | 1.2 GB | | an embedding model, for `/v1/embeddings`. Verified. |
+| `Qwen/Qwen2.5-VL-3B-Instruct` | 7.5 GB | | reads pictures (see [Images](#images)). Verified. |
 | `HuggingFaceTB/SmolLM2-360M-Instruct`, `SmolLM2-1.7B-Instruct` | 720 MB, 3.4 GB | | same architecture as the 135M |
 | `TinyLlama/TinyLlama-1.1B-Chat-v1.0` | 2.2 GB | | Llama 2 style tokenizer |
 | `google/gemma-3-1b-it`, `gemma-2-2b-it` | 2 GB, 5 GB | | gated. Checked with random weights only. |
@@ -289,6 +290,39 @@ tinyllm -m models/gpt-oss-20b --serve --batch-size 128 --parallel 16 --cache-mb 
 
 On the RTX 2000 Ada that's 39 tok/s for one request, 104 for four and 291 for sixteen. The memory
 it leaves is small, hence the smaller batches and cache.
+
+### Images
+
+Qwen2.5-VL models read pictures, on the CPU, the Apple GPU and NVIDIA GPUs. `download.sh` also
+fetches the `preprocessor_config.json` and `chat_template.json` they need. Send a picture as a data
+URL, the way the OpenAI API takes one:
+
+```bash
+IMG=$(base64 < picture.png | tr -d '\n')
+curl http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "messages": [{"role": "user", "content": [
+    {"type": "image_url", "image_url": {"url": "data:image/png;base64,'"$IMG"'"}},
+    {"type": "text", "text": "Describe this picture in one sentence."}]}]}'
+```
+
+The Anthropic API takes `{"type": "image", "source": {"type": "base64", "media_type": "image/png",
+"data": ...}}` in a message's content, and Ollama's takes `"images": [base64, ...]` on a message
+(`/api/chat`) or on the request (`/api/generate`). PNG, JPEG and WebP work.
+
+How a picture becomes tokens: it's resized to a whole number of 28-pixel blocks, cut into 14-pixel
+patches, and run through the model's vision encoder (a 32-layer transformer that mostly looks
+within windows of 8×8 patches). Each 2×2 group of patches then becomes one token in the prompt, so
+a 448×336 picture is 192 tokens. Those tokens get positions in three dimensions (time, row and
+column) rather than one. Repeating a picture costs nothing extra: the prefix cache recognizes it,
+so a follow-up question about the same picture only runs the new words.
+
+Encoding the 448×336 test picture takes 5 s on the M1 Max's CPU and 0.11 s on the RTX 2000 Ada.
+
+Limits for now: pictures must be sent as data (URLs aren't fetched), there's no video, and
+Qwen2.5-VL is the only vision model. Like `transformers`, tinyllm applies the repetition penalty
+from the model's `generation_config.json` (1.05 here), which is why it may say "picture" where an
+unpenalized run says "image" twice. [`scripts/vision_test.py`](scripts/vision_test.py) tries
+every API format against a running server.
 
 ### Embeddings
 
@@ -549,6 +583,7 @@ What makes it a server rather than a loop:
 | [`src/backend.rs`](src/backend.rs) | What a device has to provide, and the CPU implementation. |
 | [`src/cuda/`](src/cuda/mod.rs) | The NVIDIA backend: [loading the driver](src/cuda/api.rs), [the kernels](src/cuda/kernels.cu), and running a batch. |
 | [`src/model.rs`](src/model.rs) | The transformer's batched forward pass on the CPU. |
+| [`src/vision.rs`](src/vision.rs) | Pictures: decoding, resizing into patches, and the vision encoder on the CPU (and on the GPUs in [`metal/vision.rs`](src/metal/vision.rs) and [`cuda/vision.rs`](src/cuda/vision.rs)). |
 | [`src/ops.rs`](src/ops.rs) | Numeric kernels: interleaved weight storage (32- or 16-bit) and a NEON matrix kernel, RMSNorm, RoPE, softmax, SwiGLU, vectorized `exp`. |
 | [`src/pool.rs`](src/pool.rs) | A spinning fork-join thread pool: a forward pass is hundreds of parallel sections lasting microseconds each. |
 | [`src/sampler.rs`](src/sampler.rs) | Temperature, top-k, top-p, min-p, repetition/frequency/presence penalties, logit bias. |
@@ -711,6 +746,12 @@ Checked against Hugging Face `transformers` (float32) and `tokenizers`:
   correctly and that followed their schemas. The Mistral notation has only been run on a model
   with random weights and the real tokenizer.
 - **API:** exercised with the official `openai` Python client.
+- **Images:** Qwen2.5-VL-3B on the CPU against `transformers` in 32 bits: logits within 2.7e-3 at
+  every position of a 220-token picture prompt, and the same greedy reply. The Apple GPU against
+  the CPU: within 3.1e-3, with the same top token at all 220 positions. The NVIDIA GPU in 16 bits
+  against the CPU: the same reply, and the same top token at 215 of 220 positions (the other five
+  are near-ties, under 0.05 apart). A picture request and a text request give the same replies
+  together as alone.
 
 `cargo test` runs the unit tests. The scripts behind these checks are in
 [`scripts/`](scripts/README.md), driving the library through the `harness` example.
@@ -745,12 +786,14 @@ missing is breadth, and the last 10–20% of single-stream speed.
 | Sliding-window attention, logit soft-capping | yes | yes |
 | Embedding models | yes | yes, with last-token pooling |
 | Rerank models | yes | yes, rerankers that judge with "yes" and "no" (Qwen3-Reranker); **no** cross-encoders with classification heads (BERT-style) |
-| Vision, reward models | yes | **no** |
+| Vision | yes, many models, with video | Qwen2.5-VL on the CPU, the Apple GPU and NVIDIA GPUs, pictures sent as data. **No URL fetching, no video, no other vision models** |
+| Reward models | yes | **no** |
 | Multi-GPU, multi-node, router | yes | **no** |
 | The SGL frontend language (`gen`, `select`, `fork`) | yes | **no** |
 
-Biggest gaps first, the plan is: draft trees for EAGLE and DeepSeek's multi-token prediction, then
-GPT-OSS on the Apple GPU and closing the gap with SGLang on DeepSeek.
+Biggest gaps first, the plan is: measuring long prompts against SGLang, draft trees for EAGLE and
+DeepSeek's multi-token prediction, then GPT-OSS on the Apple GPU and closing the gap with SGLang
+on DeepSeek.
 
 Other limitations: only BPE tokenizers are supported (not SentencePiece Unigram or WordPiece,
 though that covers the Llama family), embeddings only use last-token pooling, and sliding windows
