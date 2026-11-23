@@ -46,7 +46,11 @@ __device__ __forceinline__ float warp_max(float v) {
 // One block per row: x[row] = embeddings[tokens[row]] * scale.
 extern "C" __global__ void embed(const float *embeddings, const int *tokens, float *x, int dim,
                                  float scale) {
-    const float *from = embeddings + (size_t)tokens[blockIdx.x] * dim;
+    // A negative token is a row given its own embedding (an image's), placed by place_rows.
+    const int token = tokens[blockIdx.x];
+    if (token < 0)
+        return;
+    const float *from = embeddings + (size_t)token * dim;
     float *to = x + (size_t)blockIdx.x * dim;
     for (int i = threadIdx.x; i < dim; i += WARP)
         to[i] = from[i] * scale;
@@ -323,6 +327,8 @@ extern "C" __global__ void head_norm(float *qkv, int stride, int n_heads, int n_
 extern "C" __global__ void embed_bf16(const __nv_bfloat16 *embeddings, const int *tokens, float *x,
                                       int dim, int chunks, float scale) {
     const int token = tokens[blockIdx.x];
+    if (token < 0)
+        return;
     float *to = x + (size_t)blockIdx.x * dim;
     for (int i = threadIdx.x; i < dim; i += WARP)
         to[i] = __bfloat162float(embeddings[tile_index(token, i, chunks)]) * scale;
@@ -1932,6 +1938,71 @@ extern "C" __global__ void copy_rows(const float *x, int dim, float *out, int st
 }
 
 // One block per row: x's row, `cols` floats, as bfloat16 in its place in a tile-layout matrix.
+// One block per row given its embedding (an image's): x[rows[i]] = values[i].
+extern "C" __global__ void place_rows(const float *values, const int *rows, float *x, int dim) {
+    const float *from = values + (size_t)blockIdx.x * dim;
+    float *to = x + (size_t)rows[blockIdx.x] * dim;
+    for (int i = threadIdx.x; i < dim; i += WARP)
+        to[i] = from[i];
+}
+
+// One warp per (patch, head) of a vision encoder: attention with no mask over the patches of the
+// patch's segment, starts[row] to starts[row] + lens[row] (its window, or the whole image). Its
+// query is in `queries` (rows `q_stride` apart), and the segment's keys and values are rows of
+// `keys` and `values`, `dim` apart. The softmax is built up as it goes, with a running maximum,
+// so nothing is stored per key. head_dim at most VISION_HEAD.
+#define VISION_HEAD 128
+extern "C" __global__ void vision_attention(const float *queries, int q_stride, const float *keys,
+                                            const float *values, int dim, int head_dim,
+                                            const int *starts, const int *lens, float scale,
+                                            float *out) {
+    constexpr int PER_LANE = VISION_HEAD / WARP;
+    const int row = blockIdx.x, head = blockIdx.y, lane = threadIdx.x;
+    const float *q = queries + (size_t)row * q_stride + head * head_dim;
+    float qv[PER_LANE], acc[PER_LANE];
+    for (int j = 0; j < PER_LANE; j++) {
+        const int f = lane + j * WARP;
+        qv[j] = f < head_dim ? q[f] : 0.0f;
+        acc[j] = 0.0f;
+    }
+    float best = -INFINITY, total = 0.0f;
+    const int first = starts[row], end = first + lens[row];
+    for (int p = first; p < end; p++) {
+        const float *k = keys + (size_t)p * dim + head * head_dim;
+        const float *v = values + (size_t)p * dim + head * head_dim;
+        float partial = 0.0f;
+        for (int j = 0; j < PER_LANE; j++) {
+            const int f = lane + j * WARP;
+            if (f < head_dim)
+                partial += qv[j] * k[f];
+        }
+        const float score = warp_sum(partial) * scale;
+        const float new_best = fmaxf(best, score);
+        const float correction = expf(best - new_best); // 0 for the first key
+        const float weight = expf(score - new_best);
+        total = total * correction + weight;
+        for (int j = 0; j < PER_LANE; j++) {
+            const int f = lane + j * WARP;
+            if (f < head_dim)
+                acc[j] = acc[j] * correction + weight * v[f];
+        }
+        best = new_best;
+    }
+    float *o = out + (size_t)row * dim + head * head_dim;
+    for (int j = 0; j < PER_LANE; j++) {
+        const int f = lane + j * WARP;
+        if (f < head_dim)
+            o[f] = acc[j] / total;
+    }
+}
+
+// x = GELU(x), the exact curve, for `count` values.
+extern "C" __global__ void gelu_erf(float *x, int count) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count)
+        x[i] = 0.5f * x[i] * (1.0f + erff(x[i] * 0.70710678118654752f));
+}
+
 extern "C" __global__ void tiles_bf16(const float *x, int cols, __nv_bfloat16 *out, int chunks) {
     const int row = blockIdx.x;
     for (int i = threadIdx.x; i < cols; i += WARP)

@@ -10,6 +10,7 @@
 //! that the input to each matrix multiplication gets rounded to 16 bits as well.
 
 mod api;
+mod vision;
 
 pub use api::{Arg, Gpu, Graph, Kernel, Module, Pointer};
 
@@ -19,7 +20,7 @@ use crate::config::{
     Routing,
 };
 use crate::lora::{LoraAdapter, LoraPair, Module as LoraModule};
-use crate::model::{LogitUse, Row};
+use crate::model::{LogitUse, Row, rope_positions};
 use crate::pool::Pool;
 use crate::safetensors::{FP8_BLOCK, SafeTensors, bf16_to_f32, f32_to_bf16};
 use anyhow::{Context, Result, bail, ensure};
@@ -321,6 +322,9 @@ struct Kernels {
     copy_rows: Kernel,
     tiles_bf16: Kernel,
     scatter_logits: Kernel,
+    place_rows: Kernel,
+    vision_attention: Kernel,
+    gelu_erf: Kernel,
 }
 
 impl Kernels {
@@ -380,6 +384,9 @@ impl Kernels {
             copy_rows: gpu.kernel(module, "copy_rows")?,
             tiles_bf16: gpu.kernel(module, "tiles_bf16")?,
             scatter_logits: gpu.kernel(module, "scatter_logits")?,
+            place_rows: gpu.kernel(module, "place_rows")?,
+            vision_attention: gpu.kernel(module, "vision_attention")?,
+            gelu_erf: gpu.kernel(module, "gelu_erf")?,
             swiglu_bf16: gpu.kernel(module, "swiglu_bf16")?,
             geglu_bf16: gpu.kernel(module, "geglu_bf16")?,
             rope_store_bf16: gpu.kernel(module, "rope_store_bf16")?,
@@ -443,6 +450,9 @@ struct StepData {
     combined: Vec<u32>,
     /// The KV slots each sequence in the batch can see, concatenated.
     slot_lists: Vec<u32>,
+    /// The rows given their own embeddings (an image's), and those embeddings.
+    override_rows: Vec<u32>,
+    overrides: Vec<f32>,
 }
 
 pub struct CudaBackend {
@@ -525,6 +535,11 @@ pub struct CudaBackend {
     lora: Vec<[LoraTarget; 4]>,
     /// Working space for `A x`, `[rows, largest rank]`.
     lora_hidden: Pointer,
+    /// A vision-language model's image encoder.
+    vision: Option<vision::VisionTower>,
+    /// Where rows given their own embeddings get them from: the embeddings, and the row indices.
+    override_values: Growing,
+    override_rows: Growing,
 }
 
 /// The matrices LoRA corrections go to, as stacked here, and the modules each stacks.
@@ -1006,6 +1021,18 @@ impl CudaBackend {
         let step_slots = 14 * options.max_batch + rope_slots + 16;
         let step_buffer = gpu.alloc(step_slots)?;
 
+        // An image encoder's weights go on before the KV cache takes what's left.
+        let vision = match &config.vision_config {
+            Some(c) => Some(vision::VisionTower::load(
+                &gpu,
+                &st,
+                precision,
+                &mut num_params,
+                c,
+            )?),
+            None => None,
+        };
+
         // The KV cache gets what's left, unless told otherwise.
         let element_bytes = match precision {
             Precision::Bf16 => 2,
@@ -1111,8 +1138,39 @@ impl CudaBackend {
                 adapters: Vec::new(),
                 lora: Vec::new(),
                 lora_hidden: Pointer::NULL,
+                vision,
+                override_values: Growing::default(),
+                override_rows: Growing::default(),
             },
         })
+    }
+
+    /// Queue copying the embeddings of rows given their own (an image's) into `x`. The embedding
+    /// kernel leaves those rows alone, since their token is -1. This runs outside any recorded
+    /// graph, so moving these buffers doesn't matter to one.
+    fn place_overrides(&mut self) -> Result<()> {
+        let k = self.step.override_rows.len();
+        if k == 0 {
+            return Ok(());
+        }
+        // The previous step has been waited for, so the buffers can be replaced.
+        self.override_values.reserve(&self.gpu, k * self.dim)?;
+        self.override_rows.reserve(&self.gpu, k)?;
+        // The data stays in `self.step` until the next step, which waits for this one.
+        self.gpu
+            .write(self.override_values.data, &self.step.overrides)?;
+        self.gpu
+            .write(self.override_rows.data, &self.step.override_rows)?;
+        self.gpu.launch(
+            self.kernels.place_rows,
+            [k, 1],
+            &[
+                Arg::Ptr(self.override_values.data),
+                Arg::Ptr(self.override_rows.data),
+                Arg::Ptr(self.x),
+                Arg::Int(self.dim),
+            ],
+        )
     }
 
     /// Queue `out = W x`, or `out += W x` if `accumulate`.
@@ -1886,6 +1944,8 @@ impl CudaBackend {
         step.temperatures.clear();
         step.keys.clear();
         step.hidden.clear();
+        step.override_rows.clear();
+        step.overrides.clear();
         let tables = self.architecture.rope_tables.len();
         step.cos.resize(tables * batch * half, 0.0);
         step.sin.resize(tables * batch * half, 0.0);
@@ -1921,12 +1981,23 @@ impl CudaBackend {
                     0 => team.min(group - i) as u32,
                     _ => 0,
                 });
-                let token = row.token as usize;
-                assert!(
-                    token < self.vocab_size,
-                    "token id {token} is outside the vocabulary"
-                );
-                step.tokens.push(row.token);
+                match row.embedding {
+                    // An image's token: its embedding goes in place of the embedding table's.
+                    Some(embedding) => {
+                        assert_eq!(embedding.len(), self.dim, "an embedding of the wrong size");
+                        step.tokens.push(u32::MAX);
+                        step.override_rows.push(index as u32);
+                        step.overrides.extend_from_slice(embedding);
+                    }
+                    None => {
+                        let token = row.token as usize;
+                        assert!(
+                            token < self.vocab_size,
+                            "token id {token} is outside the vocabulary"
+                        );
+                        step.tokens.push(row.token);
+                    }
+                }
                 step.write_slots
                     .push(*row.slots.last().expect("a row needs a KV slot"));
                 step.row_offset.push(offset);
@@ -1953,12 +2024,12 @@ impl CudaBackend {
                     step.keys.push(key as u32);
                     step.keys.push((key >> 32) as u32);
                 }
-                let position = (row.slots.len() - 1) as f32;
+                let positions = rope_positions(row, self.architecture.mrope, half);
                 for (table, frequencies) in self.architecture.rope_tables.iter().enumerate() {
                     let scale = self.architecture.rope_scales[table];
                     let start = (table * batch + index) * half;
                     for (j, &freq) in frequencies.iter().enumerate() {
-                        let angle = position * freq;
+                        let angle = positions[j] * freq;
                         step.cos[start + j] = angle.cos() * scale;
                         step.sin[start + j] = angle.sin() * scale;
                     }
@@ -2236,6 +2307,7 @@ impl CudaBackend {
         let batch = rows.len();
         assert!(batch <= self.max_batch, "batch larger than the buffers");
         let step = self.upload_step(rows)?;
+        self.place_overrides()?;
         if batch <= MAX_RECORDED_BATCH {
             let key = (
                 batch,
@@ -3303,6 +3375,10 @@ fn tile_scratch_elements(batch_rows: usize, rows: usize) -> usize {
 }
 
 impl Backend for CudaBackend {
+    fn encode_image(&mut self, patches: &crate::vision::Patches) -> Result<Vec<f32>> {
+        self.encode_image_on_gpu(patches)
+    }
+
     fn attach(&mut self) {
         self.gpu
             .attach()
