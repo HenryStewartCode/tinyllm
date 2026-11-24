@@ -6,7 +6,7 @@ usage: speculative_test.py PLAIN SPEC [concurrency]
 PLAIN can also be a file of replies saved before (when the two servers won't fit on one GPU at
 once): `speculative_test.py PLAIN_URL --save FILE` saves them, and then
 `speculative_test.py FILE SPEC_URL` compares with them."""
-import json, re, sys, time, urllib.request
+import json, os, re, sys, time, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 plain, spec = sys.argv[1:3]
@@ -42,6 +42,8 @@ SETTINGS = [
     {"temperature": 0.7, "top_p": 0.9, "top_k": 40, "seed": 5},
     {"temperature": 1.0, "repetition_penalty": 1.1, "seed": 3},
 ]
+if os.environ.get("GREEDY_ONLY"):
+    SETTINGS = SETTINGS[:1]
 
 
 def ask(base, prompt, settings):
@@ -55,7 +57,10 @@ def ask(base, prompt, settings):
 
 
 def metric(base, name):
-    text = urllib.request.urlopen(f"{base}/metrics").read().decode()
+    try:
+        text = urllib.request.urlopen(f"{base}/metrics").read().decode()
+    except OSError:  # another server, without these numbers
+        return 0.0
     found = re.search(rf"^tinyllm_{name} (\S+)$", text, re.M)
     return float(found.group(1)) if found else 0.0
 

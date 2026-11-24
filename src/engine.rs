@@ -1613,7 +1613,7 @@ impl Engine {
                         token: seq.tokens[position + 1],
                         slots: &seq.slots[..=position],
                         want_logits: last,
-                        sampling: seq.sampler.logit_use(seq.generated),
+                        sampling: head_use(seq.sampler.logit_use(seq.generated), branches),
                         adapter: 0,
                         position: None,
                         embedding: None,
@@ -1762,7 +1762,10 @@ impl Engine {
                         token,
                         slots: list,
                         want_logits: true,
-                        sampling: seq.sampler.logit_use(seq.generated + round + 1),
+                        sampling: head_use(
+                            seq.sampler.logit_use(seq.generated + round + 1),
+                            branches,
+                        ),
                         adapter: 0,
                         position: None,
                         embedding: None,
@@ -2229,6 +2232,23 @@ pub(crate) fn partial_match_len(text: &str, stop: &str) -> usize {
         .rev()
         .find(|&n| stop.is_char_boundary(n) && text.ends_with(&stop[..n]))
         .unwrap_or(0)
+}
+
+/// For an EAGLE head's rows with `branches`: candidates wide enough to show the head's other
+/// likely choices too. Ones further behind than the best could never change which token is drawn,
+/// so the guesses stay the same.
+fn head_use(use_: LogitUse, branches: usize) -> LogitUse {
+    match use_ {
+        LogitUse::Candidates { gap, limit } if branches > 0 => LogitUse::Candidates {
+            gap: gap.max(-MIN_BRANCH_PROBABILITY.ln() + 1.0),
+            limit: if limit == 0 {
+                0
+            } else {
+                limit.max(branches + 1)
+            },
+        },
+        other => other,
+    }
 }
 
 /// The least likely a branch's guesses can look to the head for it to be checked.

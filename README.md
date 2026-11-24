@@ -471,17 +471,22 @@ values as the main guesses until it splits off; from the page where it does it h
 own, with the keys and values before the split copied in and its rows from that page worked out
 again. So every guess is checked exactly as it would be on its own, and replies stay the same.
 Branches are for requests that choose from the best few tokens (greedy, top-k, top-p); a request
-sampled from every token keeps to one run. With Qwen3-4B and its head on the RTX 2000 Ada, the 20
-requests of `scripts/speculative_test.py` (half greedy, half sampled) one at a time, all replies
-identical to plain decoding:
+sampled from every token keeps to one run.
 
-| Guessing ahead | Runs (`--speculative-eagle-topk`) | tok/s |
+Against SGLang 0.5.23 with the same head, on the RTX 2000 Ada, Qwen3-4B, the 5 greedy requests of
+`scripts/speculative_test.py` (`GREEDY_ONLY=1`) one at a time (thinking on, 200 tokens each), after
+a warm-up run; tinyllm's replies were identical to plain decoding in every run:
+
+| | tinyllm | SGLang |
 |---|---|---|
-| none | | 23.5 |
-| 4 tokens | 1 | 35.6 |
-| 4 tokens | 4 | 39.8 |
-| 4 tokens | 8 | 39.9 |
-| 6 tokens | 4 | 36.8 |
+| no guessing | 23.7 tok/s | |
+| one run of guesses (tinyllm 4 ahead; SGLang 4 steps, topk 1) | 37.6 tok/s | 39.2 tok/s |
+| tinyllm 4 ahead, 4 runs; SGLang 4 steps, topk 4, 8 tokens | 41.4 tok/s | 44.4 tok/s |
+| tinyllm 3 ahead, 6 runs; SGLang 5 steps, topk 8, 16 tokens | 43.4 tok/s | 45.4 tok/s |
+
+SGLang's trees can branch anywhere, where tinyllm's branches only split off the main run, and it
+checks a tree's tokens once each, where tinyllm works out a branch's rows from the page where it
+splits off again.
 
 ### LoRA adapters
 
