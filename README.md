@@ -262,8 +262,16 @@ with NVLink), and so far dense models with 16- or 32-bit weights.
 tinyllm -m models/Qwen2.5-7B-Instruct --serve --tp-size 2
 ```
 
-Qwen2.5-7B on two RTX PRO 4000 Blackwells, over PCIe: 50 tok/s for one request against 37 on one
-GPU, and 1,033 tok/s with 32 at once against 885. Replies match one GPU's at first, but the sums
+Qwen2.5-7B on two RTX PRO 4000 Blackwells, over PCIe, with SGLang 0.5.23 on the same machine
+and the same requests (128-token replies):
+
+| | tinyllm, 1 GPU | SGLang, 1 GPU | tinyllm, 2 GPUs | SGLang, 2 GPUs |
+|---|---|---|---|---|
+| One request | 37 tok/s | 41 tok/s | 50 tok/s | 75 tok/s |
+| 32 at once | 885 tok/s | 951 tok/s | 1,033 tok/s | 1,422 tok/s |
+
+So a second GPU gains less here than in SGLang (1.35× and 1.17×, against 1.8× and 1.5×): passing
+parts between the GPUs still costs three kernels per block, where SGLang's all-reduce is one. Replies match one GPU's at first, but the sums
 come out in a different order, so long 16-bit replies can drift apart (half of 32 128-token
 replies differed); on the same GPUs they're always the same. It also runs models too large for
 one GPU.
