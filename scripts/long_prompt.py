@@ -33,7 +33,8 @@ def run(n, seed):
                 chunks += 1
                 first = first or time.time()
     end = time.time()
-    return prompt, first - start, (chunks - 1) / (end - first)
+    first = first or end  # a reply with no text
+    return prompt, first - start, max(chunks - 1, 0) / max(end - first, 1e-9)
 
 run(500, 0)  # warm up
 for i, n in enumerate(lengths):

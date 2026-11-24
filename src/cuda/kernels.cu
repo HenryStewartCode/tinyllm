@@ -1021,21 +1021,36 @@ typedef wmma::fragment<wmma::accumulator, 16, 16, 16, float> TileTotal;
 // page_lists[row_offset[row]]. Consecutive rows of a sequence each see one more token than the
 // row before. With a `window` a row only sees that many of the latest tokens.
 #define LARGEST_ATTENTION_EXPONENT 60.0f
+#define LOG2E 1.4426950408889634f
+
+__device__ __forceinline__ float exp2_approx(float x) {
+    float y;
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
+}
 #define RANGE_PAGES 32
 #define PREFILL_TILES 4
+#define PREFILL_PAGES 2
 
-// One warp's softmax state for a range. Lane L looks after tile row L / 2, and half its columns.
+// One warp's softmax state for a range, in the registers of the tensor cores' fragments
+// (mma.m16n8k16): lane L (g = L / 4, t = L % 4) looks after tile rows g and g + 8 (h = 0, 1), and
+// in each 8 columns, columns 2t and 2t + 1. `totals[c][n][2h + e]` is row g + 8h, column
+// c * 16 + n * 8 + 2t + e of the weighted values.
 template <int CHUNKS> struct RangeState {
-    TileTotal totals[CHUNKS];
-    float reference, capped, lane_sum;
-    bool referenced;
+    float totals[CHUNKS][2][4];
+    float reference[2], capped[2], lane_sum[2];
+    bool referenced[2];
 };
 
 template <int CHUNKS> __device__ __forceinline__ void range_reset(RangeState<CHUNKS> &st) {
     for (int c = 0; c < CHUNKS; c++)
-        wmma::fill_fragment(st.totals[c], 0.0f);
-    st.lane_sum = 0.0f;
-    st.referenced = false;
+        for (int n = 0; n < 2; n++)
+            for (int i = 0; i < 4; i++)
+                st.totals[c][n][i] = 0.0f;
+    for (int h = 0; h < 2; h++) {
+        st.lane_sum[h] = 0.0f;
+        st.referenced[h] = false;
+    }
 }
 
 // What a warp's tile needs to know about its rows.
@@ -1046,122 +1061,233 @@ struct TileRows {
     int window;
 };
 
-// Add one page to a range: its key and value tiles (CHUNKS each) at `k` and `v`, global or shared.
-// `scores` (256 floats) and `weights` (256, zero outside used rows) are the warp's scratch.
-template <int CHUNKS>
-__device__ __forceinline__ void range_page(RangeState<CHUNKS> &st, const TileA *a,
-                                           const __nv_bfloat16 *k, const __nv_bfloat16 *v,
-                                           int page, TileRows rows, float scale, float softcap,
-                                           float *scores, __nv_bfloat16 *weights, int lane) {
-    TileBColumns keys[CHUNKS];
-    TileBRows values[CHUNKS];
-    for (int c = 0; c < CHUNKS; c++) {
-        wmma::load_matrix_sync(keys[c], k + c * TILE_ELEMENTS, TILE);
-        wmma::load_matrix_sync(values[c], v + c * TILE_ELEMENTS, TILE);
-    }
-    TileTotal total;
-    wmma::fill_fragment(total, 0.0f);
-    for (int c = 0; c < CHUNKS; c++)
-        wmma::mma_sync(total, a[c], keys[c], total);
-    wmma::store_matrix_sync(scores, total, TILE, wmma::mem_row_major);
-    __syncwarp();
-    // This lane's row and columns, and which of them its query can see.
-    const int t = lane / 2, first_column = lane % 2 * 8;
-    const int seen = rows.first_len + t / rows.group;
-    const bool used = t < rows.count;
-    float row_scores[8];
-    bool visible[8];
-    float best = -FLT_MAX;
-    for (int j = 0; j < 8; j++) {
-        const int position = page * TILE + first_column + j;
-        visible[j] = used && position < seen && position >= seen - rows.window;
-        row_scores[j] = scores[t * TILE + first_column + j];
-        if (visible[j])
-            best = fmaxf(best, row_scores[j]);
-    }
-    best = fmaxf(best, __shfl_xor_sync(0xffffffff, best, 1));
-    if (!st.referenced && best != -FLT_MAX) {
-        st.reference = best;
-        st.capped = soft_cap(best * scale, softcap);
-        st.referenced = true;
-    }
-    for (int j = 0; j < 8; j++) {
-        float weight = 0.0f;
-        if (visible[j]) {
-            const float exponent = softcap > 0.0f
-                                       ? soft_cap(row_scores[j] * scale, softcap) - st.capped
-                                       : (row_scores[j] - st.reference) * scale;
-            weight = expf(fminf(exponent, LARGEST_ATTENTION_EXPONENT));
-        }
-        // Summing the rounded weight the multiplication really uses keeps the result a true
-        // average, so a dominant token isn't scaled by its weight's rounding error.
-        const __nv_bfloat16 rounded = __float2bfloat16(weight);
-        weights[t * TILE + first_column + j] = rounded;
-        st.lane_sum += __bfloat162float(rounded);
-    }
-    __syncwarp();
-    TileA weight_tile;
-    wmma::load_matrix_sync(weight_tile, weights, TILE);
-    for (int c = 0; c < CHUNKS; c++)
-        wmma::mma_sync(st.totals[c], weight_tile, values[c], st.totals[c]);
+// Four 8x8 matrices of 16-bit values from shared memory, each lane giving one row's address
+// (lanes 8i..8i+7 the rows of matrix i), as fragments: lane L gets row L / 4, columns 2(L % 4)
+// and the next, of each (TRANS: of each one transposed).
+template <bool TRANS>
+__device__ __forceinline__ void load_matrices(unsigned *r, const __nv_bfloat16 *row) {
+    const unsigned address = (unsigned)__cvta_generic_to_shared(row);
+    if (TRANS)
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];"
+                     : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+                     : "r"(address));
+    else
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
+                     : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+                     : "r"(address));
 }
 
-// Fold a warp's range into an accumulator: `acc` (CHUNKS tiles of floats), and per tile row a
-// reference exponent `m` (-FLT_MAX before any) and total weight `s`. One warp.
+// Add P consecutive pages from `first_page` to a range, those whose bit is set in `active`: page p's
+// key and value tiles (CHUNKS each) at `k + p * page_stride` and `v + p * page_stride`, in global
+// memory or (SHARED) shared memory. The scores of all P pages are found together, so the tensor
+// cores have more independent work; the softmax then takes the pages in order, exactly as one at a
+// time. The scores stay in registers, laid out as the weights' A fragment needs them.
+template <int CHUNKS, bool SHARED = false, int P = 1>
+__device__ __forceinline__ void range_pages(RangeState<CHUNKS> &st, const unsigned (*q)[4],
+                                            const __nv_bfloat16 *k, const __nv_bfloat16 *v,
+                                            int page_stride, int first_page, unsigned active,
+                                            TileRows rows, float scale, float softcap, int lane) {
+    const int g = lane / 4, t = lane % 4;
+    // Keys are stored token by token, so a B fragment (k = dimension, n = token) is 2 words.
+    float scores[P][2][4] = {};
+#pragma unroll
+    for (int c = 0; c < CHUNKS; c++)
+#pragma unroll
+        for (int p = 0; p < P; p++) {
+            if (!(active >> p & 1))
+                continue;
+            const __nv_bfloat16 *keys = k + p * page_stride + c * TILE_ELEMENTS;
+            unsigned b[4];
+            if (SHARED) {
+                // Matrix i: tokens i / 2 * 8.., dimensions i % 2 * 8..
+                const int i = lane / 8;
+                load_matrices<false>(b, keys + (i / 2 * 8 + lane % 8) * TILE + i % 2 * 8);
+            } else {
+                for (int n = 0; n < 2; n++) {
+                    const unsigned *key = (const unsigned *)(keys + (n * 8 + g) * TILE + 2 * t);
+                    b[2 * n] = key[0];
+                    b[2 * n + 1] = key[4];
+                }
+            }
+            for (int n = 0; n < 2; n++)
+                mma_bf16(scores[p][n], q[c], b[2 * n], b[2 * n + 1]);
+        }
+#pragma unroll
+    for (int p = 0; p < P; p++) {
+        if (!(active >> p & 1))
+            continue;
+        const int page = first_page + p;
+        unsigned weights[4];
+        // Once every row has its reference, the best scores aren't needed.
+        const bool find_best = __any_sync(0xffffffff, !st.referenced[0] || !st.referenced[1]);
+        // Most pages are seen whole by every row, which needs no masks.
+        const bool whole = page * TILE + TILE <= rows.first_len &&
+                           page * TILE >= rows.first_len + (rows.count - 1) / rows.group -
+                                              rows.window;
+#pragma unroll
+        for (int h = 0; h < 2; h++) {
+            const int r = g + 8 * h;
+            const int seen = rows.first_len + r / rows.group;
+            const bool used = r < rows.count;
+            bool visible[4];
+            for (int i = 0; i < 4; i++) {
+                const int position = page * TILE + i / 2 * 8 + 2 * t + i % 2;
+                visible[i] =
+                    used && (whole || (position < seen && position >= seen - rows.window));
+            }
+            if (find_best) {
+                float best = -FLT_MAX;
+                for (int i = 0; i < 4; i++)
+                    if (visible[i])
+                        best = fmaxf(best, scores[p][i / 2][2 * h + i % 2]);
+                best = fmaxf(best, __shfl_xor_sync(0xffffffff, best, 1));
+                best = fmaxf(best, __shfl_xor_sync(0xffffffff, best, 2));
+                if (!st.referenced[h] && best != -FLT_MAX) {
+                    st.reference[h] = best;
+                    st.capped[h] = soft_cap(best * scale, softcap);
+                    st.referenced[h] = true;
+                }
+            }
+            // Weights are powers of 2 of the exponent in base 2, which one fused multiply-add
+            // gives.
+            const float scale2 = scale * LOG2E, reference2 = st.reference[h] * scale2;
+            float weight[4];
+            for (int i = 0; i < 4; i++) {
+                const float score = scores[p][i / 2][2 * h + i % 2];
+                const float exponent2 =
+                    softcap > 0.0f ? (soft_cap(score * scale, softcap) - st.capped[h]) * LOG2E
+                                   : fmaf(score, scale2, -reference2);
+                weight[i] = visible[i]
+                                ? exp2_approx(fminf(exponent2, LARGEST_ATTENTION_EXPONENT * LOG2E))
+                                : 0.0f;
+            }
+            // Summing the rounded weights the multiplication really uses keeps the result a true
+            // average, so a dominant token isn't scaled by its weight's rounding error.
+            for (int j = 0; j < 2; j++) {
+                const __nv_bfloat162 pair = __floats2bfloat162_rn(weight[2 * j], weight[2 * j + 1]);
+                st.lane_sum[h] += __low2float(pair) + __high2float(pair);
+                weights[2 * j + h] = *reinterpret_cast<const unsigned *>(&pair);
+            }
+        }
+        // Values are stored token by token too, so a B fragment (k = token, n = dimension)
+        // takes two halves from consecutive tokens.
+        const __nv_bfloat16 *page_values = v + p * page_stride;
+        const unsigned short *values = (const unsigned short *)page_values;
+#pragma unroll
+        for (int c = 0; c < CHUNKS; c++) {
+            unsigned b[4];
+            if (SHARED) {
+                // Matrix i: tokens i % 2 * 8.., dimensions i / 2 * 8.., transposed.
+                const int i = lane / 8;
+                load_matrices<true>(b, page_values + c * TILE_ELEMENTS +
+                                           (i % 2 * 8 + lane % 8) * TILE + i / 2 * 8);
+            } else {
+                for (int n = 0; n < 2; n++) {
+                    const unsigned short *column =
+                        values + c * TILE_ELEMENTS + n * 8 + g + 2 * t * TILE;
+                    b[2 * n] = column[0] | (unsigned)column[TILE] << 16;
+                    b[2 * n + 1] = column[8 * TILE] | (unsigned)column[9 * TILE] << 16;
+                }
+            }
+            for (int n = 0; n < 2; n++)
+                mma_bf16(st.totals[c][n], weights, b[2 * n], b[2 * n + 1]);
+        }
+    }
+}
+
+// How to fold row g + 8h of a warp's range into an accumulator whose reference exponent is `old`:
+// the accumulator is scaled by `keep` and the range by `add`, and `next` is the new reference.
+template <int CHUNKS>
+__device__ __forceinline__ void fold_factors(const RangeState<CHUNKS> &st, int h, bool used,
+                                             float scale, float softcap, float old, float &next,
+                                             float &keep, float &add) {
+    used = used && st.referenced[h];
+    const float ref = !used ? 0.0f : softcap > 0.0f ? st.capped[h] : st.reference[h] * scale;
+    next = used ? fmaxf(old, ref) : old;
+    keep = !used ? 1.0f : old == -FLT_MAX ? 0.0f : expf(old - next);
+    add = used ? expf(ref - next) : 0.0f;
+}
+
+// The total weight of row g + 8h of a range (the same in all 4 lanes of a row).
+template <int CHUNKS>
+__device__ __forceinline__ float range_sum(const RangeState<CHUNKS> &st, int h) {
+    float sum = st.lane_sum[h] + __shfl_xor_sync(0xffffffff, st.lane_sum[h], 1);
+    return sum + __shfl_xor_sync(0xffffffff, sum, 2);
+}
+
+// Fold a warp's range into an accumulator in shared memory: `acc` (CHUNKS tiles of floats), and
+// per tile row a reference exponent `m` (-FLT_MAX before any) and total weight `s`. One warp.
 template <int CHUNKS>
 __device__ __forceinline__ void range_fold(RangeState<CHUNKS> &st, int count, float scale,
                                            float softcap, float *acc, float *m, float *s,
-                                           float *scratch, int lane) {
-    const int t = lane / 2;
-    const float sum = st.lane_sum + __shfl_xor_sync(0xffffffff, st.lane_sum, 1);
-    const bool used = t < count && st.referenced;
-    const float r = !used ? 0.0f : softcap > 0.0f ? st.capped : st.reference * scale;
-    const float old = m[t];
-    const float next = used ? fmaxf(old, r) : old;
-    const float keep = !used ? 1.0f : old == -FLT_MAX ? 0.0f : expf(old - next);
-    const float add = used ? expf(r - next) : 0.0f;
+                                           int lane) {
+    const int g = lane / 4, t = lane % 4;
+    float keep[2], add[2], sum[2], next[2];
+    for (int h = 0; h < 2; h++) {
+        const int r = g + 8 * h;
+        sum[h] = range_sum(st, h);
+        fold_factors(st, h, r < count, scale, softcap, m[r], next[h], keep[h], add[h]);
+    }
     __syncwarp();
-    for (int c = 0; c < CHUNKS; c++) {
-        wmma::store_matrix_sync(scratch, st.totals[c], TILE, wmma::mem_row_major);
-        __syncwarp();
-        for (int i = lane; i < TILE_ELEMENTS; i += WARP) {
-            const int row = i / TILE;
-            const float row_keep = __shfl_sync(0xffffffff, keep, 2 * row);
-            const float row_add = __shfl_sync(0xffffffff, add, 2 * row);
-            acc[c * TILE_ELEMENTS + i] =
-                acc[c * TILE_ELEMENTS + i] * row_keep + scratch[i] * row_add;
+    for (int c = 0; c < CHUNKS; c++)
+        for (int n = 0; n < 2; n++)
+            for (int i = 0; i < 4; i++) {
+                const int h = i / 2;
+                float &a = acc[c * TILE_ELEMENTS + (g + 8 * h) * TILE + n * 8 + 2 * t + i % 2];
+                a = a * keep[h] + st.totals[c][n][i] * add[h];
+            }
+    if (t == 0)
+        for (int h = 0; h < 2; h++) {
+            const int r = g + 8 * h;
+            s[r] = s[r] * keep[h] + sum[h] * add[h];
+            m[r] = next[h];
         }
-        __syncwarp();
-    }
-    if (lane % 2 == 0) {
-        s[t] = s[t] * keep + sum * add;
-        m[t] = next;
-    }
     __syncwarp();
 }
 
-// The query tile of `count` tile rows starting at `first_row`, as fragments, through `staging`
-// (256 bf16, left zero).
+// The same accumulator, kept in one warp's registers, laid out as `RangeState::totals`.
+template <int CHUNKS> struct RowTotals {
+    float acc[CHUNKS][2][4];
+    float m[2], s[2];
+};
+
 template <int CHUNKS>
-__device__ __forceinline__ void load_queries(TileA *a, const float *qkv, int stride, int first_row,
-                                             int count, int group, int kv_head, int head_dim,
-                                             __nv_bfloat16 *staging, int lane) {
-    for (int c = 0; c < CHUNKS; c++) {
-        for (int i = lane; i < TILE_ELEMENTS; i += WARP) {
-            const int t = i / TILE, j = i % TILE;
-            float value = 0.0f;
-            if (t < count)
-                value = qkv[(size_t)(first_row + t / group) * stride +
-                            (kv_head * group + t % group) * head_dim + c * TILE + j];
-            staging[i] = __float2bfloat16(value);
-        }
-        __syncwarp();
-        wmma::load_matrix_sync(a[c], staging, TILE);
-        __syncwarp();
+__device__ __forceinline__ void range_fold(RangeState<CHUNKS> &st, int count, float scale,
+                                           float softcap, RowTotals<CHUNKS> &a, int lane) {
+    const int g = lane / 4;
+    float keep[2], add[2];
+    for (int h = 0; h < 2; h++) {
+        const float sum = range_sum(st, h);
+        float next;
+        fold_factors(st, h, g + 8 * h < count, scale, softcap, a.m[h], next, keep[h], add[h]);
+        a.s[h] = a.s[h] * keep[h] + sum * add[h];
+        a.m[h] = next;
     }
-    for (int i = lane; i < TILE_ELEMENTS; i += WARP)
-        staging[i] = __float2bfloat16(0.0f);
-    __syncwarp();
+    for (int c = 0; c < CHUNKS; c++)
+        for (int n = 0; n < 2; n++)
+            for (int i = 0; i < 4; i++)
+                a.acc[c][n][i] = a.acc[c][n][i] * keep[i / 2] + st.totals[c][n][i] * add[i / 2];
+}
+
+// The query tile of `count` tile rows starting at `first_row`, as A fragments.
+template <int CHUNKS>
+__device__ __forceinline__ void load_queries(unsigned (*q)[4], const float *qkv, int stride,
+                                             int first_row, int count, int group, int kv_head,
+                                             int head_dim, int lane) {
+    const int g = lane / 4, t = lane % 4;
+    for (int h = 0; h < 2; h++) {
+        const int r = g + 8 * h;
+        const float *row =
+            r < count ? qkv + (size_t)(first_row + r / group) * stride +
+                            (kv_head * group + r % group) * head_dim
+                      : nullptr;
+        for (int c = 0; c < CHUNKS; c++)
+            for (int half = 0; half < 2; half++) {
+                const int column = c * TILE + half * 8 + 2 * t;
+                q[c][h + 2 * half] =
+                    row ? bf16_pair(row[column], row[column + 1]) : bf16_pair(0.0f, 0.0f);
+            }
+    }
 }
 
 // Divide the accumulator by the total weight and write the tile rows out, rounded for the next
@@ -1189,8 +1315,7 @@ __device__ __forceinline__ void write_rows(const float *acc, const float *m, con
 // For rows generating tokens: one block per team of rows (`team_sizes[row]` rows from this one,
 // 0 if another row's block has this one) and key/value head. Its warps take turns over the
 // ranges (warp w: ranges w, w + warps, ...), so a long context is spread over many warps, and
-// fold them in order. `smem`: CHUNKS tiles of floats and 2 * 16 floats, then for each warp a
-// score tile (1 KB) and a weight tile (512 bytes).
+// fold them in order. `smem`: CHUNKS tiles of floats and 2 * 16 floats.
 template <int CHUNKS>
 __device__ __forceinline__ void attention_tiles(const float *qkv, int stride,
                                                 const __nv_bfloat16 *k_pool,
@@ -1214,17 +1339,14 @@ __device__ __forceinline__ void attention_tiles(const float *qkv, int stride,
 
     float *acc = (float *)smem;
     float *m = acc + CHUNKS * TILE_ELEMENTS, *s = m + TILE;
-    float *scores = s + TILE + warp * (TILE_ELEMENTS + TILE_ELEMENTS / 2);
-    __nv_bfloat16 *weights = (__nv_bfloat16 *)(scores + TILE_ELEMENTS);
     for (int i = threadIdx.x; i < CHUNKS * TILE_ELEMENTS; i += blockDim.x)
         acc[i] = 0.0f;
     if (threadIdx.x < TILE) {
         m[threadIdx.x] = -FLT_MAX;
         s[threadIdx.x] = 0.0f;
     }
-    TileA a[CHUNKS];
-    load_queries<CHUNKS>(a, qkv, stride, first_row, rows.count, group, kv_head, head_dim,
-                         weights, lane);
+    unsigned q[CHUNKS][4];
+    load_queries<CHUNKS>(q, qkv, stride, first_row, rows.count, group, kv_head, head_dim, lane);
     __syncthreads();
 
     RangeState<CHUNKS> st;
@@ -1237,13 +1359,13 @@ __device__ __forceinline__ void attention_tiles(const float *qkv, int stride,
             for (int page = max(first_page, range * RANGE_PAGES); page <= end; page++) {
                 const size_t first =
                     ((size_t)pages[page] * kv_chunks + kv_head * CHUNKS) * TILE_ELEMENTS;
-                range_page<CHUNKS>(st, a, k_pool + first, v_pool + first, page, rows, scale,
-                                   softcap, scores, weights, lane);
+                range_pages<CHUNKS>(st, q, k_pool + first, v_pool + first, 0, page, 1, rows,
+                                    scale, softcap, lane);
             }
         }
         for (int w = 0; w < warps; w++) {
             if (warp == w && range <= last_range)
-                range_fold<CHUNKS>(st, rows.count, scale, softcap, acc, m, s, scores, lane);
+                range_fold<CHUNKS>(st, rows.count, scale, softcap, acc, m, s, lane);
             __syncthreads();
         }
     }
@@ -1254,9 +1376,8 @@ __device__ __forceinline__ void attention_tiles(const float *qkv, int stride,
 // For prompts: one block per PREFILL_TILES teams of consecutive rows of one sequence
 // (`block_rows[row]` rows from this one, 0 if another row's block has this one) and key/value
 // head, one warp per team. Each page of keys and values is read once into shared memory for all
-// of them, which is what makes long prompts fast. `smem`: the page's keys and values (CHUNKS
-// tiles each), then for each warp CHUNKS tiles of floats, 2 * 16 floats, a score tile and a
-// weight tile.
+// of them, the next page loading while this one is used, which is what makes long prompts fast.
+// `smem`: two stages of PREFILL_PAGES pages of keys and values (CHUNKS tiles each).
 template <int CHUNKS>
 __device__ __forceinline__ void attention_prefill_tiles(
     const float *qkv, int stride, const __nv_bfloat16 *k_pool, const __nv_bfloat16 *v_pool,
@@ -1279,48 +1400,97 @@ __device__ __forceinline__ void attention_prefill_tiles(
     const int my_first = max(0, rows.first_len - window) / TILE;
     const int my_last = (rows.first_len + my_rows - 2) / TILE;
     const unsigned *pages = page_lists + row_offset[block_row];
+    // [2 stages][PREFILL_PAGES pages][keys, values]
+    __nv_bfloat16 *buffers = (__nv_bfloat16 *)smem;
+    const int page_stride = 2 * CHUNKS * TILE_ELEMENTS;
 
-    __nv_bfloat16 *page_keys = (__nv_bfloat16 *)smem;
-    __nv_bfloat16 *page_values = page_keys + CHUNKS * TILE_ELEMENTS;
-    float *acc = (float *)(page_values + CHUNKS * TILE_ELEMENTS) +
-                 warp * (CHUNKS * TILE_ELEMENTS + 2 * TILE + TILE_ELEMENTS + TILE_ELEMENTS / 2);
-    float *m = acc + CHUNKS * TILE_ELEMENTS, *s = m + TILE, *scores = s + TILE;
-    __nv_bfloat16 *weights = (__nv_bfloat16 *)(scores + TILE_ELEMENTS);
-    for (int i = lane; i < CHUNKS * TILE_ELEMENTS; i += WARP)
-        acc[i] = 0.0f;
-    if (lane < TILE) {
-        m[lane] = -FLT_MAX;
-        s[lane] = 0.0f;
-    }
-    TileA a[CHUNKS];
+    const int vectors = CHUNKS * TILE_ELEMENTS * 2 / 16;
+    auto fetch = [&](int stage) {
+        for (int p = 0; p < PREFILL_PAGES; p++) {
+            const int page = stage * PREFILL_PAGES + p;
+            if (page < block_first || page > block_last)
+                continue;
+            const size_t first =
+                ((size_t)pages[page] * kv_chunks + kv_head * CHUNKS) * TILE_ELEMENTS;
+            __nv_bfloat16 *keys = buffers + ((stage & 1) * PREFILL_PAGES + p) * page_stride;
+            for (int i = threadIdx.x; i < 2 * vectors; i += blockDim.x) {
+                const bool value = i >= vectors;
+                const __nv_bfloat16 *from = (value ? v_pool : k_pool) + first;
+                const unsigned to = (unsigned)__cvta_generic_to_shared(keys) + i * 16;
+                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(to),
+                             "l"((const uint4 *)from + (i - (value ? vectors : 0))));
+            }
+        }
+        asm volatile("cp.async.commit_group;");
+    };
+
+    unsigned q[CHUNKS][4];
     if (my_rows > 0)
-        load_queries<CHUNKS>(a, qkv, stride, first_row, rows.count, group, kv_head, head_dim,
-                             weights, lane);
+        load_queries<CHUNKS>(q, qkv, stride, first_row, rows.count, group, kv_head, head_dim,
+                             lane);
+    RowTotals<CHUNKS> totals;
+    for (int c = 0; c < CHUNKS; c++)
+        for (int n = 0; n < 2; n++)
+            for (int i = 0; i < 4; i++)
+                totals.acc[c][n][i] = 0.0f;
+    for (int h = 0; h < 2; h++) {
+        totals.m[h] = -FLT_MAX;
+        totals.s[h] = 0.0f;
+    }
     RangeState<CHUNKS> st;
     range_reset(st);
 
-    const int vectors = CHUNKS * TILE_ELEMENTS * 2 / 16;
-    for (int page = block_first; page <= block_last; page++) {
-        __syncthreads();
-        const size_t first = ((size_t)pages[page] * kv_chunks + kv_head * CHUNKS) * TILE_ELEMENTS;
-        for (int i = threadIdx.x; i < vectors; i += blockDim.x) {
-            ((uint4 *)page_keys)[i] = ((const uint4 *)(k_pool + first))[i];
-            ((uint4 *)page_values)[i] = ((const uint4 *)(v_pool + first))[i];
+    // Stages hold PREFILL_PAGES pages, which divides RANGE_PAGES, so a range ends with a stage.
+    const int first_stage = block_first / PREFILL_PAGES, last_stage = block_last / PREFILL_PAGES;
+    fetch(first_stage);
+    for (int stage = first_stage; stage <= last_stage; stage++) {
+        if (stage < last_stage) {
+            fetch(stage + 1);
+            asm volatile("cp.async.wait_group 1;");
+        } else {
+            asm volatile("cp.async.wait_group 0;");
         }
         __syncthreads();
-        if (my_rows == 0)
-            continue;
-        if (page >= my_first && page <= my_last)
-            range_page<CHUNKS>(st, a, page_keys, page_values, page, rows, scale, softcap, scores,
-                               weights, lane);
-        if (page % RANGE_PAGES == RANGE_PAGES - 1 || page == block_last) {
-            range_fold<CHUNKS>(st, rows.count, scale, softcap, acc, m, s, scores, lane);
-            range_reset(st);
+        if (my_rows > 0) {
+            const int first_page = stage * PREFILL_PAGES;
+            unsigned active = 0;
+            for (int p = 0; p < PREFILL_PAGES; p++)
+                if (first_page + p >= my_first && first_page + p <= my_last)
+                    active |= 1u << p;
+            const __nv_bfloat16 *keys = buffers + (stage & 1) * PREFILL_PAGES * page_stride;
+            range_pages<CHUNKS, true, PREFILL_PAGES>(st, q, keys, keys + CHUNKS * TILE_ELEMENTS,
+                                                     page_stride, first_page, active, rows, scale,
+                                                     softcap, lane);
+            const int last_page = first_page + PREFILL_PAGES - 1;
+            if (last_page % RANGE_PAGES == RANGE_PAGES - 1 || stage == last_stage) {
+                range_fold<CHUNKS>(st, rows.count, scale, softcap, totals, lane);
+                range_reset(st);
+            }
         }
+        __syncthreads();
     }
-    if (my_rows > 0)
-        write_rows<CHUNKS>(acc, m, s, rows.count, first_row, group, kv_head, head_dim, sinks, out,
-                           out_chunks, lane, WARP);
+    if (my_rows == 0)
+        return;
+    const int g = lane / 4, t = lane % 4;
+#pragma unroll
+    for (int h = 0; h < 2; h++) {
+        const int r = g + 8 * h;
+        if (r >= rows.count)
+            break; // rows g + 8 come after rows g
+        const int head = kv_head * group + r % group, row = first_row + r / group;
+        float total = totals.s[h];
+        if (sinks)
+            total += expf(fminf(sinks[head] - totals.m[h], LARGEST_ATTENTION_EXPONENT));
+#pragma unroll
+        for (int c = 0; c < CHUNKS; c++)
+#pragma unroll
+            for (int n = 0; n < 2; n++)
+#pragma unroll
+                for (int e = 0; e < 2; e++)
+                    out[tile_index(row, head * head_dim + c * TILE + n * 8 + 2 * t + e,
+                                   out_chunks)] =
+                        __float2bfloat16(totals.acc[c][n][2 * h + e] / total);
+    }
 }
 
 // One kernel per head size, so the compiler can see how many tiles there are and keep them in

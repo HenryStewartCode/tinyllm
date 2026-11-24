@@ -58,6 +58,8 @@ const MAX_RECORDED_BATCH: usize = 64;
 
 /// Teams of rows in a block of `attention_prefill` (`PREFILL_TILES` in `kernels.cu`).
 const PREFILL_TILES: usize = 4;
+/// Pages per stage of `attention_prefill` (`PREFILL_PAGES` in `kernels.cu`).
+const PREFILL_PAGES: usize = 2;
 
 /// The most warps in a block of 16-bit attention.
 const ATTENTION_WARPS: usize = 16;
@@ -1345,10 +1347,10 @@ impl CudaBackend {
             // Warps per block take turns over the pages (see `attention_tiles`). Fixed per model,
             // so results don't depend on the batch.
             let warps = self.kernels.attention_warps[kernel];
-            let shared = 4 * (chunks * TILE * TILE + 2 * TILE + warps * 3 * TILE * TILE / 2);
+            let shared = 4 * (chunks * TILE * TILE + 2 * TILE);
             if let Some(prefill) = self.prefill_kernel() {
-                let shared = 2 * 2 * chunks * TILE * TILE
-                    + 4 * PREFILL_TILES * (chunks * TILE * TILE + 2 * TILE + 3 * TILE * TILE / 2);
+                // Two stages of PREFILL_PAGES pages of keys and values.
+                let shared = 2 * PREFILL_PAGES * 2 * 2 * chunks * TILE * TILE;
                 self.gpu.launch_with_shared(
                     prefill,
                     [batch * self.n_kv_heads, 1],

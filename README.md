@@ -679,13 +679,14 @@ SGLang 0.5.23 on the same GPU): time to the first token, then the speed of the 6
 
 | Prompt | tinyllm: first token | SGLang: first token | tinyllm: decoding | SGLang: decoding |
 |---|---|---|---|---|
-| 3,100 tokens | 0.34 s | 0.47 s | 105 tok/s | 127 tok/s |
-| 12,300 tokens | 2.5 s | 1.3 s | 64 tok/s | 77 tok/s |
-| 23,100 tokens | 7.3 s | 2.5 s | 45 tok/s | 53 tok/s |
+| 3,100 tokens | 0.29 s | 0.47 s | 108 tok/s | 127 tok/s |
+| 12,300 tokens | 1.8 s | 1.3 s | 68 tok/s | 77 tok/s |
+| 23,100 tokens | 5.1 s | 2.5 s | 47 tok/s | 53 tok/s |
 
-Past a few thousand tokens SGLang's attention (FlashInfer) pulls ahead on prompts, since its
-kernels keep the softmax in registers through the tensor cores' own fragment layouts, where
-tinyllm's go through shared memory for each page of 16 tokens.
+Both keep the softmax in registers, in the tensor cores' own fragment layouts, and load the next
+page while using this one. Past a few thousand tokens SGLang's attention (FlashInfer) is still
+ahead on prompts: tinyllm folds weights in fixed ranges of pages so results don't depend on the
+batch, and its pages of 16 tokens leave more bookkeeping per multiplication.
 
 These requests set only a temperature. SmolLM2 has no sampling defaults of its own, so its tokens
 are drawn on the GPU. Qwen2.5's generation config adds top-k, top-p and a repetition penalty, so
