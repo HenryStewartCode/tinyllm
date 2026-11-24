@@ -341,6 +341,7 @@ struct Kernels {
     reduce_add: Kernel,
     tp_signal: Kernel,
     tp_push: Kernel,
+    copy_pages: Kernel,
     vision_attention: Kernel,
     gelu_erf: Kernel,
 }
@@ -418,6 +419,7 @@ impl Kernels {
             reduce_add: gpu.kernel(module, "reduce_add")?,
             tp_signal: gpu.kernel(module, "tp_signal")?,
             tp_push: gpu.kernel(module, "tp_push")?,
+            copy_pages: gpu.kernel(module, "copy_pages")?,
             vision_attention: gpu.kernel(module, "vision_attention")?,
             gelu_erf: gpu.kernel(module, "gelu_erf")?,
             swiglu_bf16: gpu.kernel(module, "swiglu_bf16")?,
@@ -578,6 +580,8 @@ pub struct CudaBackend {
     override_rows: Growing,
     /// This GPU's place among several sharing the model, if it does.
     tp: Option<TpLink>,
+    /// Room on the GPU for `copy_pages`'s list of pages, and how many words it holds.
+    copy_pairs: (Pointer, usize),
 }
 
 /// What one GPU of several sharing a model (tensor parallelism) needs to combine their outputs.
@@ -1241,6 +1245,7 @@ impl CudaBackend {
                 override_values: Growing::default(),
                 override_rows: Growing::default(),
                 tp: None,
+                copy_pairs: (Pointer::NULL, 0),
             },
         })
     }
@@ -3730,6 +3735,33 @@ impl Backend for CudaBackend {
         self.gpu
             .attach()
             .expect("couldn't use the GPU from this thread");
+    }
+
+    fn copy_pages(&mut self, pairs: &[(u32, u32)]) -> Result<()> {
+        if pairs.is_empty() {
+            return Ok(());
+        }
+        if self.precision != Precision::Bf16 || self.architecture.latent.is_some() {
+            bail!("only 16-bit caches without latent attention copy pages");
+        }
+        let flat: Vec<u32> = pairs.iter().flat_map(|&(a, b)| [a, b]).collect();
+        if self.copy_pairs.1 < flat.len() {
+            self.copy_pairs = (self.gpu.alloc(flat.len().max(256))?, flat.len().max(256));
+        }
+        self.gpu.write_now(self.copy_pairs.0, &flat)?;
+        let words = TILE * self.n_kv_heads * self.head_dim / 2;
+        for layer in &self.layers {
+            for pool in [layer.k_pool, layer.v_pool] {
+                self.gpu.launch_with_shared(
+                    self.kernels.copy_pages,
+                    [pairs.len(), 1],
+                    256,
+                    0,
+                    &[Arg::Ptr(pool), Arg::Ptr(self.copy_pairs.0), Arg::Int(words)],
+                )?;
+            }
+        }
+        Ok(())
     }
 
     fn describe(&self) -> String {

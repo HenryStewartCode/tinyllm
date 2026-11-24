@@ -2286,6 +2286,15 @@ extern "C" __global__ void copy_rows(const float *x, int dim, float *out, int st
 // One block per row: x's row, `cols` floats, as bfloat16 in its place in a tile-layout matrix.
 // Tensor parallelism: copy this GPU's part of a block's output (`count` floats, a multiple of 4)
 // into every other GPU's copy of it. Writes across the bus don't wait, unlike reads.
+// Copy whole pages of a KV pool, `words` 32-bit words each: page pairs[2b] to pairs[2b + 1] in
+// block b. For draft branches, which need their own copy of the page where they split off.
+extern "C" __global__ void copy_pages(unsigned *pool, const unsigned *pairs, size_t words) {
+    const unsigned *from = pool + pairs[2 * blockIdx.x] * words;
+    unsigned *to = pool + pairs[2 * blockIdx.x + 1] * words;
+    for (size_t i = threadIdx.x; i < words; i += blockDim.x)
+        to[i] = from[i];
+}
+
 extern "C" __global__ void tp_push(const float4 *part, const unsigned long long *peers, int rank,
                                    int size, int count) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;

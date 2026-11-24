@@ -224,6 +224,11 @@ struct Args {
     #[arg(long, default_value_t = 6)]
     speculative_num_draft_tokens: usize,
 
+    /// With an EAGLE-3 head: how many runs of guesses to check at once. Others split off the
+    /// main one where the head's second choice looked likely
+    #[arg(long, default_value_t = 1)]
+    speculative_eagle_topk: usize,
+
     /// The smaller model that guesses ahead for --speculative-algorithm standalone (it needs the
     /// same tokenizer as the model), or the EAGLE-3 head for --speculative-algorithm eagle3
     #[arg(long)]
@@ -421,6 +426,7 @@ fn main() -> Result<()> {
                     // Past this many rows a batch stops being nearly free.
                     max_draft_rows: if device == Device::Cuda { 64 } else { 16 },
                     eagle,
+                    branches: args.speculative_eagle_topk.max(1) - 1,
                 })
             }
         },

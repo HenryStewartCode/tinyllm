@@ -183,6 +183,9 @@ pub struct Speculative {
     /// The draft model is an EAGLE-3 head, which guesses from the model's own hidden states
     /// (kept for it with [`Backend::capture_layers`]) rather than from the tokens alone.
     pub eagle: bool,
+    /// For an EAGLE head: how many other runs of guesses to check alongside the main one, each
+    /// splitting off it where the head's second choice looked likely (see [`Branch`]).
+    pub branches: usize,
 }
 
 #[derive(Clone)]
@@ -467,6 +470,48 @@ pub fn start(
     handle
 }
 
+/// Guesses that split off a sequence's main ones (its last `draft` tokens): the first `split` are
+/// the same, then the head's next choice at that point, then the head's guesses after that. The
+/// model checks them in the same step as the main ones, in rows of their own from the page where
+/// they split off, which has to be the branch's own: KV slots in a page hold consecutive tokens.
+/// Their keys and values from the start of that page are copied over, and the rows from there are
+/// worked out again, which gives exactly the same results. So a branch's guesses are checked just
+/// as the main ones would be, and replies stay the same.
+struct Branch {
+    tokens: Vec<u32>,
+    split: usize,
+    /// The first position with slots of the branch's own (the start of a page): `pages`.
+    own_from: usize,
+    pages: Vec<u32>,
+    /// The head's output after the latest guess, which the next guess starts from.
+    hidden: Vec<f32>,
+    /// The model's first logits row for the branch in this step: the one checking `tokens[split]`.
+    logits_row: usize,
+    /// The model's features for the branch's rows, for the head, if the branch is taken.
+    features: Vec<f32>,
+}
+
+impl Branch {
+    /// The positions of the model's rows for the branch, for a sequence with `real` real tokens:
+    /// from the newest real token or the branch's own page, whichever comes later.
+    fn rows(&self, real: usize) -> std::ops::Range<usize> {
+        self.own_from.max(real - 1)..real + self.tokens.len()
+    }
+
+    /// The slot for `position`, from `own_from` on.
+    fn slot(&self, position: usize, page_size: usize) -> u32 {
+        let offset = position - self.own_from;
+        self.pages[offset / page_size] * page_size as u32 + (offset % page_size) as u32
+    }
+
+    /// Slots for positions `..end`: `shared`'s up to `own_from`, then the branch's own.
+    fn slots(&self, shared: &[u32], end: usize, page_size: usize) -> Vec<u32> {
+        let mut slots = shared[..self.own_from].to_vec();
+        slots.extend((self.own_from..end).map(|p| self.slot(p, page_size)));
+        slots
+    }
+}
+
 /// One request's progress.
 struct Sequence {
     /// The prompt plus everything generated so far.
@@ -509,6 +554,10 @@ struct Sequence {
     draft: usize,
     /// How many of the guesses turned out right, once they've been checked.
     accepted: usize,
+    /// Other runs of guesses checked in the same step, for an EAGLE head.
+    branches: Vec<Branch>,
+    /// Which of `branches` did better than the main guesses, once they've been checked.
+    winner: Option<usize>,
     allowed: Option<Arc<TokenSet>>,
     text: TextStream,
     pending_logprobs: Vec<TokenLogprob>,
@@ -791,6 +840,8 @@ impl Engine {
             ngrams: None,
             draft: 0,
             accepted: 0,
+            branches: Vec::new(),
+            winner: None,
             allowed: None,
             text: TextStream::new(params.stop_strings.clone(), strip),
             pending_logprobs: Vec::new(),
@@ -842,10 +893,34 @@ impl Engine {
             return;
         }
 
+        // Branches are checked along with their main guesses, if those are in this step and
+        // there's room.
+        let page_size = self.cache.page_size();
+        let mut room = self.config.max_batch;
+        for seq in &mut self.active {
+            room = room.saturating_sub(seq.take);
+        }
+        for seq in &mut self.active {
+            let real = seq.tokens.len() - seq.draft;
+            let rows: usize = seq.branches.iter().map(|b| b.rows(real).len()).sum();
+            if seq.draft == 0 || seq.take != 1 + seq.draft || rows > room {
+                Self::drop_branches(&mut self.cache, seq);
+            }
+            room = room.saturating_sub(rows);
+        }
+        let branch_lists: Vec<Vec<Vec<u32>>> = (self.active.iter())
+            .map(|seq| {
+                let real = seq.tokens.len() - seq.draft;
+                (seq.branches.iter())
+                    .map(|b| b.slots(&seq.slots, real + b.tokens.len(), page_size))
+                    .collect()
+            })
+            .collect();
+
         // Run the batch.
         let mut rows = Vec::new();
         let mut logits_rows = 0;
-        for seq in &mut self.active {
+        for (i, seq) in self.active.iter_mut().enumerate() {
             seq.logits_row = None;
             let end = seq.slots.len();
             // Scores for the newest real token, and after each guess.
@@ -871,6 +946,29 @@ impl Engine {
                     position: seq.position(pos),
                     embedding: Sequence::embedding(&seq.params, &seq.image_embeddings, pos),
                 });
+            }
+            let real = seq.tokens.len() - seq.draft;
+            for (b, branch) in seq.branches.iter_mut().enumerate() {
+                let list = &branch_lists[i][b];
+                for pos in branch.rows(real) {
+                    let want_logits = pos >= real - 1 + branch.split;
+                    if want_logits && pos == real - 1 + branch.split {
+                        branch.logits_row = logits_rows;
+                    }
+                    logits_rows += want_logits as usize;
+                    rows.push(Row {
+                        adapter: seq.params.adapter,
+                        token: match pos.checked_sub(real) {
+                            None => seq.tokens[pos],
+                            Some(offset) => branch.tokens[offset],
+                        },
+                        slots: &list[..=pos],
+                        want_logits,
+                        sampling: seq.sampler.logit_use(seq.generated + pos + 1 - real),
+                        position: None,
+                        embedding: None,
+                    });
+                }
             }
         }
         let forward_start = Instant::now();
@@ -929,6 +1027,16 @@ impl Engine {
             for _ in 0..seq.take {
                 seq.features.extend_from_slice(self.backend.features(row));
                 row += 1;
+            }
+            let real = seq.tokens.len() - seq.draft;
+            for branch in &mut seq.branches {
+                branch.features.clear();
+                for _ in branch.rows(real) {
+                    branch
+                        .features
+                        .extend_from_slice(self.backend.features(row));
+                    row += 1;
+                }
             }
         }
     }
@@ -1081,6 +1189,7 @@ impl Engine {
                 let Some(mut seq) = self.active.pop() else {
                     return false;
                 };
+                Self::drop_branches(&mut self.cache, &mut seq);
                 if seq.draft > 0 {
                     // Try again without the guesses, which may be what didn't fit.
                     let real = seq.tokens.len() - seq.draft;
@@ -1096,6 +1205,7 @@ impl Engine {
                 return false;
             }
             let mut seq = self.active.pop().expect("more than one is active");
+            Self::drop_branches(&mut self.cache, &mut seq);
             let real = seq.tokens.len() - seq.draft;
             seq.tokens.truncate(real);
             seq.draft = 0;
@@ -1127,6 +1237,18 @@ impl Engine {
                 _ => Vec::new(),
             })
             .collect();
+        // For each branch, the logits from its first row that checks a guess on.
+        let branch_views: Vec<Vec<Vec<Logits>>> = (self.active.iter())
+            .map(|seq| {
+                (seq.branches.iter())
+                    .map(|b| {
+                        (b.logits_row..b.logits_row + b.tokens.len() - b.split + 1)
+                            .map(|row| self.backend.logits(row))
+                            .collect()
+                    })
+                    .collect()
+            })
+            .collect();
         let pool = self.backend.pool();
         pool.for_chunks(&mut self.active, 1, 2, |i, seq| {
             let seq = &mut seq[0];
@@ -1146,6 +1268,39 @@ impl Engine {
                         break;
                     }
                     seq.accepted += 1;
+                }
+                // A branch that splits off where the main guesses went wrong, with what came out
+                // there, may go further.
+                seq.winner = None;
+                for (k, views) in branch_views[i].iter().enumerate() {
+                    let split = seq.branches[k].split;
+                    if seq.winner.is_some()
+                        || seq.accepted != split
+                        || seq.sampled != seq.branches[k].tokens[split]
+                    {
+                        continue;
+                    }
+                    let mut history = seq.tokens[..real].to_vec();
+                    history.extend_from_slice(&seq.branches[k].tokens);
+                    let length = seq.branches[k].tokens.len();
+                    let mut accepted = split + 1;
+                    let sampled = loop {
+                        let generated = seq.generated + accepted;
+                        let logits = views[accepted - split];
+                        let sampled = (seq.sampler).sample(
+                            logits,
+                            &history[..real + accepted],
+                            generated,
+                            None,
+                        );
+                        if accepted == length || sampled != seq.branches[k].tokens[accepted] {
+                            break sampled;
+                        }
+                        accepted += 1;
+                    };
+                    seq.winner = Some(k);
+                    seq.accepted = accepted;
+                    seq.sampled = sampled;
                 }
                 seq.token_logprob = None;
                 return;
@@ -1217,13 +1372,13 @@ impl Engine {
             .draft_tokens
             .min(speculative.max_draft_rows / decoding.max(1));
         if self.eagle() {
-            return self.propose_with_eagle(per_sequence * (decoding > 0) as usize);
+            // Branches while there's room: each takes up to a row per guess and one more.
+            let room = speculative.max_draft_rows / decoding.max(1) / (per_sequence + 1).max(1);
+            let branches = speculative.branches.min(room.saturating_sub(1));
+            return self.propose_with_eagle(per_sequence * (decoding > 0) as usize, branches);
         }
         if decoding == 0 || per_sequence == 0 {
             return;
-        }
-        if self.eagle() {
-            return self.propose_with_eagle(per_sequence);
         }
         if self.draft.is_some() {
             return self.propose_with_draft(per_sequence);
@@ -1398,7 +1553,7 @@ impl Engine {
     /// Then each further guess comes from the head's own output for the guess before, in slots
     /// borrowed for the purpose, as with a draft model, and is sampled exactly as the model
     /// will sample that position.
-    fn propose_with_eagle(&mut self, per_sequence: usize) {
+    fn propose_with_eagle(&mut self, per_sequence: usize, branches: usize) {
         let limit = self.config.ctx_size.min(self.config.cache_tokens);
         // How many guesses each sequence makes.
         let wants: Vec<usize> = (self.active.iter())
@@ -1427,6 +1582,10 @@ impl Engine {
             / 3;
         // The head's output for each guessing sequence's last row, for its next guess.
         let mut outputs: Vec<Vec<f32>> = vec![Vec::new(); self.active.len()];
+        // For branches: the other choices for each sequence's newest guess, and how likely the
+        // main guesses so far are.
+        let mut forks: Vec<(Vec<(f32, u32)>, f32)> = vec![(Vec::new(), 0.0); self.active.len()];
+        let mut scores = vec![0.0f32; self.active.len()];
 
         // Go through what's new, a batch at a time.
         let budget = self.config.max_batch.max(1);
@@ -1485,6 +1644,10 @@ impl Engine {
                     seq.tokens.push(guess);
                     seq.draft += 1;
                     outputs[i] = draft.features(last_row).to_vec();
+                    if branches > 0 {
+                        forks[i] = alternatives(logits, guess, 0.0, branches);
+                        scores[i] = forks[i].1;
+                    }
                 }
             }
             if !ran {
@@ -1523,27 +1686,80 @@ impl Engine {
             borrowed.push((i, slots));
         }
 
-        // Each further guess in turn.
+        // Each further guess in turn, for the main guesses and their branches.
         let longest = borrowed.iter().map(|(_, s)| s.len()).max().unwrap_or(0);
+        let main_backend = &mut self.backend;
         let mut lists: Vec<Vec<u32>> = Vec::new();
-        for round in 0..longest {
+        for round in 0..=longest {
+            // Branches off the guess just made.
+            if branches > 0 {
+                for &(i, ref slots) in &borrowed {
+                    let seq = &mut self.active[i];
+                    let (choices, _) = std::mem::take(&mut forks[i]);
+                    let split = seq.draft - 1;
+                    if split != round || seq.draft != round + 1 {
+                        continue;
+                    }
+                    for (_, token) in choices {
+                        if seq.branches.len() >= branches {
+                            break;
+                        }
+                        let first = seq.slots.len();
+                        let head_list: Vec<u32> = seq.slots.iter().chain(slots).copied().collect();
+                        let real = seq.tokens.len() - seq.draft;
+                        let mut tokens = seq.tokens[real..real + split].to_vec();
+                        tokens.push(token);
+                        let Some(branch) = new_branch(
+                            &mut self.cache,
+                            [main_backend.as_mut(), draft.as_mut()],
+                            [&seq.slots, &head_list],
+                            first,
+                            tokens,
+                            wants[i],
+                            outputs[i].clone(),
+                        ) else {
+                            break;
+                        };
+                        seq.branches.push(branch);
+                    }
+                }
+            }
+            if round == longest {
+                break;
+            }
             lists.clear();
             hidden.clear();
-            let going: Vec<usize> = (0..borrowed.len())
-                .filter(|&b| round < borrowed[b].1.len())
-                .collect();
-            for &b in &going {
-                let (i, slots) = &borrowed[b];
-                let mut list = self.active[*i].slots.clone();
+            // (sequence, branch or main) for each row.
+            let mut going: Vec<(usize, Option<usize>)> = Vec::new();
+            for (i, slots) in &borrowed {
+                if round >= slots.len() {
+                    continue;
+                }
+                let seq = &self.active[*i];
+                let mut list = seq.slots.clone();
                 list.extend_from_slice(&slots[..=round]);
                 lists.push(list);
                 hidden.extend_from_slice(&outputs[*i]);
+                going.push((*i, None));
+                let head_list: Vec<u32> = seq.slots.iter().chain(slots).copied().collect();
+                for (k, branch) in seq.branches.iter().enumerate() {
+                    if branch.split <= round {
+                        let end = seq.slots.len() + round + 1;
+                        lists.push(branch.slots(&head_list, end, page_size));
+                        hidden.extend_from_slice(&branch.hidden);
+                        going.push((*i, Some(k)));
+                    }
+                }
             }
             let rows: Vec<Row> = (going.iter().zip(&lists))
-                .map(|(&b, list)| {
-                    let seq = &self.active[borrowed[b].0];
+                .map(|(&(i, branch), list)| {
+                    let seq = &self.active[i];
+                    let token = match branch {
+                        None => *seq.tokens.last().expect("a sequence has tokens"),
+                        Some(k) => seq.branches[k].tokens[round],
+                    };
                     Row {
-                        token: *seq.tokens.last().expect("a sequence has tokens"),
+                        token,
                         slots: list,
                         want_logits: true,
                         sampling: seq.sampler.logit_use(seq.generated + round + 1),
@@ -1558,15 +1774,31 @@ impl Engine {
             }
             draft.forward(&rows);
             drop(rows);
-            for (row, &b) in going.iter().enumerate() {
-                let i = borrowed[b].0;
+            for (row, &(i, branch)) in going.iter().enumerate() {
                 let seq = &mut self.active[i];
                 let logits = draft.logits(row);
-                let guess =
-                    (seq.sampler).sample(logits, &seq.tokens, seq.generated + round + 1, None);
-                seq.tokens.push(guess);
-                seq.draft += 1;
-                outputs[i] = draft.features(row).to_vec();
+                let generated = seq.generated + round + 1;
+                match branch {
+                    None => {
+                        let guess = (seq.sampler).sample(logits, &seq.tokens, generated, None);
+                        seq.tokens.push(guess);
+                        seq.draft += 1;
+                        outputs[i] = draft.features(row).to_vec();
+                        if branches > seq.branches.len() {
+                            forks[i] = alternatives(logits, guess, scores[i], branches);
+                            scores[i] = forks[i].1;
+                        }
+                    }
+                    Some(k) => {
+                        let real = seq.tokens.len() - seq.draft;
+                        let mut history = seq.tokens[..real].to_vec();
+                        history.extend_from_slice(&seq.branches[k].tokens);
+                        let guess = (seq.sampler).sample(logits, &history, generated, None);
+                        let branch = &mut seq.branches[k];
+                        branch.tokens.push(guess);
+                        branch.hidden = draft.features(row).to_vec();
+                    }
+                }
             }
         }
 
@@ -1584,6 +1816,10 @@ impl Engine {
     /// Take the guesses that were right, then the token sampled after them, and forget the rest.
     fn accept_guesses(&mut self, index: usize) -> Option<FinishReason> {
         let seq = &mut self.active[index];
+        if let Some(k) = seq.winner.take() {
+            Self::take_branch(&mut self.cache, seq, k);
+        }
+        Self::drop_branches(&mut self.cache, seq);
         let real = seq.tokens.len() - seq.draft;
         let accepted = seq.accepted;
         let mut taken: Vec<u32> = seq.tokens[real..real + accepted].to_vec();
@@ -1609,6 +1845,45 @@ impl Engine {
             }
         }
         None
+    }
+
+    /// Forget a sequence's branches, giving back their pages.
+    fn drop_branches(cache: &mut PrefixCache, seq: &mut Sequence) {
+        for branch in seq.branches.drain(..) {
+            for page in branch.pages {
+                cache.free_page(page);
+            }
+        }
+        seq.winner = None;
+    }
+
+    /// Make branch `k`'s guesses the sequence's own, with their slots and the model's features.
+    fn take_branch(cache: &mut PrefixCache, seq: &mut Sequence, k: usize) {
+        let page_size = cache.page_size();
+        let branch = seq.branches.swap_remove(k);
+        let real = seq.tokens.len() - seq.draft;
+        seq.tokens.truncate(real);
+        seq.tokens.extend_from_slice(&branch.tokens);
+        seq.draft = branch.tokens.len();
+        // Its own pages take over from the page where it split off.
+        let own = branch.own_from;
+        let mut position = own;
+        while position < seq.slots.len() {
+            cache.free_page(seq.slots[position] / page_size as u32);
+            position += page_size;
+        }
+        seq.slots.truncate(own);
+        let end = real + branch.tokens.len();
+        seq.slots
+            .extend((own..end).map(|p| branch.slot(p, page_size)));
+        let start = branch.rows(real).start;
+        if seq.feature_width > 0 && seq.draft_len <= start {
+            let kept = (start - seq.draft_len) * seq.feature_width;
+            if seq.features.len() >= kept {
+                seq.features.truncate(kept);
+                seq.features.extend_from_slice(&branch.features);
+            }
+        }
     }
 
     /// Shorten a sequence's KV slots to `keep`, giving back pages that held only what's gone.
@@ -1736,6 +2011,7 @@ impl Engine {
 
     /// Hand what a sequence has computed to the prefix cache, and let go of what it held.
     fn retire(&mut self, seq: &mut Sequence) {
+        Self::drop_branches(&mut self.cache, seq);
         Self::commit_into(&mut self.cache, seq, false);
         if let Some(pinned) = seq.pinned.take() {
             self.cache.release(pinned);
@@ -1953,6 +2229,91 @@ pub(crate) fn partial_match_len(text: &str, stop: &str) -> usize {
         .rev()
         .find(|&n| stop.is_char_boundary(n) && text.ends_with(&stop[..n]))
         .unwrap_or(0)
+}
+
+/// The least likely a branch's guesses can look to the head for it to be checked.
+const MIN_BRANCH_PROBABILITY: f32 = 0.05;
+
+/// The head's other choices for a guess, after `guess`: up to `n` of them as likely as
+/// MIN_BRANCH_PROBABILITY with the guesses before (whose log probability is `before`), best
+/// first, as `(log probability with the guesses before, token)`. Also the log probability of the
+/// guesses with `guess`.
+fn alternatives(logits: Logits, guess: u32, before: f32, n: usize) -> (Vec<(f32, u32)>, f32) {
+    let mut scored: Vec<(f32, u32)> = match logits {
+        Logits::All(all) => all
+            .iter()
+            .enumerate()
+            .map(|(t, &x)| (x, t as u32))
+            .collect(),
+        Logits::Candidates(candidates) => candidates.to_vec(),
+    };
+    let best = scored.iter().map(|c| c.0).fold(f32::NEG_INFINITY, f32::max);
+    let total: f32 = scored.iter().map(|c| (c.0 - best).exp()).sum();
+    let log_total = best + total.ln();
+    let with_guess = scored
+        .iter()
+        .find(|c| c.1 == guess)
+        .map_or(f32::NEG_INFINITY, |c| before + c.0 - log_total);
+    let floor = MIN_BRANCH_PROBABILITY.ln();
+    scored.retain(|c| c.1 != guess && before + c.0 - log_total >= floor);
+    scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+    scored.truncate(n);
+    let choices = scored
+        .into_iter()
+        .map(|(x, t)| (before + x - log_total, t))
+        .collect();
+    (choices, with_guess)
+}
+
+/// A branch with `tokens` (the last one where it splits off), its pages allocated and the
+/// keys and values from the start of the page where it splits off copied in, for the model and
+/// the head: `backends` and `slots` are each's, the model's for the sequence's real tokens, the
+/// head's for those and the main guesses. `first` is the position of the sequence's newest real
+/// token, and the model's rows for the branch go up to position `first + length`.
+#[allow(clippy::too_many_arguments)]
+fn new_branch(
+    cache: &mut PrefixCache,
+    backends: [&mut dyn Backend; 2],
+    slots: [&[u32]; 2],
+    first: usize,
+    tokens: Vec<u32>,
+    length: usize,
+    hidden: Vec<f32>,
+) -> Option<Branch> {
+    let page_size = cache.page_size();
+    let split = tokens.len() - 1;
+    // The head's first row for the branch.
+    let start = first + split;
+    let own_from = start / page_size * page_size;
+    let count = (first + length + 1).div_ceil(page_size) - own_from / page_size;
+    let mut pages = Vec::new();
+    if !cache.allocate(count, &mut pages) {
+        return None;
+    }
+    let [model, head] = backends;
+    let copied = own_from == start
+        || (head
+            .copy_pages(&[(slots[1][own_from] / page_size as u32, pages[0])])
+            .is_ok()
+            && (own_from >= first
+                || model
+                    .copy_pages(&[(slots[0][own_from] / page_size as u32, pages[0])])
+                    .is_ok()));
+    if !copied {
+        for page in pages {
+            cache.free_page(page);
+        }
+        return None;
+    }
+    Some(Branch {
+        tokens,
+        split,
+        own_from,
+        pages,
+        hidden,
+        logits_row: 0,
+        features: Vec::new(),
+    })
 }
 
 #[cfg(test)]

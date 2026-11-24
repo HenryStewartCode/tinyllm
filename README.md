@@ -463,6 +463,26 @@ faster from a cool start (Qwen3-4B: 25 to 33 tok/s run back to back). Checking g
 work, though, so once a long run has the laptop's GPU slowing down to stay cool, the gain mostly
 goes, and sampled replies, whose guesses are right less often, can come out slower.
 
+`--speculative-eagle-topk K` checks up to K runs of guesses at once, a small tree of them. Others
+branch off the main run where the head's second choice still looked at least 5% likely, and get
+guessed on from there by the head too. The model checks every branch in the same step as the main
+guesses, and the one that turns out right for longest is taken. A branch reads the same keys and
+values as the main guesses until it splits off; from the page where it does it has pages of its
+own, with the keys and values before the split copied in and its rows from that page worked out
+again. So every guess is checked exactly as it would be on its own, and replies stay the same.
+Branches are for requests that choose from the best few tokens (greedy, top-k, top-p); a request
+sampled from every token keeps to one run. With Qwen3-4B and its head on the RTX 2000 Ada, the 20
+requests of `scripts/speculative_test.py` (half greedy, half sampled) one at a time, all replies
+identical to plain decoding:
+
+| Guessing ahead | Runs (`--speculative-eagle-topk`) | tok/s |
+|---|---|---|
+| none | | 23.5 |
+| 4 tokens | 1 | 35.6 |
+| 4 tokens | 4 | 39.8 |
+| 4 tokens | 8 | 39.9 |
+| 6 tokens | 4 | 36.8 |
+
 ### LoRA adapters
 
 `--lora NAME=PATH` (repeat it for more) loads a LoRA adapter in the PEFT format that Hugging Face
@@ -576,6 +596,7 @@ cargo run --release -- -m models/Qwen2.5-0.5B-Instruct --chat --system "You are 
 | `--speculative-draft-model-path DIR` | | the smaller model that guesses for `standalone` |
 | `--schedule-policy P` | fcfs | `fcfs`, or `lpm` to start the requests with the longest cached prefix first (with up to 128 waiting) |
 | `--speculative-num-draft-tokens N` | 6 | the most tokens to guess ahead per request |
+| `--speculative-eagle-topk K` | 1 | with EAGLE-3: how many runs of guesses to check at once, a small tree of them |
 | `--lora NAME=PATH` | | a LoRA adapter requests can choose (see [LoRA adapters](#lora-adapters)); without `--serve`, the first is used |
 | `--batch-size N` | 64 CPU, 512 GPU | tokens run through the model per step |
 | `--cache-mb N` | see right | KV cache size. CPU: ¼ of RAM up to 8 GiB, committed as used. GPU: what's left after loading |
@@ -848,7 +869,7 @@ missing is breadth, and the last 10–20% of single-stream speed.
 | Quantized weights | yes: FP8, INT8, AWQ, GPTQ, GGUF, bitsandbytes, MXFP4 and more | FP8 and 4-bit AWQ/GPTQ checkpoints, 8-bit integers, and GPT-OSS's MXFP4 experts, on the NVIDIA GPU (the CPU and Apple GPU unpack quantized checkpoints); bfloat16 weights stay 16-bit on the CPU. **No GGUF, bitsandbytes, or GPTQ with 8 bits** |
 | Tool calling, with `tool_choice` and strict schemas | yes, with parsers for many model families | yes, for the families that run here: Qwen and Hermes, Mistral, Llama 3, and GPT-OSS's harmony messages |
 | Reasoning parsers, thinking budgets | yes, for many families | yes, for `<think>` models (Qwen3, SmolLM3, DeepSeek-R1 and others) and GPT-OSS's harmony channels (budgets for `<think>` models only) |
-| Speculative decoding | yes: EAGLE (with draft trees), MTP, draft models, n-grams | EAGLE-3 heads, draft models and n-grams, with replies exactly as without it; EAGLE-3 accepts as many tokens a step as SGLang's with the same head. **No draft trees yet (one guess per position), no MTP** |
+| Speculative decoding | yes: EAGLE (with draft trees), MTP, draft models, n-grams | EAGLE-3 heads, draft models and n-grams, with replies exactly as without it; EAGLE-3 accepts as many tokens a step as SGLang's with the same head. EAGLE-3 draft trees as branches off the main guesses (`--speculative-eagle-topk`). **No MTP** |
 | LoRA adapters | yes, mixed in batches, loaded and unloaded while running | yes, mixed in batches, chosen by `model` or `lora_path`, loaded and unloaded while running (unloading doesn't free their memory yet) |
 | Architectures | many | Llama-style (Llama, Mistral, Qwen2/3, SmolLM2/3, Phi-3, Granite, Gemma 1–3) and mixtures of experts (Qwen3-MoE, Qwen2-MoE, Mixtral, OLMoE, Granite MoE, GPT-OSS, and DeepSeek V2/V3, with only the latent in the cache on the GPUs: 3–13% behind SGLang on DeepSeek-V2-Lite's shape). GPT-OSS doesn't run on the Apple GPU yet. **No hybrid attention models (Qwen3-Next, Jamba)** |
 | Sliding-window attention, logit soft-capping | yes | yes |
@@ -860,8 +881,8 @@ missing is breadth, and the last 10–20% of single-stream speed.
 | One model across GPUs or nodes (tensor, pipeline, expert parallelism) | yes | tensor parallelism across the GPUs of one machine, for dense models (see [Several GPUs](#several-gpus)). **No pipeline or expert parallelism, no multi-node, no quantized or MoE models split yet** |
 | The SGL frontend language (`gen`, `select`, `fork`) | yes | **no** |
 
-Biggest gaps first, the plan is: faster attention for prompts past a few thousand tokens, draft trees for EAGLE and
-DeepSeek's multi-token prediction, then GPT-OSS on the Apple GPU and closing the gap with SGLang
+Biggest gaps first, the plan is: faster attention for prompts past a few thousand tokens, wider
+draft trees for EAGLE (branches off branches) and DeepSeek's multi-token prediction, then GPT-OSS on the Apple GPU and closing the gap with SGLang
 on DeepSeek.
 
 Other limitations: only BPE tokenizers are supported (not SentencePiece Unigram or WordPiece,

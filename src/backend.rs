@@ -39,6 +39,11 @@ pub trait Backend: Send {
         1
     }
 
+    /// Copy the keys and values of whole KV pages, `(from, to)`, for every layer.
+    fn copy_pages(&mut self, _pairs: &[(u32, u32)]) -> Result<()> {
+        bail!("{} can't copy KV pages yet", self.describe())
+    }
+
     /// Add a LoRA adapter, which rows then ask for by number: the first one added is 1, the
     /// next 2, and so on.
     fn add_adapter(&mut self, _adapter: &LoraAdapter) -> Result<()> {
