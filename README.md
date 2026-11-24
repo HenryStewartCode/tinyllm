@@ -670,9 +670,22 @@ batch size on first use. Total tokens per second:
 | SmolLM2-135M, prompt already cached | 10–12 ms | 17–22 ms |
 
 So from 16 concurrent requests up, tinyllm is ahead by 1.4× to 7× on these two models, and for a
-single stream SGLang is still about 10–20% faster. Long prompts are close to even. SGLang's own
+single stream SGLang is still about 10–20% faster. SGLang's own
 numbers dip at 16 requests in every run, for reasons not looked into, so the largest ratios there
 may say more about its default settings than about the GPU work.
+
+Long prompts, with nothing cached, on Qwen3-0.6B ([`scripts/long_prompt.py`](scripts/long_prompt.py),
+SGLang 0.5.23 on the same GPU): time to the first token, then the speed of the 64 tokens after it.
+
+| Prompt | tinyllm: first token | SGLang: first token | tinyllm: decoding | SGLang: decoding |
+|---|---|---|---|---|
+| 3,100 tokens | 0.34 s | 0.47 s | 105 tok/s | 127 tok/s |
+| 12,300 tokens | 2.5 s | 1.3 s | 64 tok/s | 77 tok/s |
+| 23,100 tokens | 7.3 s | 2.5 s | 45 tok/s | 53 tok/s |
+
+Past a few thousand tokens SGLang's attention (FlashInfer) pulls ahead on prompts, since its
+kernels keep the softmax in registers through the tensor cores' own fragment layouts, where
+tinyllm's go through shared memory for each page of 16 tokens.
 
 These requests set only a temperature. SmolLM2 has no sampling defaults of its own, so its tokens
 are drawn on the GPU. Qwen2.5's generation config adds top-k, top-p and a repetition penalty, so
@@ -846,7 +859,7 @@ missing is breadth, and the last 10–20% of single-stream speed.
 | One model across GPUs or nodes (tensor, pipeline, expert parallelism) | yes | tensor parallelism across the GPUs of one machine, for dense models (see [Several GPUs](#several-gpus)). **No pipeline or expert parallelism, no multi-node, no quantized or MoE models split yet** |
 | The SGL frontend language (`gen`, `select`, `fork`) | yes | **no** |
 
-Biggest gaps first, the plan is: measuring long prompts against SGLang, draft trees for EAGLE and
+Biggest gaps first, the plan is: faster attention for prompts past a few thousand tokens, draft trees for EAGLE and
 DeepSeek's multi-token prediction, then GPT-OSS on the Apple GPU and closing the gap with SGLang
 on DeepSeek.
 
