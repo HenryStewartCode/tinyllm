@@ -93,6 +93,7 @@ driver_api! {
     cuGraphDestroy(Handle);
     cuGraphExecDestroy(Handle);
     cuDeviceGetCount(*mut c_int);
+    cuFuncGetAttribute(*mut c_int, c_int, Handle);
     cuCtxEnablePeerAccess(Handle, c_uint);
     cuEventCreate(*mut Handle, c_uint);
     cuEventRecord(Handle, Handle);
@@ -223,6 +224,14 @@ impl Gpu {
             }
         }
         Err(anyhow!("CUDA error {status}"))
+    }
+
+    /// The most threads a block of `kernel` can have, given the registers it uses.
+    pub fn max_threads(&self, kernel: Kernel) -> Result<usize> {
+        let mut value = 0;
+        // SAFETY: a live kernel; attribute 0 is CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK.
+        self.check(unsafe { (self.driver.cuFuncGetAttribute)(&mut value, 0, kernel.0) })?;
+        Ok(value as usize)
     }
 
     /// Let kernels here read and write `other`'s memory, through the same addresses.

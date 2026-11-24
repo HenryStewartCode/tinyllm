@@ -56,6 +56,9 @@ const SCAN_THREADS: usize = 1024;
 /// The largest batch to keep a recorded graph for. Each takes about 2 MB of GPU memory.
 const MAX_RECORDED_BATCH: usize = 64;
 
+/// The most warps in a block of 16-bit attention.
+const ATTENTION_WARPS: usize = 16;
+
 /// How many 16-element chunks a head can have. `kernels.cu` has an attention kernel for each.
 const TILE_CHUNK_COUNTS: [usize; 9] = [1, 2, 3, 4, 5, 6, 7, 8, 16];
 
@@ -325,6 +328,9 @@ struct Kernels {
     tiles_bf16: Kernel,
     scatter_logits: Kernel,
     place_rows: Kernel,
+    /// How many warps each of `attention_bf16`'s blocks has: as many as its registers allow, up
+    /// to `ATTENTION_WARPS`.
+    attention_warps: Vec<usize>,
     reduce_add: Kernel,
     tp_signal: Kernel,
     tp_push: Kernel,
@@ -390,6 +396,15 @@ impl Kernels {
             tiles_bf16: gpu.kernel(module, "tiles_bf16")?,
             scatter_logits: gpu.kernel(module, "scatter_logits")?,
             place_rows: gpu.kernel(module, "place_rows")?,
+            attention_warps: TILE_CHUNK_COUNTS
+                .iter()
+                .map(|chunks| {
+                    let kernel = gpu.kernel(module, &format!("attention_bf16_{chunks}"))?;
+                    let most = (gpu.max_threads(kernel)? / 32).min(ATTENTION_WARPS);
+                    // A power of two, so the shared memory sum below stays simple.
+                    Ok(1 << most.ilog2())
+                })
+                .collect::<Result<_>>()?,
             reduce_add: gpu.kernel(module, "reduce_add")?,
             tp_signal: gpu.kernel(module, "tp_signal")?,
             tp_push: gpu.kernel(module, "tp_push")?,
@@ -1304,15 +1319,19 @@ impl CudaBackend {
         let lists = self.slot_list_buffer.data;
         if self.precision == Precision::Bf16 {
             let tile_bytes = TILE * TILE * 2;
-            let shared = (head_dim / TILE) * tile_bytes + 3 * tile_bytes;
             let chunks = head_dim / TILE;
             let kernel = TILE_CHUNK_COUNTS
                 .iter()
                 .position(|&count| count == chunks)
                 .expect("checked when the model was loaded");
-            return self.gpu.launch_shared(
+            // Warps per block take turns over the pages (see `attention_tiles`). Fixed per model,
+            // so results don't depend on the batch.
+            let warps = self.kernels.attention_warps[kernel];
+            let shared = 3 * chunks * tile_bytes + warps * (3 * tile_bytes + 2 * TILE * 4);
+            return self.gpu.launch_with_shared(
                 self.kernels.attention_bf16[kernel],
                 [batch * self.n_kv_heads, 1],
+                warps * 32,
                 shared,
                 &[
                     Arg::Ptr(self.qkv),
