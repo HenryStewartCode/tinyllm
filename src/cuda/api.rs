@@ -92,7 +92,20 @@ driver_api! {
     cuGraphLaunch(Handle, Handle);
     cuGraphDestroy(Handle);
     cuGraphExecDestroy(Handle);
+    cuDeviceGetCount(*mut c_int);
+    cuCtxEnablePeerAccess(Handle, c_uint);
+    cuEventCreate(*mut Handle, c_uint);
+    cuEventRecord(Handle, Handle);
+    cuStreamWaitEvent(Handle, Handle, c_uint);
 }
+
+/// A point in a GPU's queue (see [`Gpu::event`]). Events live as long as the program.
+#[derive(Clone, Copy, Debug)]
+pub struct Event(Handle);
+
+// SAFETY: an event handle can be used from any thread with its GPU's context current.
+unsafe impl Send for Event {}
+unsafe impl Sync for Event {}
 
 /// An address in GPU memory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -151,6 +164,24 @@ unsafe impl Send for Gpu {}
 impl Gpu {
     /// Open the first GPU that `CUDA_VISIBLE_DEVICES` allows.
     pub fn open() -> Result<Self> {
+        Self::open_device(0)
+    }
+
+    /// How many GPUs `CUDA_VISIBLE_DEVICES` allows.
+    pub fn count() -> Result<usize> {
+        let driver = Driver::load()?;
+        let mut count = 0;
+        // SAFETY: documented calls with a pointer to a live variable.
+        unsafe {
+            if (driver.cuInit)(0) != 0 || (driver.cuDeviceGetCount)(&mut count) != 0 {
+                return Ok(0);
+            }
+        }
+        Ok(count as usize)
+    }
+
+    /// Open the `index`th GPU that `CUDA_VISIBLE_DEVICES` allows.
+    pub fn open_device(index: usize) -> Result<Self> {
         let driver = Driver::load()?;
         let mut gpu = Self {
             driver,
@@ -164,7 +195,7 @@ impl Gpu {
             gpu.check((gpu.driver.cuInit)(0))
                 .context("no usable NVIDIA GPU")?;
             let mut device = 0;
-            gpu.check((gpu.driver.cuDeviceGet)(&mut device, 0))
+            gpu.check((gpu.driver.cuDeviceGet)(&mut device, index as c_int))
                 .context("no usable NVIDIA GPU")?;
             gpu.device = device;
             let mut context = std::ptr::null_mut();
@@ -192,6 +223,35 @@ impl Gpu {
             }
         }
         Err(anyhow!("CUDA error {status}"))
+    }
+
+    /// Let kernels here read and write `other`'s memory, through the same addresses.
+    pub fn enable_peer_access(&self, other: &Gpu) -> Result<()> {
+        self.attach()?;
+        // SAFETY: both contexts are live.
+        self.check(unsafe { (self.driver.cuCtxEnablePeerAccess)(other.context, 0) })
+            .context("these GPUs can't reach each other's memory")
+    }
+
+    /// A marker for a point in this GPU's queue that other queues can wait for.
+    pub fn event(&self) -> Result<Event> {
+        let mut event = std::ptr::null_mut();
+        // SAFETY: a pointer to a live variable. Flag 2: no timing, which makes it cheaper.
+        self.check(unsafe { (self.driver.cuEventCreate)(&mut event, 2) })?;
+        Ok(Event(event))
+    }
+
+    /// Mark the current end of the queue with `event`.
+    pub fn record(&self, event: Event) -> Result<()> {
+        // SAFETY: both are live.
+        self.check(unsafe { (self.driver.cuEventRecord)(event.0, self.stream) })
+    }
+
+    /// Hold the rest of this queue until `event` (perhaps another GPU's) has been reached. It
+    /// has to have been recorded already.
+    pub fn wait_for(&self, event: Event) -> Result<()> {
+        // SAFETY: both are live.
+        self.check(unsafe { (self.driver.cuStreamWaitEvent)(self.stream, event.0, 0) })
     }
 
     /// Make this thread the one using the GPU.

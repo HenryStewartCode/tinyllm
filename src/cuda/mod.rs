@@ -10,9 +10,11 @@
 //! that the input to each matrix multiplication gets rounded to 16 bits as well.
 
 mod api;
+mod parallel;
+pub use parallel::TensorParallel;
 mod vision;
 
-pub use api::{Arg, Gpu, Graph, Kernel, Module, Pointer};
+pub use api::{Arg, Event, Gpu, Graph, Kernel, Module, Pointer};
 
 use crate::backend::{Backend, LoadedModel, Logits};
 use crate::config::{
@@ -27,6 +29,7 @@ use anyhow::{Context, Result, bail, ensure};
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{Arc, Barrier};
 
 pub const KERNELS_PTX: &str = include_str!("kernels.ptx");
 
@@ -323,6 +326,7 @@ struct Kernels {
     tiles_bf16: Kernel,
     scatter_logits: Kernel,
     place_rows: Kernel,
+    reduce_add: Kernel,
     vision_attention: Kernel,
     gelu_erf: Kernel,
 }
@@ -385,6 +389,7 @@ impl Kernels {
             tiles_bf16: gpu.kernel(module, "tiles_bf16")?,
             scatter_logits: gpu.kernel(module, "scatter_logits")?,
             place_rows: gpu.kernel(module, "place_rows")?,
+            reduce_add: gpu.kernel(module, "reduce_add")?,
             vision_attention: gpu.kernel(module, "vision_attention")?,
             gelu_erf: gpu.kernel(module, "gelu_erf")?,
             swiglu_bf16: gpu.kernel(module, "swiglu_bf16")?,
@@ -540,6 +545,24 @@ pub struct CudaBackend {
     /// Where rows given their own embeddings get them from: the embeddings, and the row indices.
     override_values: Growing,
     override_rows: Growing,
+    /// This GPU's place among several sharing the model, if it does.
+    tp: Option<TpLink>,
+}
+
+/// What one GPU of several sharing a model (tensor parallelism) needs to combine their outputs.
+/// Each block's output is a sum over the GPUs: each computes its part into `partials[point]`
+/// (one point per attention and MLP block), then adds every GPU's part to its `x`, reading the
+/// others' through peer access.
+struct TpLink {
+    rank: usize,
+    size: usize,
+    /// Each GPU's threads meet here, so every GPU has queued its part's event before any waits.
+    barrier: Arc<Barrier>,
+    /// For point `p` and GPU `r`, `events[p * size + r]` marks its part being done.
+    events: Arc<Vec<Event>>,
+    partials: Vec<Pointer>,
+    /// For each point, every GPU's part's address, on this GPU.
+    tables: Vec<Pointer>,
 }
 
 /// The matrices LoRA corrections go to, as stacked here, and the modules each stacks.
@@ -570,20 +593,51 @@ impl CudaBackend {
 
     /// Load `config.json` and the weights onto the GPU.
     pub fn load(dir: &Path, options: &Options) -> Result<LoadedModel<Self>> {
+        Self::load_shard(dir, options, (0, 1))
+    }
+
+    /// Load GPU `rank`'s share of a model split across `size` GPUs (tensor parallelism): its
+    /// share of the attention heads and of the MLP. Everything else is on every GPU.
+    fn load_shard(
+        dir: &Path,
+        options: &Options,
+        shard: (usize, usize),
+    ) -> Result<LoadedModel<Self>> {
         let config = Config::load(dir)?;
         let st = SafeTensors::open_with(dir, options.weights_from.as_deref())?;
-        let gpu = Gpu::open()?;
+        let gpu = Gpu::open_device(shard.0)?;
         gpu.attach()?;
         let gpu_name = gpu.name();
 
         let dim = config.hidden_size;
-        let n_heads = config.num_attention_heads;
-        let n_kv_heads = config.n_kv_heads();
+        let size = shard.1;
+        let n_heads = config.num_attention_heads / size;
+        let n_kv_heads = config.n_kv_heads() / size;
         let head_dim = config.head_dim();
-        let hidden_dim = config.intermediate_size;
+        let hidden_dim = config.intermediate_size / size;
         let vocab_size = config.vocab_size;
         let (q_dim, kv_dim) = (n_heads * head_dim, n_kv_heads * head_dim);
         let architecture = config.architecture()?;
+        if size > 1 {
+            ensure!(
+                config.num_attention_heads.is_multiple_of(size)
+                    && config.n_kv_heads().is_multiple_of(size)
+                    && config.intermediate_size.is_multiple_of(size),
+                "the model's heads and MLP don't split evenly across {size} GPUs"
+            );
+            ensure!(
+                architecture.latent.is_none()
+                    && architecture.experts.is_none()
+                    && architecture.eagle3.is_none()
+                    && !architecture.combined_projections
+                    && !architecture.attention_sinks
+                    && !architecture.full_qk_norms
+                    && !architecture.norms_after_blocks
+                    && config.vision_config.is_none()
+                    && options.quantization.is_none(),
+                "splitting across GPUs only handles dense models with separate projections so far"
+            );
+        }
         let latent = architecture.latent;
         let eagle = architecture.eagle3;
         ensure!(
@@ -745,7 +799,7 @@ impl CudaBackend {
                     (format!("{attn}.v_proj"), kv_dim),
                 ],
             };
-            let qkv = upload_stacked(
+            let qkv = upload_layer(
                 &gpu,
                 &st,
                 precision,
@@ -755,8 +809,10 @@ impl CudaBackend {
                 batch_rows,
                 1.0,
                 options.quantization,
+                shard,
+                Split::Rows,
             )?;
-            let o_proj = upload_stacked(
+            let o_proj = upload_layer(
                 &gpu,
                 &st,
                 precision,
@@ -766,6 +822,8 @@ impl CudaBackend {
                 batch_rows,
                 architecture.residual_scale,
                 options.quantization,
+                shard,
+                Split::Cols,
             )?;
             let latent_layer = match latent {
                 None => None,
@@ -825,7 +883,7 @@ impl CudaBackend {
                             (format!("{p}.mlp.up_proj"), hidden_dim),
                         ],
                     };
-                    let gate_up = upload_stacked(
+                    let gate_up = upload_layer(
                         &gpu,
                         &st,
                         precision,
@@ -835,8 +893,10 @@ impl CudaBackend {
                         batch_rows,
                         1.0,
                         options.quantization,
+                        shard,
+                        Split::Rows,
                     )?;
-                    let down = upload_stacked(
+                    let down = upload_layer(
                         &gpu,
                         &st,
                         precision,
@@ -846,6 +906,8 @@ impl CudaBackend {
                         batch_rows,
                         architecture.residual_scale,
                         options.quantization,
+                        shard,
+                        Split::Cols,
                     )?;
                     FeedForward::Dense { gate_up, down }
                 }
@@ -1141,6 +1203,7 @@ impl CudaBackend {
                 vision,
                 override_values: Growing::default(),
                 override_rows: Growing::default(),
+                tp: None,
             },
         })
     }
@@ -1469,6 +1532,26 @@ impl CudaBackend {
         lora: Option<(usize, usize)>,
         step: &StepPointers,
     ) -> Result<()> {
+        if let Some(tp) = &self.tp {
+            let (layer, target) = lora.expect("every block names its matrix");
+            let point = 2 * layer + (target == 3) as usize;
+            self.matmul(w, input, batch, tp.partials[point], false)?;
+            self.gpu.record(tp.events[point * tp.size + tp.rank])?;
+            tp.barrier.wait();
+            for r in (0..tp.size).filter(|&r| r != tp.rank) {
+                self.gpu.wait_for(tp.events[point * tp.size + r])?;
+            }
+            return self.gpu.launch(
+                self.kernels.reduce_add,
+                [batch, 1],
+                &[
+                    Arg::Ptr(self.x),
+                    Arg::Ptr(tp.tables[point]),
+                    Arg::Int(tp.size),
+                    Arg::Int(self.dim),
+                ],
+            );
+        }
         let out = match norm {
             Some(_) => self.added,
             None => self.x,
@@ -2308,7 +2391,8 @@ impl CudaBackend {
         assert!(batch <= self.max_batch, "batch larger than the buffers");
         let step = self.upload_step(rows)?;
         self.place_overrides()?;
-        if batch <= MAX_RECORDED_BATCH {
+        // Recording would capture waits on the other GPUs' events, which it can't.
+        if batch <= MAX_RECORDED_BATCH && self.tp.is_none() {
             let key = (
                 batch,
                 step.any_adapter,
@@ -2645,6 +2729,184 @@ fn to_tiles<T: Copy + Default>(values: &[T], rows: usize, cols: usize) -> Vec<T>
     tiles
 }
 
+/// Upload `[rows, cols]` 32- or 16-bit values (whichever `precision` uses), and a bias.
+#[allow(clippy::too_many_arguments)]
+fn upload_plain(
+    gpu: &Gpu,
+    precision: Precision,
+    f32_values: &[f32],
+    bf16_values: &[u16],
+    bias: Option<Vec<f32>>,
+    rows: usize,
+    cols: usize,
+    batch_rows: usize,
+) -> Result<Matrix> {
+    let padded = rows.div_ceil(BLOCK_ROWS) * BLOCK_ROWS;
+    let data = match precision {
+        Precision::F32 => {
+            let data = gpu.alloc(padded * cols)?;
+            gpu.write_now(data, f32_values)?;
+            if padded > rows {
+                gpu.zero(data.offset(rows * cols), (padded - rows) * cols)?;
+            }
+            data
+        }
+        Precision::Bf16 => {
+            let tiles = to_tiles(bf16_values, rows, cols);
+            let data = gpu.alloc(tiles.len().div_ceil(2))?;
+            gpu.write_now(data, &tiles)?;
+            data
+        }
+    };
+    let bias = match bias {
+        Some(values) => {
+            let device = gpu.alloc(rows)?;
+            gpu.write_now(device, &values)?;
+            device
+        }
+        None => Pointer::NULL,
+    };
+    let scratch = match precision == Precision::Bf16 && !rows.is_multiple_of(TILE) {
+        true => gpu.alloc(tile_scratch_elements(batch_rows, rows))?,
+        false => Pointer::NULL,
+    };
+    Ok(Matrix {
+        data,
+        rows,
+        cols,
+        bias,
+        scratch,
+        scales: Pointer::NULL,
+        fp8: false,
+        zeros: Pointer::NULL,
+    })
+}
+
+/// A layer's matrix: all of it, or GPU `shard.0`'s `split` of it when there are several.
+#[allow(clippy::too_many_arguments)]
+fn upload_layer(
+    gpu: &Gpu,
+    st: &SafeTensors,
+    precision: Precision,
+    num_params: &mut usize,
+    layers: &[(String, usize)],
+    cols: usize,
+    batch_rows: usize,
+    scale: f32,
+    quantization: Option<Quantization>,
+    shard: (usize, usize),
+    split: Split,
+) -> Result<Matrix> {
+    match shard.1 {
+        1 => upload_stacked(
+            gpu,
+            st,
+            precision,
+            num_params,
+            layers,
+            cols,
+            batch_rows,
+            scale,
+            quantization,
+        ),
+        _ => upload_split(
+            gpu, st, precision, num_params, layers, cols, batch_rows, scale, shard, split,
+        ),
+    }
+}
+
+/// Which part of a matrix one GPU of several holds.
+#[derive(Clone, Copy)]
+enum Split {
+    /// Its share of each stacked matrix's rows (outputs).
+    Rows,
+    /// Its share of the columns (inputs); the bias goes with the first GPU's.
+    Cols,
+}
+
+/// As [`upload_stacked`], for GPU `rank` of `size` holding its `split` of each matrix. `layers`
+/// gives this GPU's row counts and `cols` its column count; the stored matrices are `size` times
+/// that along the split.
+#[allow(clippy::too_many_arguments)]
+fn upload_split(
+    gpu: &Gpu,
+    st: &SafeTensors,
+    precision: Precision,
+    num_params: &mut usize,
+    layers: &[(String, usize)],
+    cols: usize,
+    batch_rows: usize,
+    scale: f32,
+    (rank, size): (usize, usize),
+    split: Split,
+) -> Result<Matrix> {
+    let rows: usize = layers.iter().map(|(_, rows)| rows).sum();
+    let (mut f32_values, mut bf16_values) = (Vec::new(), Vec::new());
+    let mut bias: Option<Vec<f32>> = None;
+    let mut row = 0;
+    for (name, count) in layers {
+        let weight = format!("{name}.weight");
+        let dtype = st.dtype(&weight);
+        ensure!(
+            matches!(dtype, Some("BF16" | "F16" | "F32")),
+            "{weight}: only 16- and 32-bit weights can be split across GPUs so far"
+        );
+        let (full_rows, full_cols) = match split {
+            Split::Rows => (count * size, cols),
+            Split::Cols => (*count, cols * size),
+        };
+        let keep = |r: usize, c: usize| match split {
+            Split::Rows => r / count == rank,
+            Split::Cols => c / cols == rank,
+        };
+        match precision {
+            Precision::F32 => {
+                let all = st.load(&weight, &[full_rows, full_cols])?;
+                for (i, &v) in all.iter().enumerate() {
+                    if keep(i / full_cols, i % full_cols) {
+                        f32_values.push(v * scale);
+                    }
+                }
+            }
+            Precision::Bf16 => {
+                let all = st.load_bf16(&weight, &[full_rows, full_cols])?;
+                for (i, &v) in all.iter().enumerate() {
+                    if keep(i / full_cols, i % full_cols) {
+                        bf16_values.push(match scale {
+                            1.0 => v,
+                            _ => f32_to_bf16(bf16_to_f32(v) * scale),
+                        });
+                    }
+                }
+            }
+        }
+        *num_params += count * cols;
+        let bias_name = format!("{name}.bias");
+        if st.contains(&bias_name) {
+            let all = st.load(&bias_name, &[full_rows])?;
+            let values = match split {
+                Split::Rows => all[rank * count..][..*count].to_vec(),
+                Split::Cols if rank == 0 => all,
+                Split::Cols => vec![0.0; *count],
+            };
+            *num_params += values.len();
+            bias.get_or_insert_with(|| vec![0.0; rows])[row..row + count]
+                .copy_from_slice(&values.iter().map(|v| v * scale).collect::<Vec<_>>());
+        }
+        row += count;
+    }
+    upload_plain(
+        gpu,
+        precision,
+        &f32_values,
+        &bf16_values,
+        bias,
+        rows,
+        cols,
+        batch_rows,
+    )
+}
+
 /// Upload some matrices with the same number of columns as one, one on top of the other. Padded
 /// with zero rows to a whole number of blocks. `layers` lists each one's name and row count.
 #[allow(clippy::too_many_arguments)]
@@ -2660,7 +2922,6 @@ fn upload_stacked(
     quantization: Option<Quantization>,
 ) -> Result<Matrix> {
     let rows: usize = layers.iter().map(|(_, rows)| rows).sum();
-    let padded = rows.div_ceil(BLOCK_ROWS) * BLOCK_ROWS;
     // 4-bit checkpoints keep their 4-bit values, when the kernel can take their groups.
     let all_int4 = layers
         .iter()
@@ -2787,44 +3048,16 @@ fn upload_stacked(
         });
     }
 
-    let data = match precision {
-        Precision::F32 => {
-            let data = gpu.alloc(padded * cols)?;
-            gpu.write_now(data, &f32_values)?;
-            if padded > rows {
-                gpu.zero(data.offset(rows * cols), (padded - rows) * cols)?;
-            }
-            data
-        }
-        Precision::Bf16 => {
-            let tiles = to_tiles(&bf16_values, rows, cols);
-            let data = gpu.alloc(tiles.len().div_ceil(2))?;
-            gpu.write_now(data, &tiles)?;
-            data
-        }
-    };
-    let bias = match bias {
-        Some(values) => {
-            let device = gpu.alloc(rows)?;
-            gpu.write_now(device, &values)?;
-            device
-        }
-        None => Pointer::NULL,
-    };
-    let scratch = match precision == Precision::Bf16 && !rows.is_multiple_of(TILE) {
-        true => gpu.alloc(tile_scratch_elements(batch_rows, rows))?,
-        false => Pointer::NULL,
-    };
-    Ok(Matrix {
-        data,
+    upload_plain(
+        gpu,
+        precision,
+        &f32_values,
+        &bf16_values,
+        bias,
         rows,
         cols,
-        bias,
-        scratch,
-        scales: Pointer::NULL,
-        fp8: false,
-        zeros: Pointer::NULL,
-    })
+        batch_rows,
+    )
 }
 
 /// Stack 4-bit weights for the GPU kernel: their values two to a byte in the lane order of the

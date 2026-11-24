@@ -1938,6 +1938,19 @@ extern "C" __global__ void copy_rows(const float *x, int dim, float *out, int st
 }
 
 // One block per row: x's row, `cols` floats, as bfloat16 in its place in a tile-layout matrix.
+// One block per row: x += the sum of every GPU's part of a block's output (tensor parallelism),
+// added up in the same order on every GPU so they all keep the same x.
+extern "C" __global__ void reduce_add(float *x, const unsigned long long *parts, int count,
+                                      int dim) {
+    const size_t row = (size_t)blockIdx.x * dim;
+    for (int i = threadIdx.x; i < dim; i += WARP) {
+        float sum = 0.0f;
+        for (int r = 0; r < count; r++)
+            sum += ((const float *)parts[r])[row + i];
+        x[row + i] += sum;
+    }
+}
+
 // One block per row given its embedding (an image's): x[rows[i]] = values[i].
 extern "C" __global__ void place_rows(const float *values, const int *rows, float *x, int dim) {
     const float *from = values + (size_t)blockIdx.x * dim;

@@ -239,6 +239,11 @@ struct Args {
     #[arg(long = "lora", alias = "lora-paths", value_name = "NAME=PATH", num_args = 1..)]
     lora: Vec<String>,
 
+    /// Split the model across this many NVIDIA GPUs (tensor parallelism): each holds its share
+    /// of every layer's attention heads and MLP
+    #[arg(long, alias = "tensor-parallel-size", default_value_t = 1)]
+    tp_size: usize,
+
     /// Run as a router in front of tinyllm servers (no model): the URL of each, e.g.
     /// http://10.0.0.2:8000. Repeat for more. Requests go to the server most likely to have
     /// their prompt cached, unless that would leave the servers unevenly loaded
@@ -335,13 +340,23 @@ fn main() -> Result<()> {
             host_threads: threads,
             weights_from: None,
         };
-        match CudaBackend::load(args.model(), &options) {
-            Ok(LoadedModel {
-                config,
-                num_params,
-                backend,
-            }) => (config, num_params, Box::new(backend) as Box<dyn Backend>),
-            Err(err) => fallback(err)?,
+        if args.tp_size > 1 {
+            let loaded = cuda::TensorParallel::load(args.model(), &options, args.tp_size)
+                .context("couldn't split the model across GPUs")?;
+            (
+                loaded.config,
+                loaded.num_params,
+                Box::new(loaded.backend) as Box<dyn Backend>,
+            )
+        } else {
+            match CudaBackend::load(args.model(), &options) {
+                Ok(LoadedModel {
+                    config,
+                    num_params,
+                    backend,
+                }) => (config, num_params, Box::new(backend) as Box<dyn Backend>),
+                Err(err) => fallback(err)?,
+            }
         }
     } else if device == Device::Metal {
         if args.quantization.is_some() {
