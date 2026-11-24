@@ -56,6 +56,9 @@ const SCAN_THREADS: usize = 1024;
 /// The largest batch to keep a recorded graph for. Each takes about 2 MB of GPU memory.
 const MAX_RECORDED_BATCH: usize = 64;
 
+/// Teams of rows in a block of `attention_prefill` (`PREFILL_TILES` in `kernels.cu`).
+const PREFILL_TILES: usize = 4;
+
 /// The most warps in a block of 16-bit attention.
 const ATTENTION_WARPS: usize = 16;
 
@@ -331,6 +334,8 @@ struct Kernels {
     /// How many warps each of `attention_bf16`'s blocks has: as many as its registers allow, up
     /// to `ATTENTION_WARPS`.
     attention_warps: Vec<usize>,
+    /// `attention_prefill` for each of the first 8 of `TILE_CHUNK_COUNTS` (heads up to 128 wide).
+    attention_prefill: Vec<Kernel>,
     reduce_add: Kernel,
     tp_signal: Kernel,
     tp_push: Kernel,
@@ -396,6 +401,9 @@ impl Kernels {
             tiles_bf16: gpu.kernel(module, "tiles_bf16")?,
             scatter_logits: gpu.kernel(module, "scatter_logits")?,
             place_rows: gpu.kernel(module, "place_rows")?,
+            attention_prefill: (1..=8)
+                .map(|chunks| gpu.kernel(module, &format!("attention_prefill_{chunks}")))
+                .collect::<Result<_>>()?,
             attention_warps: TILE_CHUNK_COUNTS
                 .iter()
                 .map(|chunks| {
@@ -466,6 +474,9 @@ struct StepData {
     /// Each row's LoRA adapter, 0 for none.
     adapters: Vec<u32>,
     team_size: Vec<u32>,
+    /// For prompts' rows in 16-bit attention: how many rows (from this one) each block of
+    /// `attention_prefill` takes, 0 if another row's block has this one (see `kernels.cu`).
+    block_rows: Vec<u32>,
     scratch_offset: Vec<u32>,
     logit_rows: Vec<u32>,
     cos: Vec<f32>,
@@ -1104,7 +1115,7 @@ impl CudaBackend {
         let candidate_ids_device = gpu.alloc(options.max_batch * MAX_CANDIDATES)?;
         let rope_half = config.rope_dim() / 2;
         let rope_slots = 2 * options.max_batch * rope_half * architecture.rope_tables.len();
-        let step_slots = 14 * options.max_batch + rope_slots + 16;
+        let step_slots = 15 * options.max_batch + rope_slots + 16;
         let step_buffer = gpu.alloc(step_slots)?;
 
         // An image encoder's weights go on before the KV cache takes what's left.
@@ -1232,6 +1243,14 @@ impl CudaBackend {
         })
     }
 
+    /// The prompt attention kernel, if this model's attention can use it: 16-bit, not latent,
+    /// heads at most 128 wide.
+    fn prefill_kernel(&self) -> Option<Kernel> {
+        let chunks = self.head_dim / TILE;
+        (self.precision == Precision::Bf16 && self.architecture.latent.is_none() && chunks <= 8)
+            .then(|| self.kernels.attention_prefill[chunks - 1])
+    }
+
     /// Queue copying the embeddings of rows given their own (an image's) into `x`. The embedding
     /// kernel leaves those rows alone, since their token is -1. This runs outside any recorded
     /// graph, so moving these buffers doesn't matter to one.
@@ -1318,7 +1337,6 @@ impl CudaBackend {
         let softcap = self.architecture.attention_softcap;
         let lists = self.slot_list_buffer.data;
         if self.precision == Precision::Bf16 {
-            let tile_bytes = TILE * TILE * 2;
             let chunks = head_dim / TILE;
             let kernel = TILE_CHUNK_COUNTS
                 .iter()
@@ -1327,7 +1345,37 @@ impl CudaBackend {
             // Warps per block take turns over the pages (see `attention_tiles`). Fixed per model,
             // so results don't depend on the batch.
             let warps = self.kernels.attention_warps[kernel];
-            let shared = 3 * chunks * tile_bytes + warps * (3 * tile_bytes + 2 * TILE * 4);
+            let shared = 4 * (chunks * TILE * TILE + 2 * TILE + warps * 3 * TILE * TILE / 2);
+            if let Some(prefill) = self.prefill_kernel() {
+                let shared = 2 * 2 * chunks * TILE * TILE
+                    + 4 * PREFILL_TILES * (chunks * TILE * TILE + 2 * TILE + 3 * TILE * TILE / 2);
+                self.gpu.launch_with_shared(
+                    prefill,
+                    [batch * self.n_kv_heads, 1],
+                    32 * PREFILL_TILES,
+                    shared,
+                    &[
+                        Arg::Ptr(self.qkv),
+                        Arg::Int(stride),
+                        Arg::Ptr(layer.k_pool),
+                        Arg::Ptr(layer.v_pool),
+                        Arg::Int(kv_dim / TILE),
+                        Arg::Ptr(lists),
+                        Arg::Ptr(step.row_offset),
+                        Arg::Ptr(step.row_len),
+                        Arg::Ptr(step.block_rows),
+                        Arg::Ptr(self.attn_out),
+                        Arg::Int(self.n_heads),
+                        Arg::Int(self.n_kv_heads),
+                        Arg::Int(head_dim),
+                        Arg::Float(scale),
+                        Arg::Int(q_dim.div_ceil(TILE)),
+                        Arg::Int(layer.window),
+                        Arg::Float(softcap),
+                        Arg::Ptr(layer.sinks),
+                    ],
+                )?;
+            }
             return self.gpu.launch_with_shared(
                 self.kernels.attention_bf16[kernel],
                 [batch * self.n_kv_heads, 1],
@@ -2063,6 +2111,7 @@ impl CudaBackend {
     fn upload_step(&mut self, rows: &[Row]) -> Result<StepPointers> {
         let batch = rows.len();
         let half = self.rope_half;
+        let prefill_kernel = self.prefill_kernel();
         let step = &mut self.step;
         step.tokens.clear();
         step.write_slots.clear();
@@ -2070,6 +2119,7 @@ impl CudaBackend {
         step.row_len.clear();
         step.adapters.clear();
         step.team_size.clear();
+        step.block_rows.clear();
         step.scratch_offset.clear();
         step.logit_rows.clear();
         step.slot_lists.clear();
@@ -2111,8 +2161,16 @@ impl CudaBackend {
             let team = (TILE / heads_per_kv).max(1);
             for (i, row) in rows[r..r + group].iter().enumerate() {
                 let index = r + i;
-                step.team_size.push(match i % team {
-                    0 => team.min(group - i) as u32,
+                // A prompt's rows go to the prompt kernel, which gives the same results but reads
+                // each page once for several teams.
+                let prefill = prefill_kernel.is_some() && group >= 2 * team;
+                let block = team * PREFILL_TILES;
+                step.team_size.push(match (prefill, i % team) {
+                    (false, 0) => team.min(group - i) as u32,
+                    _ => 0,
+                });
+                step.block_rows.push(match (prefill, i % block) {
+                    (true, 0) => block.min(group - i) as u32,
                     _ => 0,
                 });
                 match row.embedding {
@@ -2204,6 +2262,8 @@ impl CudaBackend {
         combined.extend_from_slice(&step.adapters);
         let team_size = mark(combined);
         combined.extend_from_slice(&step.team_size);
+        let block_rows = mark(combined);
+        combined.extend_from_slice(&step.block_rows);
         let scratch_offset = mark(combined);
         combined.extend_from_slice(&step.scratch_offset);
         let logit_rows = mark(combined);
@@ -2236,6 +2296,7 @@ impl CudaBackend {
             adapters,
             any_adapter: step.adapters.iter().any(|&a| a != 0),
             team_size,
+            block_rows,
             scratch_offset,
             logit_rows,
             cos,
@@ -2626,6 +2687,7 @@ struct StepPointers {
     /// Some row uses a LoRA adapter.
     any_adapter: bool,
     team_size: Pointer,
+    block_rows: Pointer,
     scratch_offset: Pointer,
     logit_rows: Pointer,
     cos: Pointer,

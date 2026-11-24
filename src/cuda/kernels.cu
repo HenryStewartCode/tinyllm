@@ -1001,32 +1001,196 @@ typedef wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_majo
 typedef wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> TileBRows;
 typedef wmma::fragment<wmma::accumulator, 16, 16, 16, float> TileTotal;
 
-// Causal self-attention on tensor cores. One block per (row, key/value head), whose warps take
-// turns over the pages of keys and values (warp w takes pages w, w + warps, ...), so a long
-// context is spread over many warps even when there are few rows (generating tokens).
+// Causal self-attention on tensor cores, in two kernels that give exactly the same results:
+// `attention_bf16_*` for rows generating tokens (few rows per sequence, long contexts), and
+// `attention_prefill_*` for prompts (many consecutive rows of one sequence).
 //
-// Consecutive rows from one sequence read nearly the same pages, and a tile has room for more
-// query heads than one row has per key/value head, so rows can share a block. `team_sizes[row]`
-// is how many rows (this one and those following it) this row answers for, and is 0 if another
-// row's block is handling this one. Tile rows are then the query heads of the team's rows in
-// turn, and a tile multiplication gives the scores of a whole page of 16 tokens at once for all
-// of them.
+// Tile rows are query heads: a 16-row tile holds the query heads sharing a key/value head for
+// 16 / group consecutive rows, and a tile multiplication gives the scores of a whole page of 16
+// tokens at once for all of them.
 //
-// Each warp works out its share of the softmax in a single pass over its pages, which needs each
-// token's weight before the best score is known. Weights are relative to the best score in the
-// first page the warp sees for that query instead, and that works because only ratios between
-// weights matter. Weights can then be large if a later page scores much higher, so they're
-// capped well short of overflowing. At the end the warps' totals are rescaled to a common
-// reference and added up in warp order, so the result doesn't depend on timing.
+// The softmax: pages fall into ranges of RANGE_PAGES (by their position in the sequence). Within
+// a range, one warp goes through its pages in order, weighting each token relative to the best
+// score in the first page of the range that the query can see (only ratios between weights
+// matter, and weights are capped well short of overflowing). Then the ranges' totals are folded
+// into one, in range order, rescaled to a running reference. Pages a query can't see change
+// nothing, so a row's result depends only on its own context, whichever kernel and whichever
+// tile it's in: results don't depend on the batch.
 //
 // `row_len[row]` is how many tokens the row can see, whose pages start at
-// page_lists[row_offset[row]]. Rows in a team are consecutive tokens, so they each see one more
-// token than the row before. With a `window` a row only sees that many of the latest tokens, and
-// pages before the first that any row can see are skipped. `smem` needs room for the query tiles
-// (2 bytes * 256 * CHUNKS), a total for each tile (4 bytes * 256 * CHUNKS), and for each warp a
-// score tile (4 bytes * 256), a weight tile (2 bytes * 256) and two numbers per tile row.
+// page_lists[row_offset[row]]. Consecutive rows of a sequence each see one more token than the
+// row before. With a `window` a row only sees that many of the latest tokens.
 #define LARGEST_ATTENTION_EXPONENT 60.0f
+#define RANGE_PAGES 32
+#define PREFILL_TILES 4
 
+// One warp's softmax state for a range. Lane L looks after tile row L / 2, and half its columns.
+template <int CHUNKS> struct RangeState {
+    TileTotal totals[CHUNKS];
+    float reference, capped, lane_sum;
+    bool referenced;
+};
+
+template <int CHUNKS> __device__ __forceinline__ void range_reset(RangeState<CHUNKS> &st) {
+    for (int c = 0; c < CHUNKS; c++)
+        wmma::fill_fragment(st.totals[c], 0.0f);
+    st.lane_sum = 0.0f;
+    st.referenced = false;
+}
+
+// What a warp's tile needs to know about its rows.
+struct TileRows {
+    int count;     // tile rows in use
+    int first_len; // how many tokens the tile's first row sees
+    int group;     // query heads per key/value head
+    int window;
+};
+
+// Add one page to a range: its key and value tiles (CHUNKS each) at `k` and `v`, global or shared.
+// `scores` (256 floats) and `weights` (256, zero outside used rows) are the warp's scratch.
+template <int CHUNKS>
+__device__ __forceinline__ void range_page(RangeState<CHUNKS> &st, const TileA *a,
+                                           const __nv_bfloat16 *k, const __nv_bfloat16 *v,
+                                           int page, TileRows rows, float scale, float softcap,
+                                           float *scores, __nv_bfloat16 *weights, int lane) {
+    TileBColumns keys[CHUNKS];
+    TileBRows values[CHUNKS];
+    for (int c = 0; c < CHUNKS; c++) {
+        wmma::load_matrix_sync(keys[c], k + c * TILE_ELEMENTS, TILE);
+        wmma::load_matrix_sync(values[c], v + c * TILE_ELEMENTS, TILE);
+    }
+    TileTotal total;
+    wmma::fill_fragment(total, 0.0f);
+    for (int c = 0; c < CHUNKS; c++)
+        wmma::mma_sync(total, a[c], keys[c], total);
+    wmma::store_matrix_sync(scores, total, TILE, wmma::mem_row_major);
+    __syncwarp();
+    // This lane's row and columns, and which of them its query can see.
+    const int t = lane / 2, first_column = lane % 2 * 8;
+    const int seen = rows.first_len + t / rows.group;
+    const bool used = t < rows.count;
+    float row_scores[8];
+    bool visible[8];
+    float best = -FLT_MAX;
+    for (int j = 0; j < 8; j++) {
+        const int position = page * TILE + first_column + j;
+        visible[j] = used && position < seen && position >= seen - rows.window;
+        row_scores[j] = scores[t * TILE + first_column + j];
+        if (visible[j])
+            best = fmaxf(best, row_scores[j]);
+    }
+    best = fmaxf(best, __shfl_xor_sync(0xffffffff, best, 1));
+    if (!st.referenced && best != -FLT_MAX) {
+        st.reference = best;
+        st.capped = soft_cap(best * scale, softcap);
+        st.referenced = true;
+    }
+    for (int j = 0; j < 8; j++) {
+        float weight = 0.0f;
+        if (visible[j]) {
+            const float exponent = softcap > 0.0f
+                                       ? soft_cap(row_scores[j] * scale, softcap) - st.capped
+                                       : (row_scores[j] - st.reference) * scale;
+            weight = expf(fminf(exponent, LARGEST_ATTENTION_EXPONENT));
+        }
+        // Summing the rounded weight the multiplication really uses keeps the result a true
+        // average, so a dominant token isn't scaled by its weight's rounding error.
+        const __nv_bfloat16 rounded = __float2bfloat16(weight);
+        weights[t * TILE + first_column + j] = rounded;
+        st.lane_sum += __bfloat162float(rounded);
+    }
+    __syncwarp();
+    TileA weight_tile;
+    wmma::load_matrix_sync(weight_tile, weights, TILE);
+    for (int c = 0; c < CHUNKS; c++)
+        wmma::mma_sync(st.totals[c], weight_tile, values[c], st.totals[c]);
+}
+
+// Fold a warp's range into an accumulator: `acc` (CHUNKS tiles of floats), and per tile row a
+// reference exponent `m` (-FLT_MAX before any) and total weight `s`. One warp.
+template <int CHUNKS>
+__device__ __forceinline__ void range_fold(RangeState<CHUNKS> &st, int count, float scale,
+                                           float softcap, float *acc, float *m, float *s,
+                                           float *scratch, int lane) {
+    const int t = lane / 2;
+    const float sum = st.lane_sum + __shfl_xor_sync(0xffffffff, st.lane_sum, 1);
+    const bool used = t < count && st.referenced;
+    const float r = !used ? 0.0f : softcap > 0.0f ? st.capped : st.reference * scale;
+    const float old = m[t];
+    const float next = used ? fmaxf(old, r) : old;
+    const float keep = !used ? 1.0f : old == -FLT_MAX ? 0.0f : expf(old - next);
+    const float add = used ? expf(r - next) : 0.0f;
+    __syncwarp();
+    for (int c = 0; c < CHUNKS; c++) {
+        wmma::store_matrix_sync(scratch, st.totals[c], TILE, wmma::mem_row_major);
+        __syncwarp();
+        for (int i = lane; i < TILE_ELEMENTS; i += WARP) {
+            const int row = i / TILE;
+            const float row_keep = __shfl_sync(0xffffffff, keep, 2 * row);
+            const float row_add = __shfl_sync(0xffffffff, add, 2 * row);
+            acc[c * TILE_ELEMENTS + i] =
+                acc[c * TILE_ELEMENTS + i] * row_keep + scratch[i] * row_add;
+        }
+        __syncwarp();
+    }
+    if (lane % 2 == 0) {
+        s[t] = s[t] * keep + sum * add;
+        m[t] = next;
+    }
+    __syncwarp();
+}
+
+// The query tile of `count` tile rows starting at `first_row`, as fragments, through `staging`
+// (256 bf16, left zero).
+template <int CHUNKS>
+__device__ __forceinline__ void load_queries(TileA *a, const float *qkv, int stride, int first_row,
+                                             int count, int group, int kv_head, int head_dim,
+                                             __nv_bfloat16 *staging, int lane) {
+    for (int c = 0; c < CHUNKS; c++) {
+        for (int i = lane; i < TILE_ELEMENTS; i += WARP) {
+            const int t = i / TILE, j = i % TILE;
+            float value = 0.0f;
+            if (t < count)
+                value = qkv[(size_t)(first_row + t / group) * stride +
+                            (kv_head * group + t % group) * head_dim + c * TILE + j];
+            staging[i] = __float2bfloat16(value);
+        }
+        __syncwarp();
+        wmma::load_matrix_sync(a[c], staging, TILE);
+        __syncwarp();
+    }
+    for (int i = lane; i < TILE_ELEMENTS; i += WARP)
+        staging[i] = __float2bfloat16(0.0f);
+    __syncwarp();
+}
+
+// Divide the accumulator by the total weight and write the tile rows out, rounded for the next
+// multiplication. A head's sink (GPT-OSS) adds to the total weight as one more score, with no
+// value. Threads `start`, `start + step`, ... share the work.
+template <int CHUNKS>
+__device__ __forceinline__ void write_rows(const float *acc, const float *m, const float *s,
+                                           int count, int first_row, int group, int kv_head,
+                                           int head_dim, const float *sinks, __nv_bfloat16 *out,
+                                           int out_chunks, int start, int step) {
+    for (int i = start; i < CHUNKS * TILE_ELEMENTS; i += step) {
+        const int c = i / TILE_ELEMENTS, t = i % TILE_ELEMENTS / TILE, j = i % TILE;
+        if (t >= count)
+            continue;
+        float total = s[t];
+        if (sinks)
+            total += expf(
+                fminf(sinks[kv_head * group + t % group] - m[t], LARGEST_ATTENTION_EXPONENT));
+        const int row = first_row + t / group, head = kv_head * group + t % group;
+        out[tile_index(row, head * head_dim + c * TILE + j, out_chunks)] =
+            __float2bfloat16(acc[i] / total);
+    }
+}
+
+// For rows generating tokens: one block per team of rows (`team_sizes[row]` rows from this one,
+// 0 if another row's block has this one) and key/value head. Its warps take turns over the
+// ranges (warp w: ranges w, w + warps, ...), so a long context is spread over many warps, and
+// fold them in order. `smem`: CHUNKS tiles of floats and 2 * 16 floats, then for each warp a
+// score tile (1 KB) and a weight tile (512 bytes).
 template <int CHUNKS>
 __device__ __forceinline__ void attention_tiles(const float *qkv, int stride,
                                                 const __nv_bfloat16 *k_pool,
@@ -1037,170 +1201,126 @@ __device__ __forceinline__ void attention_tiles(const float *qkv, int stride,
                                                 int head_dim, float scale, int out_chunks,
                                                 int window, float softcap, const float *sinks) {
     extern __shared__ __align__(1024) unsigned char smem[];
-    const int block = blockIdx.x, lane = threadIdx.x % WARP, warp = threadIdx.x / WARP;
-    const int warps = blockDim.x / WARP;
-    const int first_row = block / n_kv_heads, kv_head = block % n_kv_heads;
+    const int lane = threadIdx.x % WARP, warp = threadIdx.x / WARP, warps = blockDim.x / WARP;
+    const int first_row = blockIdx.x / n_kv_heads, kv_head = blockIdx.x % n_kv_heads;
     const int team_size = team_sizes[first_row];
     if (team_size == 0)
         return;
     const int group = n_heads / n_kv_heads;
-    // Tile rows are the query heads of this team's rows, one row's heads after another.
-    const int tile_rows = team_size * group;
-    const int first_len = row_len[first_row];
-    const int first_page = max(0, first_len - window) / TILE;
-    const int last_page = (first_len + team_size - 2) / TILE;
+    const TileRows rows = {team_size * group, row_len[first_row], group, window};
+    const int first_page = max(0, rows.first_len - window) / TILE;
+    const int last_page = (rows.first_len + team_size - 2) / TILE;
     const unsigned *pages = page_lists + row_offset[first_row];
-    const size_t tile_bytes = TILE_ELEMENTS * sizeof(__nv_bfloat16);
 
-    __nv_bfloat16 *q_tiles = (__nv_bfloat16 *)smem;
-    float *sum_tiles = (float *)(smem + CHUNKS * tile_bytes);
-    unsigned char *own = smem + 3 * CHUNKS * tile_bytes + warp * 3 * tile_bytes;
-    float *scores = (float *)own;
-    __nv_bfloat16 *weights = (__nv_bfloat16 *)(own + 2 * tile_bytes);
-    // Each warp's reference (as an exponent) and total weight, for each tile row.
-    float *references = (float *)(smem + 3 * CHUNKS * tile_bytes + warps * 3 * tile_bytes);
-    float *weight_sums = references + warps * TILE;
-
-    // Lay the queries out as tiles (rows: query heads; columns: 16 elements of the head).
-    for (int i = threadIdx.x; i < CHUNKS * TILE_ELEMENTS; i += blockDim.x) {
-        const int c = i / TILE_ELEMENTS, t = i % TILE_ELEMENTS / TILE, j = i % TILE;
-        float value = 0.0f;
-        if (t < tile_rows) {
-            const float *query = qkv + (size_t)(first_row + t / group) * stride +
-                                 (kv_head * group + t % group) * head_dim;
-            value = query[c * TILE + j];
-        }
-        q_tiles[i] = __float2bfloat16(value);
-        sum_tiles[i] = 0.0f;
+    float *acc = (float *)smem;
+    float *m = acc + CHUNKS * TILE_ELEMENTS, *s = m + TILE;
+    float *scores = s + TILE + warp * (TILE_ELEMENTS + TILE_ELEMENTS / 2);
+    __nv_bfloat16 *weights = (__nv_bfloat16 *)(scores + TILE_ELEMENTS);
+    for (int i = threadIdx.x; i < CHUNKS * TILE_ELEMENTS; i += blockDim.x)
+        acc[i] = 0.0f;
+    if (threadIdx.x < TILE) {
+        m[threadIdx.x] = -FLT_MAX;
+        s[threadIdx.x] = 0.0f;
     }
-    __syncthreads();
     TileA a[CHUNKS];
-    for (int c = 0; c < CHUNKS; c++)
-        wmma::load_matrix_sync(a[c], q_tiles + c * TILE_ELEMENTS, TILE);
-
-    // Whether a tile row's query can see the token in this lane's column of a page.
-    const auto visible = [&](int t, int page) {
-        const int position = page * TILE + lane, seen = first_len + t / group;
-        return position < seen && position >= seen - window;
-    };
-
-    // The reference point for each query's weights (the best score in the first page this warp
-    // sees for it, as raw scores and as soft-capped ones), and the running total of its weights.
-    float reference[TILE], capped_reference[TILE], lane_sum[TILE];
-    bool referenced[TILE];
-    for (int t = 0; t < TILE; t++) {
-        lane_sum[t] = 0;
-        referenced[t] = false;
-    }
-    for (int i = lane; i < TILE_ELEMENTS; i += WARP)
-        weights[i] = __float2bfloat16(0.0f);
-    __syncwarp();
-    TileTotal totals[CHUNKS];
-    for (int c = 0; c < CHUNKS; c++)
-        wmma::fill_fragment(totals[c], 0.0f);
-
-    for (int page = first_page + warp; page <= last_page; page += warps) {
-        const size_t first = ((size_t)pages[page] * kv_chunks + kv_head * CHUNKS) * TILE_ELEMENTS;
-        TileBColumns keys[CHUNKS];
-        TileBRows values[CHUNKS];
-        for (int c = 0; c < CHUNKS; c++) {
-            wmma::load_matrix_sync(keys[c], k_pool + first + (size_t)c * TILE_ELEMENTS, TILE);
-            wmma::load_matrix_sync(values[c], v_pool + first + (size_t)c * TILE_ELEMENTS, TILE);
-        }
-        TileTotal total;
-        wmma::fill_fragment(total, 0.0f);
-        for (int c = 0; c < CHUNKS; c++)
-            wmma::mma_sync(total, a[c], keys[c], total);
-        wmma::store_matrix_sync(scores, total, TILE, wmma::mem_row_major);
-        __syncwarp();
-
-        for (int t = 0; t < tile_rows; t++) {
-            if (referenced[t])
-                continue;
-            const bool sees = lane < TILE && visible(t, page);
-            if (!__any_sync(0xffffffff, sees))
-                continue;
-            reference[t] = warp_max(sees ? scores[t * TILE + lane] : -FLT_MAX);
-            capped_reference[t] = soft_cap(reference[t] * scale, softcap);
-            referenced[t] = true;
-        }
-        if (lane < TILE) {
-            for (int t = 0; t < tile_rows; t++) {
-                float weight = 0.0f;
-                if (visible(t, page)) {
-                    const float score = scores[t * TILE + lane];
-                    const float exponent =
-                        softcap > 0.0f ? soft_cap(score * scale, softcap) - capped_reference[t]
-                                       : (score - reference[t]) * scale;
-                    weight = expf(fminf(exponent, LARGEST_ATTENTION_EXPONENT));
-                }
-                // Summing the rounded weight the multiplication really uses keeps the result a
-                // true average, so a dominant token isn't scaled by its weight's rounding error.
-                const __nv_bfloat16 rounded = __float2bfloat16(weight);
-                weights[t * TILE + lane] = rounded;
-                lane_sum[t] += __bfloat162float(rounded);
-            }
-        }
-        __syncwarp();
-        TileA weight_tile;
-        wmma::load_matrix_sync(weight_tile, weights, TILE);
-        for (int c = 0; c < CHUNKS; c++)
-            wmma::mma_sync(totals[c], weight_tile, values[c], totals[c]);
-    }
-
-    // Each warp's reference as an exponent, and its total weight.
-    for (int t = 0; t < TILE; t++) {
-        const float total = warp_sum(lane_sum[t]);
-        if (lane == 0) {
-            const bool used = t < tile_rows && referenced[t];
-            references[warp * TILE + t] =
-                !used ? -FLT_MAX : softcap > 0.0f ? capped_reference[t] : reference[t] * scale;
-            weight_sums[warp * TILE + t] = total;
-        }
-    }
+    load_queries<CHUNKS>(a, qkv, stride, first_row, rows.count, group, kv_head, head_dim,
+                         weights, lane);
     __syncthreads();
-    // The common reference for each tile row: the largest.
-    float common[TILE], factor[TILE];
-    for (int t = 0; t < TILE; t++) {
-        common[t] = -FLT_MAX;
-        for (int w = 0; w < warps; w++)
-            common[t] = fmaxf(common[t], references[w * TILE + t]);
-        const float mine = references[warp * TILE + t];
-        factor[t] = mine == -FLT_MAX ? 0.0f : expf(mine - common[t]);
-    }
-    // Add the warps' totals up, rescaled, one warp after another.
-    for (int w = 0; w < warps; w++) {
-        if (warp == w) {
-            for (int c = 0; c < CHUNKS; c++) {
-                wmma::store_matrix_sync(scores, totals[c], TILE, wmma::mem_row_major);
-                __syncwarp();
-                for (int i = lane; i < TILE_ELEMENTS; i += WARP)
-                    sum_tiles[c * TILE_ELEMENTS + i] += scores[i] * factor[i / TILE];
-                __syncwarp();
+
+    RangeState<CHUNKS> st;
+    const int first_range = first_page / RANGE_PAGES, last_range = last_page / RANGE_PAGES;
+    for (int base = first_range; base <= last_range; base += warps) {
+        const int range = base + warp;
+        range_reset(st);
+        if (range <= last_range) {
+            const int end = min(last_page, range * RANGE_PAGES + RANGE_PAGES - 1);
+            for (int page = max(first_page, range * RANGE_PAGES); page <= end; page++) {
+                const size_t first =
+                    ((size_t)pages[page] * kv_chunks + kv_head * CHUNKS) * TILE_ELEMENTS;
+                range_page<CHUNKS>(st, a, k_pool + first, v_pool + first, page, rows, scale,
+                                   softcap, scores, weights, lane);
             }
+        }
+        for (int w = 0; w < warps; w++) {
+            if (warp == w && range <= last_range)
+                range_fold<CHUNKS>(st, rows.count, scale, softcap, acc, m, s, scores, lane);
+            __syncthreads();
+        }
+    }
+    write_rows<CHUNKS>(acc, m, s, rows.count, first_row, group, kv_head, head_dim, sinks, out,
+                       out_chunks, threadIdx.x, blockDim.x);
+}
+
+// For prompts: one block per PREFILL_TILES teams of consecutive rows of one sequence
+// (`block_rows[row]` rows from this one, 0 if another row's block has this one) and key/value
+// head, one warp per team. Each page of keys and values is read once into shared memory for all
+// of them, which is what makes long prompts fast. `smem`: the page's keys and values (CHUNKS
+// tiles each), then for each warp CHUNKS tiles of floats, 2 * 16 floats, a score tile and a
+// weight tile.
+template <int CHUNKS>
+__device__ __forceinline__ void attention_prefill_tiles(
+    const float *qkv, int stride, const __nv_bfloat16 *k_pool, const __nv_bfloat16 *v_pool,
+    int kv_chunks, const unsigned *page_lists, const int *row_offset, const int *row_len,
+    const int *block_rows, __nv_bfloat16 *out, int n_heads, int n_kv_heads, int head_dim,
+    float scale, int out_chunks, int window, float softcap, const float *sinks) {
+    extern __shared__ __align__(1024) unsigned char smem[];
+    const int lane = threadIdx.x % WARP, warp = threadIdx.x / WARP;
+    const int block_row = blockIdx.x / n_kv_heads, kv_head = blockIdx.x % n_kv_heads;
+    const int total_rows = block_rows[block_row];
+    if (total_rows == 0)
+        return;
+    const int group = n_heads / n_kv_heads, team = TILE / group;
+    const int first_row = block_row + warp * team;
+    const int my_rows = max(0, min(team, total_rows - warp * team));
+    const int block_len = row_len[block_row];
+    const TileRows rows = {my_rows * group, block_len + warp * team, group, window};
+    const int block_first = max(0, block_len - window) / TILE;
+    const int block_last = (block_len + total_rows - 2) / TILE;
+    const int my_first = max(0, rows.first_len - window) / TILE;
+    const int my_last = (rows.first_len + my_rows - 2) / TILE;
+    const unsigned *pages = page_lists + row_offset[block_row];
+
+    __nv_bfloat16 *page_keys = (__nv_bfloat16 *)smem;
+    __nv_bfloat16 *page_values = page_keys + CHUNKS * TILE_ELEMENTS;
+    float *acc = (float *)(page_values + CHUNKS * TILE_ELEMENTS) +
+                 warp * (CHUNKS * TILE_ELEMENTS + 2 * TILE + TILE_ELEMENTS + TILE_ELEMENTS / 2);
+    float *m = acc + CHUNKS * TILE_ELEMENTS, *s = m + TILE, *scores = s + TILE;
+    __nv_bfloat16 *weights = (__nv_bfloat16 *)(scores + TILE_ELEMENTS);
+    for (int i = lane; i < CHUNKS * TILE_ELEMENTS; i += WARP)
+        acc[i] = 0.0f;
+    if (lane < TILE) {
+        m[lane] = -FLT_MAX;
+        s[lane] = 0.0f;
+    }
+    TileA a[CHUNKS];
+    if (my_rows > 0)
+        load_queries<CHUNKS>(a, qkv, stride, first_row, rows.count, group, kv_head, head_dim,
+                             weights, lane);
+    RangeState<CHUNKS> st;
+    range_reset(st);
+
+    const int vectors = CHUNKS * TILE_ELEMENTS * 2 / 16;
+    for (int page = block_first; page <= block_last; page++) {
+        __syncthreads();
+        const size_t first = ((size_t)pages[page] * kv_chunks + kv_head * CHUNKS) * TILE_ELEMENTS;
+        for (int i = threadIdx.x; i < vectors; i += blockDim.x) {
+            ((uint4 *)page_keys)[i] = ((const uint4 *)(k_pool + first))[i];
+            ((uint4 *)page_values)[i] = ((const uint4 *)(v_pool + first))[i];
         }
         __syncthreads();
-    }
-
-    // Divide by the total weight and write out, rounded for the next multiplication.
-    // A head's sink (GPT-OSS) adds to the total weight as one more score, with no value.
-    for (int i = threadIdx.x; i < CHUNKS * TILE_ELEMENTS; i += blockDim.x) {
-        const int c = i / TILE_ELEMENTS, t = i % TILE_ELEMENTS / TILE, j = i % TILE;
-        if (t >= tile_rows)
+        if (my_rows == 0)
             continue;
-        float total = 0.0f;
-        for (int w = 0; w < warps; w++) {
-            const float r = references[w * TILE + t];
-            if (r != -FLT_MAX)
-                total += weight_sums[w * TILE + t] * expf(r - common[t]);
+        if (page >= my_first && page <= my_last)
+            range_page<CHUNKS>(st, a, page_keys, page_values, page, rows, scale, softcap, scores,
+                               weights, lane);
+        if (page % RANGE_PAGES == RANGE_PAGES - 1 || page == block_last) {
+            range_fold<CHUNKS>(st, rows.count, scale, softcap, acc, m, s, scores, lane);
+            range_reset(st);
         }
-        if (sinks)
-            total += expf(fminf(sinks[kv_head * group + t % group] - common[t],
-                                LARGEST_ATTENTION_EXPONENT));
-        const int row = first_row + t / group, head = kv_head * group + t % group;
-        out[tile_index(row, head * head_dim + c * TILE + j, out_chunks)] =
-            __float2bfloat16(sum_tiles[i] / total);
     }
+    if (my_rows > 0)
+        write_rows<CHUNKS>(acc, m, s, rows.count, first_row, group, kv_head, head_dim, sinks, out,
+                           out_chunks, lane, WARP);
 }
 
 // One kernel per head size, so the compiler can see how many tiles there are and keep them in
@@ -1224,6 +1344,26 @@ ATTENTION_BF16(6)
 ATTENTION_BF16(7)
 ATTENTION_BF16(8)
 ATTENTION_BF16(16)
+
+#define ATTENTION_PREFILL(CHUNKS)                                                              \
+    extern "C" __global__ void attention_prefill_##CHUNKS(                                     \
+        const float *qkv, int stride, const __nv_bfloat16 *k_pool, const __nv_bfloat16 *v_pool, \
+        int kv_chunks, const unsigned *page_lists, const int *row_offset, const int *row_len,  \
+        const int *block_rows, __nv_bfloat16 *out, int n_heads, int n_kv_heads, int head_dim,  \
+        float scale, int out_chunks, int window, float softcap, const float *sinks) {          \
+        attention_prefill_tiles<CHUNKS>(qkv, stride, k_pool, v_pool, kv_chunks, page_lists,    \
+                                        row_offset, row_len, block_rows, out, n_heads,         \
+                                        n_kv_heads, head_dim, scale, out_chunks, window,       \
+                                        softcap, sinks);                                       \
+    }
+ATTENTION_PREFILL(1)
+ATTENTION_PREFILL(2)
+ATTENTION_PREFILL(3)
+ATTENTION_PREFILL(4)
+ATTENTION_PREFILL(5)
+ATTENTION_PREFILL(6)
+ATTENTION_PREFILL(7)
+ATTENTION_PREFILL(8)
 
 // As gated, with the output in tile layout. One block per SWIGLU_COLUMNS columns of a row.
 #define SWIGLU_COLUMNS 256
