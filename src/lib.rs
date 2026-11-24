@@ -47,6 +47,7 @@ pub mod model;
 pub mod ops;
 pub mod pool;
 pub mod reasoning;
+pub mod router;
 pub mod safetensors;
 pub mod sampler;
 pub mod server;

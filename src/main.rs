@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, ValueEnum};
 use serde_json::Value;
 use std::io::{BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 use tinyllm::backend::{Backend, CpuBackend, LoadedModel};
@@ -115,8 +115,8 @@ enum ReasoningParserArg {
 #[command(version)]
 struct Args {
     /// Model directory holding config.json, tokenizer.json and *.safetensors (see download.sh)
-    #[arg(short, long)]
-    model: PathBuf,
+    #[arg(short, long, required_unless_present = "worker")]
+    model: Option<PathBuf>,
 
     /// Text to continue. With --chat it is sent as one user message instead
     #[arg(short, long)]
@@ -238,15 +238,35 @@ struct Args {
     /// Without --serve, the first one is used
     #[arg(long = "lora", alias = "lora-paths", value_name = "NAME=PATH", num_args = 1..)]
     lora: Vec<String>,
+
+    /// Run as a router in front of tinyllm servers (no model): the URL of each, e.g.
+    /// http://10.0.0.2:8000. Repeat for more. Requests go to the server most likely to have
+    /// their prompt cached, unless that would leave the servers unevenly loaded
+    #[arg(long, value_name = "URL", num_args = 1..)]
+    worker: Vec<String>,
+}
+
+impl Args {
+    fn model(&self) -> &Path {
+        self.model
+            .as_deref()
+            .expect("clap requires --model without --worker")
+    }
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    if !args.worker.is_empty() {
+        return tinyllm::router::serve(
+            args.worker.clone(),
+            &format!("{}:{}", args.host, args.port),
+        );
+    }
     if !args.serve && !args.chat && args.prompt.is_none() {
         bail!("nothing to do: pass --prompt \"some text\", --chat, or --serve");
     }
     let start = Instant::now();
-    let tokenizer = Arc::new(Tokenizer::load(&args.model)?);
+    let tokenizer = Arc::new(Tokenizer::load(args.model())?);
     let device = match args.device {
         Device::Auto if CudaBackend::available() => Device::Cuda,
         Device::Auto if MetalBackend::available() => Device::Metal,
@@ -289,7 +309,7 @@ fn main() -> Result<()> {
             config,
             num_params,
             backend,
-        } = CpuBackend::load(&args.model, threads, bytes)?;
+        } = CpuBackend::load(args.model(), threads, bytes)?;
         Ok((config, num_params, Box::new(backend)))
     };
     let fallback = |err: anyhow::Error| -> Result<(Config, usize, Box<dyn Backend>)> {
@@ -315,7 +335,7 @@ fn main() -> Result<()> {
             host_threads: threads,
             weights_from: None,
         };
-        match CudaBackend::load(&args.model, &options) {
+        match CudaBackend::load(args.model(), &options) {
             Ok(LoadedModel {
                 config,
                 num_params,
@@ -332,7 +352,7 @@ fn main() -> Result<()> {
             host_threads: threads,
             weights_from: None,
         };
-        match MetalBackend::load(&args.model, &options) {
+        match MetalBackend::load(args.model(), &options) {
             Ok(LoadedModel {
                 config,
                 num_params,
@@ -425,7 +445,7 @@ fn main() -> Result<()> {
             ..Default::default()
         },
         stop_tokens: chat::stop_tokens(
-            &args.model,
+            args.model(),
             config
                 .eos_token_id
                 .iter()
@@ -444,11 +464,11 @@ fn main() -> Result<()> {
     );
 
     if args.serve {
-        let model_name = args.model.file_name().map_or_else(
-            || args.model.display().to_string(),
+        let model_name = args.model().file_name().map_or_else(
+            || args.model().display().to_string(),
             |name| name.to_string_lossy().into_owned(),
         );
-        let template = ChatTemplate::load(&args.model)?;
+        let template = ChatTemplate::load(args.model())?;
         let detected = template.as_ref().and_then(ChatTemplate::tool_format);
         let tool_format = match args.tool_call_parser {
             ToolParserArg::Auto => detected,
@@ -493,7 +513,7 @@ fn main() -> Result<()> {
                 template,
                 model_name,
                 stop_tokens: params.stop_tokens,
-                defaults: SamplingDefaults::load(&args.model),
+                defaults: SamplingDefaults::load(args.model()),
                 vocab_size: config.vocab_size,
                 tool_format,
                 reasoning,
@@ -501,7 +521,7 @@ fn main() -> Result<()> {
                 num_params,
                 adapters: std::sync::RwLock::new(Adapters::new(adapter_names)),
                 config: Arc::new(config.clone()),
-                images: tinyllm::vision::ImageInput::load(&args.model, &config)?,
+                images: tinyllm::vision::ImageInput::load(args.model(), &config)?,
             },
             &format!("{}:{}", args.host, args.port),
         );
@@ -562,7 +582,7 @@ fn load_draft(
             );
         }
     }
-    let weights_from = eagle.then(|| args.model.clone());
+    let weights_from = eagle.then(|| args.model().to_path_buf());
     let described = model.describe();
     let (on_cuda, on_metal) = (described.contains("(CUDA"), described.contains("(Metal"));
     let element = match (on_cuda, args.precision) {
@@ -769,7 +789,7 @@ impl Cli {
 }
 
 fn chat(cli: &Cli, args: &Args) -> Result<()> {
-    let template = ChatTemplate::load(&args.model)?
+    let template = ChatTemplate::load(args.model())?
         .context("this model has no chat template; run without --chat to complete text instead")?;
     let system = args.system.as_ref().map(|s| chat::message("system", s));
     let mut history: Vec<Value> = system.into_iter().collect();

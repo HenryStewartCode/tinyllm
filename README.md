@@ -222,6 +222,33 @@ Requests can set `max_tokens` (or `max_completion_tokens`), `temperature`, `top_
 `usage.prompt_tokens_details.cached_tokens` reports how much of the prompt came from the prefix
 cache.
 
+### Several servers
+
+`--worker` runs tinyllm as a router in front of other tinyllm servers, on one machine or many,
+with no model of its own:
+
+```bash
+tinyllm -m models/Qwen2.5-0.5B-Instruct --serve --port 8001 &
+tinyllm -m models/Qwen2.5-0.5B-Instruct --serve --port 8002 &
+tinyllm --worker http://127.0.0.1:8001 http://127.0.0.1:8002 --port 8000
+```
+
+Clients talk to the router as they would to one server, in any of the APIs, streaming included.
+Like SGLang's router, it sends each request to the server most likely to have its prompt cached:
+it remembers the recent prompts it sent each one, and picks the server sharing the longest prefix
+with the new request if that's at least 30% of it. Otherwise, or when the servers are unevenly
+loaded (64 more requests on the busiest than the least busy, and 1.5 times as many), the least busy
+server gets it. A server that can't be reached is skipped and checked every 5 seconds until it's
+back. `GET /workers` lists the servers with their load, and `POST /workers` and `DELETE /workers`
+with `{"url": ...}` add and remove them while running. Each reply says which server answered in an
+`x-tinyllm-worker` header.
+
+With two Qwen2.5-0.5B servers sharing the RTX 2000 Ada, each with a 120 MB cache, and 128
+requests in 8 conversations with 1,500-token system prompts, 32 at a time
+([`scripts/router_test.py`](scripts/router_test.py)): sending requests to the servers in turn
+managed 15.3 requests a second with 79% of prompt tokens cached; the router managed 22.7 a second
+with 92% cached, each conversation staying on one server and the requests split evenly.
+
 ### Reasoning models
 
 Models such as Qwen3, SmolLM3 and DeepSeek-R1 think between `<think>` and `</think>` before they
@@ -788,7 +815,8 @@ missing is breadth, and the last 10–20% of single-stream speed.
 | Rerank models | yes | yes, rerankers that judge with "yes" and "no" (Qwen3-Reranker); **no** cross-encoders with classification heads (BERT-style) |
 | Vision | yes, many models, with video | Qwen2.5-VL on the CPU, the Apple GPU and NVIDIA GPUs, pictures sent as data. **No URL fetching, no video, no other vision models** |
 | Reward models | yes | **no** |
-| Multi-GPU, multi-node, router | yes | **no** |
+| Router across servers | yes: cache-aware, and prefill and decode on separate servers | yes, cache-aware (see [Several servers](#several-servers)). **No separate prefill and decode servers** |
+| One model across GPUs or nodes (tensor, pipeline, expert parallelism) | yes | **no** |
 | The SGL frontend language (`gen`, `select`, `fork`) | yes | **no** |
 
 Biggest gaps first, the plan is: measuring long prompts against SGLang, draft trees for EAGLE and
