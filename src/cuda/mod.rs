@@ -29,7 +29,6 @@ use anyhow::{Context, Result, bail, ensure};
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Barrier};
 
 pub const KERNELS_PTX: &str = include_str!("kernels.ptx");
 
@@ -327,6 +326,8 @@ struct Kernels {
     scatter_logits: Kernel,
     place_rows: Kernel,
     reduce_add: Kernel,
+    tp_signal: Kernel,
+    tp_push: Kernel,
     vision_attention: Kernel,
     gelu_erf: Kernel,
 }
@@ -390,6 +391,8 @@ impl Kernels {
             scatter_logits: gpu.kernel(module, "scatter_logits")?,
             place_rows: gpu.kernel(module, "place_rows")?,
             reduce_add: gpu.kernel(module, "reduce_add")?,
+            tp_signal: gpu.kernel(module, "tp_signal")?,
+            tp_push: gpu.kernel(module, "tp_push")?,
             vision_attention: gpu.kernel(module, "vision_attention")?,
             gelu_erf: gpu.kernel(module, "gelu_erf")?,
             swiglu_bf16: gpu.kernel(module, "swiglu_bf16")?,
@@ -550,19 +553,25 @@ pub struct CudaBackend {
 }
 
 /// What one GPU of several sharing a model (tensor parallelism) needs to combine their outputs.
-/// Each block's output is a sum over the GPUs: each computes its part into `partials[point]`
-/// (one point per attention and MLP block), then adds every GPU's part to its `x`, reading the
-/// others' through peer access.
-struct TpLink {
-    rank: usize,
-    size: usize,
-    /// Each GPU's threads meet here, so every GPU has queued its part's event before any waits.
-    barrier: Arc<Barrier>,
-    /// For point `p` and GPU `r`, `events[p * size + r]` marks its part being done.
-    events: Arc<Vec<Event>>,
-    partials: Vec<Pointer>,
-    /// For each point, every GPU's part's address, on this GPU.
-    tables: Vec<Pointer>,
+/// Each block's output is a sum over the GPUs: each computes its part into its slot of
+/// `parts[point]` (one point per attention and MLP block), copies it into the same slot on every
+/// other GPU, then adds up every GPU's part into its `x`. The GPUs tell each other their parts
+/// have arrived themselves, through flags in each other's memory, so the CPU isn't involved and
+/// steps can be recorded.
+pub(super) struct TpLink {
+    pub(super) rank: usize,
+    pub(super) size: usize,
+    /// For each point, every GPU's part, `stride` floats apart.
+    pub(super) parts: Vec<Pointer>,
+    pub(super) stride: usize,
+    /// For each point, where this GPU's part goes on every GPU.
+    pub(super) peer_parts: Vec<Pointer>,
+    /// For each point, how many times it's been reached (u32).
+    pub(super) seq: Pointer,
+    /// For each point, how many times each GPU has said it's reached it (u32, `[points, size]`).
+    pub(super) flags: Pointer,
+    /// For each point, every GPU's flags for that point, on this GPU.
+    pub(super) peer_flags: Vec<Pointer>,
 }
 
 /// The matrices LoRA corrections go to, as stacked here, and the modules each stacks.
@@ -1535,18 +1544,41 @@ impl CudaBackend {
         if let Some(tp) = &self.tp {
             let (layer, target) = lora.expect("every block names its matrix");
             let point = 2 * layer + (target == 3) as usize;
-            self.matmul(w, input, batch, tp.partials[point], false)?;
-            self.gpu.record(tp.events[point * tp.size + tp.rank])?;
-            tp.barrier.wait();
-            for r in (0..tp.size).filter(|&r| r != tp.rank) {
-                self.gpu.wait_for(tp.events[point * tp.size + r])?;
-            }
+            let own = tp.parts[point].offset(tp.rank * tp.stride);
+            self.matmul(w, input, batch, own, false)?;
+            let count = batch * self.dim;
+            self.gpu.launch_blocks(
+                self.kernels.tp_push,
+                [(count / 4).div_ceil(256), 1],
+                256,
+                &[
+                    Arg::Ptr(own),
+                    Arg::Ptr(tp.peer_parts[point]),
+                    Arg::Int(tp.rank),
+                    Arg::Int(tp.size),
+                    Arg::Int(count),
+                ],
+            )?;
+            self.gpu.launch(
+                self.kernels.tp_signal,
+                [1, 1],
+                &[
+                    Arg::Ptr(tp.seq.offset(point)),
+                    Arg::Ptr(tp.peer_flags[point]),
+                    Arg::Int(tp.rank),
+                    Arg::Int(tp.size),
+                ],
+            )?;
             return self.gpu.launch(
                 self.kernels.reduce_add,
                 [batch, 1],
                 &[
                     Arg::Ptr(self.x),
-                    Arg::Ptr(tp.tables[point]),
+                    Arg::Ptr(tp.parts[point]),
+                    Arg::Int(tp.stride),
+                    Arg::Ptr(tp.seq.offset(point)),
+                    Arg::Ptr(tp.flags.offset(point * tp.size)),
+                    Arg::Int(tp.rank),
                     Arg::Int(tp.size),
                     Arg::Int(self.dim),
                 ],
@@ -2391,8 +2423,7 @@ impl CudaBackend {
         assert!(batch <= self.max_batch, "batch larger than the buffers");
         let step = self.upload_step(rows)?;
         self.place_overrides()?;
-        // Recording would capture waits on the other GPUs' events, which it can't.
-        if batch <= MAX_RECORDED_BATCH && self.tp.is_none() {
+        if batch <= MAX_RECORDED_BATCH {
             let key = (
                 batch,
                 step.any_adapter,

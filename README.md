@@ -249,6 +249,25 @@ requests in 8 conversations with 1,500-token system prompts, 32 at a time
 managed 15.3 requests a second with 79% of prompt tokens cached; the router managed 22.7 a second
 with 92% cached, each conversation staying on one server and the requests split evenly.
 
+### Several GPUs
+
+`--tp-size N` splits a model across N NVIDIA GPUs in one machine (tensor parallelism, as SGLang's
+option of the same name does): each holds its share of every layer's attention heads and MLP, and
+after each block they add up their parts. The GPUs pass their parts and signal each other
+directly, through each other's memory, so the CPU isn't involved and steps are still recorded as
+CUDA graphs. It needs GPUs that can reach each other's memory (any pair on the same PCIe switch or
+with NVLink), and so far dense models with 16- or 32-bit weights.
+
+```bash
+tinyllm -m models/Qwen2.5-7B-Instruct --serve --tp-size 2
+```
+
+Qwen2.5-7B on two RTX PRO 4000 Blackwells, over PCIe: 50 tok/s for one request against 37 on one
+GPU, and 1,033 tok/s with 32 at once against 885. Replies match one GPU's at first, but the sums
+come out in a different order, so long 16-bit replies can drift apart (half of 32 128-token
+replies differed); on the same GPUs they're always the same. It also runs models too large for
+one GPU.
+
 ### Reasoning models
 
 Models such as Qwen3, SmolLM3 and DeepSeek-R1 think between `<think>` and `</think>` before they
@@ -816,7 +835,7 @@ missing is breadth, and the last 10–20% of single-stream speed.
 | Vision | yes, many models, with video | Qwen2.5-VL on the CPU, the Apple GPU and NVIDIA GPUs, pictures sent as data. **No URL fetching, no video, no other vision models** |
 | Reward models | yes | **no** |
 | Router across servers | yes: cache-aware, and prefill and decode on separate servers | yes, cache-aware (see [Several servers](#several-servers)). **No separate prefill and decode servers** |
-| One model across GPUs or nodes (tensor, pipeline, expert parallelism) | yes | **no** |
+| One model across GPUs or nodes (tensor, pipeline, expert parallelism) | yes | tensor parallelism across the GPUs of one machine, for dense models (see [Several GPUs](#several-gpus)). **No pipeline or expert parallelism, no multi-node, no quantized or MoE models split yet** |
 | The SGL frontend language (`gen`, `select`, `fork`) | yes | **no** |
 
 Biggest gaps first, the plan is: measuring long prompts against SGLang, draft trees for EAGLE and

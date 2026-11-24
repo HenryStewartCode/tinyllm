@@ -386,9 +386,10 @@ impl Gpu {
 
     /// Start recording. Kernels launched from here on go into the graph instead of running.
     pub fn begin_recording(&self) -> Result<()> {
-        // SAFETY: `stream` is a live stream that isn't being captured already; mode 0 is the
-        // default capture mode.
-        self.check(unsafe { (self.driver.cuStreamBeginCapture_v2)(self.stream, 0) })
+        // SAFETY: `stream` is a live stream that isn't being captured already. Mode 1 (thread
+        // local) only stops this thread doing what can't be recorded, so other GPUs' threads can
+        // carry on meanwhile.
+        self.check(unsafe { (self.driver.cuStreamBeginCapture_v2)(self.stream, 1) })
     }
 
     /// Stop recording, and get a graph that can be replayed.

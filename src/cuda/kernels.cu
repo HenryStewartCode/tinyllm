@@ -1938,15 +1938,53 @@ extern "C" __global__ void copy_rows(const float *x, int dim, float *out, int st
 }
 
 // One block per row: x's row, `cols` floats, as bfloat16 in its place in a tile-layout matrix.
-// One block per row: x += the sum of every GPU's part of a block's output (tensor parallelism),
-// added up in the same order on every GPU so they all keep the same x.
-extern "C" __global__ void reduce_add(float *x, const unsigned long long *parts, int count,
-                                      int dim) {
+// Tensor parallelism: copy this GPU's part of a block's output (`count` floats, a multiple of 4)
+// into every other GPU's copy of it. Writes across the bus don't wait, unlike reads.
+extern "C" __global__ void tp_push(const float4 *part, const unsigned long long *peers, int rank,
+                                   int size, int count) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count / 4)
+        return;
+    const float4 v = part[i];
+    for (int r = 0; r < size; r++)
+        if (r != rank)
+            ((float4 *)peers[r])[i] = v;
+}
+
+// Then, one thread: count this point's step (`seq`), and tell every other GPU, by writing the
+// count into its flags.
+extern "C" __global__ void tp_signal(unsigned *seq, const unsigned long long *peer_flags, int rank,
+                                     int size) {
+    if (threadIdx.x != 0)
+        return;
+    const unsigned next = seq[0] + 1;
+    seq[0] = next;
+    __threadfence_system();
+    for (int r = 0; r < size; r++)
+        if (r != rank)
+            ((volatile unsigned *)peer_flags[r])[rank] = next;
+}
+
+// One block per row: once every other GPU's flag has reached this step's count, x += the sum of
+// every GPU's part (GPU r's at parts + r * stride, all here), added up in the same order on every
+// GPU so they all keep the same x.
+extern "C" __global__ void reduce_add(float *x, const float *parts, size_t stride,
+                                      const unsigned *seq, const unsigned *flags, int rank,
+                                      int count, int dim) {
+    if (threadIdx.x == 0) {
+        const unsigned want = seq[0];
+        for (int r = 0; r < count; r++)
+            if (r != rank)
+                while (((volatile const unsigned *)flags)[r] < want) {
+                }
+    }
+    __syncwarp();
+    __threadfence_system();
     const size_t row = (size_t)blockIdx.x * dim;
     for (int i = threadIdx.x; i < dim; i += WARP) {
         float sum = 0.0f;
         for (int r = 0; r < count; r++)
-            sum += ((const float *)parts[r])[row + i];
+            sum += __ldcg(parts + r * stride + row + i);
         x[row + i] += sum;
     }
 }

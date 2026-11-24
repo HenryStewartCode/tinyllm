@@ -1,6 +1,6 @@
 //! One model split across several GPUs (tensor parallelism).
 
-use super::api::{Event, Gpu};
+use super::api::Gpu;
 use super::{CudaBackend, Options, PADDING_ROWS, TpLink};
 use crate::backend::{Backend, LoadedModel, Logits};
 use crate::model::Row;
@@ -8,7 +8,6 @@ use crate::pool::Pool;
 use crate::safetensors::SafeTensors;
 use anyhow::{Result, ensure};
 use std::path::Path;
-use std::sync::{Arc, Barrier};
 
 /// A model split across several GPUs (tensor parallelism): each holds its share of every layer's
 /// attention heads and MLP, and they add up their outputs after each block. All of them run every
@@ -54,34 +53,44 @@ impl TensorParallel {
         let points = 2 * ranks[0].layers.len();
         let rows = ranks[0].max_batch + PADDING_ROWS;
         let dim = ranks[0].dim;
-        let (mut partials, mut events) = (Vec::new(), vec![None; points * size]);
-        for (r, rank) in ranks.iter().enumerate() {
+        ensure!(
+            dim.is_multiple_of(4),
+            "splitting needs the model's width in multiples of 4"
+        );
+        let stride = rows * dim;
+        // Each GPU's parts, and its counts and flags, all zero to start.
+        let mut own = Vec::new();
+        for rank in &ranks {
             rank.gpu.attach()?;
-            let mut own = Vec::with_capacity(points);
-            for p in 0..points {
-                own.push(rank.gpu.alloc(rows * dim)?);
-                events[p * size + r] = Some(rank.gpu.event()?);
-            }
-            partials.push(own);
+            let parts = (0..points)
+                .map(|_| rank.gpu.alloc(size * stride))
+                .collect::<Result<Vec<_>>>()?;
+            let (seq, flags) = (rank.gpu.alloc(points)?, rank.gpu.alloc(points * size)?);
+            rank.gpu.zero(seq, points)?;
+            rank.gpu.zero(flags, points * size)?;
+            own.push((parts, seq, flags));
         }
-        let events: Arc<Vec<Event>> = Arc::new(events.into_iter().map(Option::unwrap).collect());
-        let barrier = Arc::new(Barrier::new(size));
         for (r, rank) in ranks.iter_mut().enumerate() {
             rank.gpu.attach()?;
-            let mut tables = Vec::with_capacity(points);
+            let (mut peer_parts, mut peer_flags) = (Vec::new(), Vec::new());
             for p in 0..points {
-                let addresses: Vec<u64> = partials.iter().map(|own| own[p].0).collect();
-                let table = rank.gpu.alloc(2 * size)?;
-                rank.gpu.write_now(table, &addresses)?;
-                tables.push(table);
+                let parts: Vec<u64> = (own.iter()).map(|o| o.0[p].offset(r * stride).0).collect();
+                let flags: Vec<u64> = own.iter().map(|o| o.2.offset(p * size).0).collect();
+                for (addresses, into) in [(parts, &mut peer_parts), (flags, &mut peer_flags)] {
+                    let table = rank.gpu.alloc(2 * size)?;
+                    rank.gpu.write_now(table, &addresses)?;
+                    into.push(table);
+                }
             }
             rank.tp = Some(TpLink {
                 rank: r,
                 size,
-                barrier: barrier.clone(),
-                events: events.clone(),
-                partials: partials[r].clone(),
-                tables,
+                parts: own[r].0.clone(),
+                stride,
+                peer_parts,
+                seq: own[r].1,
+                flags: own[r].2,
+                peer_flags,
             });
         }
         ranks[0].gpu.attach()?;
