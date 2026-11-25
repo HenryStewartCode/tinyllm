@@ -318,15 +318,21 @@ through that head's key matrix first, so it scores against the latent directly, 
 blend of latents goes through the head's value matrix afterwards. The CPU keeps the expanded keys
 and values.
 
-The full DeepSeek-V2-Lite is 31 GB, too big for the 16 GB RTX 2000 Ada, so its speed there was
-measured on a model of the same width with random weights and 8 of its 27 layers
-(`scripts/make_random_checkpoint.py`), against SGLang 0.5.23 on the same shape (`--load-format
-dummy`), 128 tokens per request, total tokens per second:
+The full DeepSeek-V2-Lite-Chat (31 GB) and Qwen3-30B-A3B (61 GB) are too big for the 16 GB RTX
+2000 Ada, so they were measured on a B200 against SGLang 0.5.23 (`scripts/load.py`, 128 tokens
+per request, total tokens per second). Greedy replies to six short chat prompts matched SGLang's
+word for word, except one DeepSeek reply that took a different word after about 30 tokens. Here
+the gap with SGLang is wide, mostly at low concurrency: at one request, kernels written for one
+row at a time (attention over the latent cache, the small matrix products, the norms) leave most
+of the B200's 148 multiprocessors idle.
 
-| Concurrent requests | 1 | 4 | 16 | 64 |
+| DeepSeek-V2-Lite-Chat, concurrent requests | 1 | 4 | 16 | 64 |
 |---|---|---|---|---|
-| tinyllm | 96 | 204 | 427 | 1,269 |
-| SGLang | 110 | 223 | 442 | 1,358 |
+| tinyllm | 104 | 385 | 1,247 | 3,820 |
+| SGLang | 328 | 961 | 2,514 | 7,631 |
+
+Qwen3-30B-A3B (thinking off): tinyllm 73, 276, 932 and 2,682 tokens/s at 1, 4, 16 and 64
+requests, SGLang 374, 1,041, 2,916 and 8,414.
 
 ### GPT-OSS
 
@@ -723,11 +729,11 @@ tokens per second:
 
 | Concurrent requests | Qwen2.5-0.5B, tinyllm | Qwen2.5-0.5B, SGLang | Qwen2.5-7B, tinyllm | Qwen2.5-7B, SGLang |
 |---|---|---|---|---|
-| 1 | 448 | 910 | 154 | 313 |
+| 1 | 514 | 910 | 162 | 313 |
 | 4 | 1,728 | 3,368 | 589 | 1,212 |
-| 16 | 6,416 | 4,190 | 2,212 | 4,673 |
+| 16 | 7,314 | 4,190 | 2,324 | 4,673 |
 | 64 | 18,908 | 17,384 | 4,092 | 15,341 |
-| 256 | 25,065 | 55,707 | 4,609 | 32,005 |
+| 256 | 24,698 | 55,707 | 4,415 | 32,005 |
 
 | Qwen3-0.6B, prompt | tinyllm: first token | SGLang: first token | tinyllm: decoding | SGLang: decoding |
 |---|---|---|---|---|
@@ -740,8 +746,11 @@ tensor-core instructions of 2020's GPUs (Blackwell's own are several times faste
 matmul reads tiles straight from memory rather than staging them in shared memory, which only
 pays off while a step has few rows. Splitting each matmul tile's inner dimension over 8 warps
 (the same split for every batch size, so results don't change with the batch) was the first
-fix: one request on Qwen2.5-7B went from 84 to 154 tok/s, and 256 on Qwen2.5-0.5B from 19,600
-to 25,100. The long-prompt rows were measured before it.
+fix: one request on Qwen2.5-7B went from 84 to 162 tok/s, one on Qwen2.5-0.5B from 297 to 514,
+and 256 on Qwen2.5-0.5B from 19,600 to 24,700. The rows for 4 and 64 requests were measured with
+an earlier form of that split (blocks of 4 tiles, 4 tiles in flight per warp, where the final
+form has 1 and 8), which was slightly slower below 256 requests; the long-prompt rows were
+measured before any of it.
 
 These requests set only a temperature. SmolLM2 has no sampling defaults of its own, so its tokens
 are drawn on the GPU. Qwen2.5's generation config adds top-k, top-p and a repetition penalty, so
@@ -905,7 +914,7 @@ missing is breadth, and the last 10–20% of single-stream speed.
 | Reasoning parsers, thinking budgets | yes, for many families | yes, for `<think>` models (Qwen3, SmolLM3, DeepSeek-R1 and others) and GPT-OSS's harmony channels (budgets for `<think>` models only) |
 | Speculative decoding | yes: EAGLE (with draft trees), MTP, draft models, n-grams | EAGLE-3 heads, draft models and n-grams, with replies exactly as without it; EAGLE-3 accepts as many tokens a step as SGLang's with the same head. EAGLE-3 draft trees as branches off the main guesses (`--speculative-eagle-topk`). **No MTP** |
 | LoRA adapters | yes, mixed in batches, loaded and unloaded while running | yes, mixed in batches, chosen by `model` or `lora_path`, loaded and unloaded while running (unloading doesn't free their memory yet) |
-| Architectures | many | Llama-style (Llama, Mistral, Qwen2/3, SmolLM2/3, Phi-3, Granite, Gemma 1–3) and mixtures of experts (Qwen3-MoE, Qwen2-MoE, Mixtral, OLMoE, Granite MoE, GPT-OSS, and DeepSeek V2/V3, with only the latent in the cache on the GPUs: 3–13% behind SGLang on DeepSeek-V2-Lite's shape). GPT-OSS doesn't run on the Apple GPU yet. **No hybrid attention models (Qwen3-Next, Jamba)** |
+| Architectures | many | Llama-style (Llama, Mistral, Qwen2/3, SmolLM2/3, Phi-3, Granite, Gemma 1–3) and mixtures of experts (Qwen3-MoE, Qwen2-MoE, Mixtral, OLMoE, Granite MoE, GPT-OSS, and DeepSeek V2/V3, with only the latent in the cache on the GPUs: on a B200, 2–3.2x behind SGLang on DeepSeek-V2-Lite-Chat and 3.1–5.1x on Qwen3-30B-A3B). GPT-OSS doesn't run on the Apple GPU yet. **No hybrid attention models (Qwen3-Next, Jamba)** |
 | Sliding-window attention, logit soft-capping | yes | yes |
 | Embedding models | yes | yes, with last-token pooling |
 | Rerank models | yes | yes, rerankers that judge with "yes" and "no" (Qwen3-Reranker); **no** cross-encoders with classification heads (BERT-style) |

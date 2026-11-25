@@ -476,16 +476,15 @@ __device__ __forceinline__ void matmul_tiles(const __nv_bfloat16 *w, int m, int 
 // The 16-bit matmul splits each tile's columns of the inner dimension into SPLIT_K contiguous
 // ranges, one warp each, and adds their sums in range order. With few rows (one request), there
 // are otherwise too few warps to keep a large GPU's memory busy. The split doesn't depend on the
-// batch, so neither do the results. A block holds SPLIT_ACROSS(TX) weight tiles by TX input groups
-// by SPLIT_K ranges.
+// batch, so neither do the results. A block is one output tile's SPLIT_K warps, each keeping
+// SPLIT_AHEAD tiles of its range in flight.
 #define SPLIT_K 8
-#define SPLIT_ACROSS(TX) (4 / (TX))
+#define SPLIT_AHEAD 8
 
-template <int TX>
 __device__ __forceinline__ void matmul_split(const __nv_bfloat16 *w, int m, int chunks,
                                              const __nv_bfloat16 *x, int batch, float *out,
                                              const float *bias, int accumulate) {
-    constexpr int ACROSS = SPLIT_ACROSS(TX);
+    constexpr int ACROSS = 1, TX = 1;
     __shared__ float partial[ACROSS * TX][SPLIT_K][TILE_ELEMENTS];
     const int warp = threadIdx.x / WARP, lane = threadIdx.x % WARP;
     const int range = warp % SPLIT_K, pair = warp / SPLIT_K;
@@ -501,18 +500,18 @@ __device__ __forceinline__ void matmul_split(const __nv_bfloat16 *w, int m, int 
         const int begin = min(chunks, range * per), end = min(chunks, begin + per);
         const __nv_bfloat16 *x_tiles = x + (size_t)x_group * chunks * TILE_ELEMENTS;
         const __nv_bfloat16 *w_tiles = w + (size_t)w_group * chunks * TILE_ELEMENTS;
-        wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a[LOAD_AHEAD];
-        wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> b[LOAD_AHEAD];
-        for (int c = begin; c < end; c += LOAD_AHEAD) {
-            const int n = min(LOAD_AHEAD, end - c);
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a[SPLIT_AHEAD];
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> b[SPLIT_AHEAD];
+        for (int c = begin; c < end; c += SPLIT_AHEAD) {
+            const int n = min(SPLIT_AHEAD, end - c);
 #pragma unroll
-            for (int i = 0; i < LOAD_AHEAD; i++)
+            for (int i = 0; i < SPLIT_AHEAD; i++)
                 if (i < n) {
                     wmma::load_matrix_sync(a[i], x_tiles + (size_t)(c + i) * TILE_ELEMENTS, TILE);
                     wmma::load_matrix_sync(b[i], w_tiles + (size_t)(c + i) * TILE_ELEMENTS, TILE);
                 }
 #pragma unroll
-            for (int i = 0; i < LOAD_AHEAD; i++)
+            for (int i = 0; i < SPLIT_AHEAD; i++)
                 if (i < n)
                     wmma::mma_sync(acc, a[i], b[i], acc);
         }
@@ -547,11 +546,9 @@ __device__ __forceinline__ void matmul_split(const __nv_bfloat16 *w, int m, int 
                                                 const __nv_bfloat16 *x, int batch, float *out, \
                                                 const float *bias, int accumulate,             \
                                                 float *scratch) {                              \
-        matmul_split<TX>(w, m, chunks, x, batch, out, bias, accumulate);                       \
+        matmul_split(w, m, chunks, x, batch, out, bias, accumulate);                          \
     }
 MATMUL_BF16(1)
-MATMUL_BF16(2)
-MATMUL_BF16(4)
 
 // ---------------------------------------------------------------------------------------------
 // Mixtures of experts
@@ -697,13 +694,14 @@ MOE_MATMUL(1)
 MOE_MATMUL(2)
 MOE_MATMUL(4)
 
-// One block per row: add up what its experts made of it (plus each expert's down bias, if they
+// One block per row (of 256 threads, so a lone row isn't left to one warp's memory latency): add
+// up what its experts made of it (plus each expert's down bias, if they
 // have them), weighted, in order of expert, and add that to the residual stream.
 extern "C" __global__ void moe_combine(const float *down, int dim, const int *slot_of,
                                        const float *topk_weights, int top_k, float *x,
                                        const int *topk_ids, const float *down_bias) {
     const int row = blockIdx.x;
-    for (int c = threadIdx.x; c < dim; c += WARP) {
+    for (int c = threadIdx.x; c < dim; c += blockDim.x) {
         float sum = 0.0f;
         for (int k = 0; k < top_k; k++) {
             float value = down[(size_t)slot_of[row * top_k + k] * dim + c];
@@ -2016,7 +2014,7 @@ extern "C" __global__ void latent_queries(float *q, int stride, int n_heads, int
     float *queries = q + (size_t)row * stride;
     const float *c = cos_table + (size_t)row * half;
     const float *s = sin_table + (size_t)row * half;
-    for (int t = lane; t < n_heads * half; t += WARP) {
+    for (int t = lane; t < n_heads * half; t += blockDim.x) {
         const int i = t % half;
         float *pair = queries + (t / half) * width + nope + 2 * i;
         const float a = pair[0], b = pair[1];
@@ -2024,7 +2022,7 @@ extern "C" __global__ void latent_queries(float *q, int stride, int n_heads, int
         pair[1] = b * c[i] + a * s[i];
     }
     const int chunks = nope / TILE;
-    for (int t = lane; t < n_heads * nope; t += WARP) {
+    for (int t = lane; t < n_heads * nope; t += blockDim.x) {
         const int head = t / nope, i = t % nope;
         q_nope[head * head_stride + tile_index(row, i, chunks)] =
             __float2bfloat16(queries[head * width + i]);
@@ -2222,7 +2220,7 @@ extern "C" __global__ void __launch_bounds__(LATENT_WARPS *WARP)
 extern "C" __global__ void heads_to_tiles(const float *x, unsigned long long head_stride,
                                           int n_heads, int width, __nv_bfloat16 *out) {
     const int row = blockIdx.x, chunks = n_heads * width / TILE;
-    for (int i = threadIdx.x; i < n_heads * width; i += WARP)
+    for (int i = threadIdx.x; i < n_heads * width; i += blockDim.x)
         out[tile_index(row, i, chunks)] =
             __float2bfloat16(x[(i / width) * head_stride + (size_t)row * width + i % width]);
 }

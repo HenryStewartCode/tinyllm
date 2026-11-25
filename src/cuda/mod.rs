@@ -31,6 +31,9 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::Path;
 
+/// Threads in each block of the kernels that give a whole block to a row's elementwise work.
+const ROW_THREADS: usize = 256;
+
 pub const KERNELS_PTX: &str = include_str!("kernels.ptx");
 
 /// The most tokens read back per row when the rest can't matter. It's plenty for most text, and
@@ -288,8 +291,6 @@ struct Kernels {
     embed_bf16: Kernel,
     rmsnorm_bf16: Kernel,
     matmul_bf16_1: Kernel,
-    matmul_bf16_2: Kernel,
-    matmul_bf16_4: Kernel,
     matmul_i8_1: Kernel,
     matmul_i8_2: Kernel,
     matmul_i8_4: Kernel,
@@ -366,8 +367,6 @@ impl Kernels {
             embed_bf16: gpu.kernel(module, "embed_bf16")?,
             rmsnorm_bf16: gpu.kernel(module, "rmsnorm_bf16")?,
             matmul_bf16_1: gpu.kernel(module, "matmul_bf16_1")?,
-            matmul_bf16_2: gpu.kernel(module, "matmul_bf16_2")?,
-            matmul_bf16_4: gpu.kernel(module, "matmul_bf16_4")?,
             matmul_i8_1: gpu.kernel(module, "matmul_i8_1")?,
             matmul_i8_2: gpu.kernel(module, "matmul_i8_2")?,
             matmul_i8_4: gpu.kernel(module, "matmul_i8_4")?,
@@ -1479,9 +1478,10 @@ impl CudaBackend {
         };
         let angles = layer.rope_table * batch * self.rope_half;
         let (cos, sin) = (step.cos.offset(angles), step.sin.offset(angles));
-        self.gpu.launch(
+        self.gpu.launch_blocks(
             self.kernels.latent_queries,
             [batch, 1],
+            ROW_THREADS,
             &[
                 Arg::Ptr(q),
                 Arg::Int(q_stride),
@@ -1553,9 +1553,10 @@ impl CudaBackend {
             batch,
             buffers.values,
         )?;
-        self.gpu.launch(
+        self.gpu.launch_blocks(
             self.kernels.heads_to_tiles,
             [batch, 1],
+            ROW_THREADS,
             &[
                 Arg::Ptr(buffers.values),
                 Arg::Int(rows * v),
@@ -1929,9 +1930,10 @@ impl CudaBackend {
             (None, Activation::Gelu) => self.gpu.launch(self.kernels.moe_geglu, grid, &common)?,
         }
         self.moe_matmul(experts.down, dim, hidden, slots, moe.gated, moe.down)?;
-        self.gpu.launch(
+        self.gpu.launch_blocks(
             self.kernels.moe_combine,
             [batch, 1],
+            ROW_THREADS,
             &[
                 Arg::Ptr(moe.down),
                 Arg::Int(dim),
@@ -2776,20 +2778,11 @@ fn launch_matmul(
         );
     }
     if precision == Precision::Bf16 {
-        let (kernel, groups) = match batch {
-            1..=16 => (kernels.matmul_bf16_1, 1),
-            17..=32 => (kernels.matmul_bf16_2, 2),
-            _ => (kernels.matmul_bf16_4, 4),
-        };
-        // Weight tiles per block, and warps per tile: `SPLIT_ACROSS` and `SPLIT_K` in kernels.cu.
-        let across = 4 / groups;
+        // One block per output tile, of `SPLIT_K` (8) warps: see `matmul_split` in kernels.cu.
         return gpu.launch_blocks(
-            kernel,
-            [
-                batch.div_ceil(TILE * groups),
-                w.rows.div_ceil(TILE * across),
-            ],
-            32 * across * groups * 8,
+            kernels.matmul_bf16_1,
+            [batch.div_ceil(TILE), w.rows.div_ceil(TILE)],
+            32 * 8,
             &[
                 Arg::Ptr(w.data),
                 Arg::Int(w.rows),
