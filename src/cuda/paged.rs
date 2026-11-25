@@ -55,6 +55,59 @@ impl PageTable {
     }
 }
 
+/// A step's rows grouped into FlashInfer requests. tinyllm gives every token its own row, and a
+/// prompt's rows each see one more slot than the row before; FlashInfer takes those as one
+/// request of several queries under a causal mask. Request `b` is rows
+/// `qo_indptr[b]..qo_indptr[b + 1]`, and its keys and values are its last row's slots. A row
+/// generating a token is a request of one query.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Requests {
+    pub qo_indptr: Vec<i32>,
+}
+
+impl Requests {
+    /// Groups rows, given as their slots, into runs that each extend the row before by one slot.
+    pub fn from_slots(rows: &[&[u32]]) -> Self {
+        let mut qo_indptr = vec![0];
+        for (i, pair) in rows.windows(2).enumerate() {
+            let (a, b) = (pair[0], pair[1]);
+            // Rows of one prompt are slices of the same list, which saves comparing them.
+            let extends = b.len() == a.len() + 1 && (a.as_ptr() == b.as_ptr() || b[..a.len()] == *a);
+            if !extends {
+                qo_indptr.push(i as i32 + 1);
+            }
+        }
+        if !rows.is_empty() {
+            qo_indptr.push(rows.len() as i32);
+        }
+        Requests { qo_indptr }
+    }
+
+    pub fn batch(&self) -> usize {
+        self.qo_indptr.len() - 1
+    }
+
+    /// The row whose slots are request `b`'s whole context.
+    pub fn last_row(&self, b: usize) -> usize {
+        self.qo_indptr[b + 1] as usize - 1
+    }
+
+    /// The requests' page table.
+    pub fn page_table(&self, rows: &[&[u32]], page_size: usize) -> PageTable {
+        PageTable::from_slots((0..self.batch()).map(|b| rows[self.last_row(b)]), page_size)
+    }
+
+    /// Where each row's keys and values go, as FlashInfer's `append_paged_kv_cache` takes them:
+    /// the row's request and its position in that request's sequence.
+    pub fn append_indices(&self, rows: &[&[u32]]) -> (Vec<i32>, Vec<i32>) {
+        let mut batch_indices = Vec::with_capacity(rows.len());
+        for b in 0..self.batch() {
+            batch_indices.extend((self.qo_indptr[b]..self.qo_indptr[b + 1]).map(|_| b as i32));
+        }
+        (batch_indices, rows.iter().map(|slots| slots.len() as i32 - 1).collect())
+    }
+}
+
 /// One launch's plan, with the fields of cute-flashinfer's `decode::Plan`: block `i` takes chunk
 /// `kv_tile_indices[i]` of request `request_indices[i]`, and request `b`'s partial states are
 /// rows `o_indptr[b]..o_indptr[b + 1]`. Requests are numbered within `requests`, which gives each
@@ -119,6 +172,25 @@ mod tests {
     #[should_panic(expected = "isn't one whole page")]
     fn page_table_refuses_a_broken_page() {
         PageTable::from_slots([&[4u32, 6][..]], 4);
+    }
+
+    #[test]
+    fn rows_group_into_requests() {
+        // A three-token prompt after a two-token prefix, a row generating, and a second prompt.
+        let prompt: Vec<u32> = (8..13).collect();
+        let other = [16u32, 17, 18, 19];
+        let rows: Vec<&[u32]> =
+            vec![&prompt[..3], &prompt[..4], &prompt[..5], &[4, 5], &other[..3], &other[..4]];
+        let requests = Requests::from_slots(&rows);
+        assert_eq!(requests.qo_indptr, [0, 3, 4, 6]);
+        assert_eq!((requests.batch(), requests.last_row(0), requests.last_row(2)), (3, 2, 5));
+        let table = requests.page_table(&rows, 4);
+        assert_eq!(table.kv_indices, [2, 3, 1, 4]);
+        assert_eq!(table.kv_last_page_len, [1, 2, 4]);
+        let (batch_indices, positions) = requests.append_indices(&rows);
+        assert_eq!(batch_indices, [0, 0, 0, 1, 2, 2]);
+        assert_eq!(positions, [2, 3, 4, 1, 2, 3]);
+        assert_eq!(Requests::from_slots(&[]).batch(), 0);
     }
 
     #[test]
