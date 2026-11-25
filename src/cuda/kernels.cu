@@ -473,15 +473,81 @@ __device__ __forceinline__ void matmul_tiles(const __nv_bfloat16 *w, int m, int 
     }
 }
 
+// The 16-bit matmul splits each tile's columns of the inner dimension into SPLIT_K contiguous
+// ranges, one warp each, and adds their sums in range order. With few rows (one request), there
+// are otherwise too few warps to keep a large GPU's memory busy. The split doesn't depend on the
+// batch, so neither do the results. A block holds SPLIT_ACROSS(TX) weight tiles by TX input groups
+// by SPLIT_K ranges.
+#define SPLIT_K 8
+#define SPLIT_ACROSS(TX) (4 / (TX))
+
+template <int TX>
+__device__ __forceinline__ void matmul_split(const __nv_bfloat16 *w, int m, int chunks,
+                                             const __nv_bfloat16 *x, int batch, float *out,
+                                             const float *bias, int accumulate) {
+    constexpr int ACROSS = SPLIT_ACROSS(TX);
+    __shared__ float partial[ACROSS * TX][SPLIT_K][TILE_ELEMENTS];
+    const int warp = threadIdx.x / WARP, lane = threadIdx.x % WARP;
+    const int range = warp % SPLIT_K, pair = warp / SPLIT_K;
+    const int x_group = blockIdx.x * TX + pair / ACROSS;
+    const int w_group = blockIdx.y * ACROSS + pair % ACROSS;
+    const int first_row = x_group * TILE, first_column = w_group * TILE;
+    const bool active = first_row < batch && first_column < m;
+
+    if (active) {
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+        wmma::fill_fragment(acc, 0.0f);
+        const int per = (chunks + SPLIT_K - 1) / SPLIT_K;
+        const int begin = min(chunks, range * per), end = min(chunks, begin + per);
+        const __nv_bfloat16 *x_tiles = x + (size_t)x_group * chunks * TILE_ELEMENTS;
+        const __nv_bfloat16 *w_tiles = w + (size_t)w_group * chunks * TILE_ELEMENTS;
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a[LOAD_AHEAD];
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> b[LOAD_AHEAD];
+        for (int c = begin; c < end; c += LOAD_AHEAD) {
+            const int n = min(LOAD_AHEAD, end - c);
+#pragma unroll
+            for (int i = 0; i < LOAD_AHEAD; i++)
+                if (i < n) {
+                    wmma::load_matrix_sync(a[i], x_tiles + (size_t)(c + i) * TILE_ELEMENTS, TILE);
+                    wmma::load_matrix_sync(b[i], w_tiles + (size_t)(c + i) * TILE_ELEMENTS, TILE);
+                }
+#pragma unroll
+            for (int i = 0; i < LOAD_AHEAD; i++)
+                if (i < n)
+                    wmma::mma_sync(acc, a[i], b[i], acc);
+        }
+        wmma::store_matrix_sync(partial[pair][range], acc, TILE, wmma::mem_row_major);
+    }
+    __syncthreads();
+    if (!active)
+        return;
+    // The range's warp writes its share of the tile's elements: the ranges' sums in order, then
+    // what was there (if accumulating) and the bias.
+    for (int i = range * WARP + lane; i < TILE_ELEMENTS; i += SPLIT_K * WARP) {
+        const int row = first_row + i / TILE, column = first_column + i % TILE;
+        if (row >= batch || column >= m)
+            continue;
+        float sum = 0.0f;
+#pragma unroll
+        for (int r = 0; r < SPLIT_K; r++)
+            sum += partial[pair][r][i];
+        float *target = out + (size_t)row * m + column;
+        if (accumulate)
+            sum = *target + sum;
+        if (bias)
+            sum += bias[column];
+        *target = sum;
+    }
+}
+
 // matmul_bf16_TX: out[b][m] = dot(w[m], x[b]) (+ bias[m]), added to what's there if `accumulate`.
-// `scratch` is only used when m isn't a multiple of 16, and then needs room for a 16x16 tile for
-// every tile of the output.
+// `scratch` isn't used.
 #define MATMUL_BF16(TX)                                                                        \
     extern "C" __global__ void matmul_bf16_##TX(const __nv_bfloat16 *w, int m, int chunks,     \
                                                 const __nv_bfloat16 *x, int batch, float *out, \
                                                 const float *bias, int accumulate,             \
                                                 float *scratch) {                              \
-        matmul_tiles<TX>(w, m, chunks, x, batch, out, bias, accumulate, scratch);              \
+        matmul_split<TX>(w, m, chunks, x, batch, out, bias, accumulate);                       \
     }
 MATMUL_BF16(1)
 MATMUL_BF16(2)

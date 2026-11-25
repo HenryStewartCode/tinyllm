@@ -2781,13 +2781,15 @@ fn launch_matmul(
             17..=32 => (kernels.matmul_bf16_2, 2),
             _ => (kernels.matmul_bf16_4, 4),
         };
+        // Weight tiles per block, and warps per tile: `SPLIT_ACROSS` and `SPLIT_K` in kernels.cu.
+        let across = 4 / groups;
         return gpu.launch_blocks(
             kernel,
             [
                 batch.div_ceil(TILE * groups),
-                w.rows.div_ceil(TILE * WARPS_ACROSS),
+                w.rows.div_ceil(TILE * across),
             ],
-            32 * WARPS_ACROSS * groups,
+            32 * across * groups * 8,
             &[
                 Arg::Ptr(w.data),
                 Arg::Int(w.rows),
