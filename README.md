@@ -488,6 +488,10 @@ SGLang's trees can branch anywhere, where tinyllm's branches only split off the 
 checks a tree's tokens once each, where tinyllm works out a branch's rows from the page where it
 splits off again.
 
+The same requests on a B200: tinyllm 149 tok/s without guessing, 195 with 3 ahead and 6 runs, 192
+with 4 ahead and 4 runs (replies identical to plain decoding); SGLang 657 tok/s with 3 steps and
+topk 1, and 492–494 with trees. There, the gap is in tinyllm's kernels rather than its guessing.
+
 ### LoRA adapters
 
 `--lora NAME=PATH` (repeat it for more) loads a LoRA adapter in the PEFT format that Hugging Face
@@ -713,6 +717,31 @@ Both keep the softmax in registers, in the tensor cores' own fragment layouts, a
 page while using this one. Past a few thousand tokens SGLang's attention (FlashInfer) is still
 ahead on prompts: tinyllm folds weights in fixed ranges of pages so results don't depend on the
 batch, and its pages of 16 tokens leave more bookkeeping per multiplication.
+
+On a B200 (180 GB, 148 SMs), against SGLang 0.5.23, with the same client and requests, total
+tokens per second:
+
+| Concurrent requests | Qwen2.5-0.5B, tinyllm | Qwen2.5-0.5B, SGLang | Qwen2.5-7B, tinyllm | Qwen2.5-7B, SGLang |
+|---|---|---|---|---|
+| 1 | 448 | 910 | 154 | 313 |
+| 4 | 1,728 | 3,368 | 589 | 1,212 |
+| 16 | 6,416 | 4,190 | 2,212 | 4,673 |
+| 64 | 18,908 | 17,384 | 4,092 | 15,341 |
+| 256 | 25,065 | 55,707 | 4,609 | 32,005 |
+
+| Qwen3-0.6B, prompt | tinyllm: first token | SGLang: first token | tinyllm: decoding | SGLang: decoding |
+|---|---|---|---|---|
+| 3,100 tokens | 0.10 s | 0.014 s | 165 tok/s | 841 tok/s |
+| 12,300 tokens | 0.66 s | 0.17 s | 88 tok/s | 722 tok/s |
+| 23,100 tokens | 1.9 s | 0.10 s | 55 tok/s | 598 tok/s |
+
+So on a large GPU tinyllm is well behind: its kernels were tuned on a 22-SM card, use the
+tensor-core instructions of 2020's GPUs (Blackwell's own are several times faster), and its
+matmul reads tiles straight from memory rather than staging them in shared memory, which only
+pays off while a step has few rows. Splitting each matmul tile's inner dimension over 8 warps
+(the same split for every batch size, so results don't change with the batch) was the first
+fix: one request on Qwen2.5-7B went from 84 to 154 tok/s, and 256 on Qwen2.5-0.5B from 19,600
+to 25,100. The long-prompt rows were measured before it.
 
 These requests set only a temperature. SmolLM2 has no sampling defaults of its own, so its tokens
 are drawn on the GPU. Qwen2.5's generation config adds top-k, top-p and a repetition penalty, so
