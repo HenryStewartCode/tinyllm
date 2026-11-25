@@ -10,6 +10,7 @@
 //! that the input to each matrix multiplication gets rounded to 16 bits as well.
 
 mod api;
+pub mod paged;
 mod parallel;
 pub use parallel::TensorParallel;
 mod vision;
