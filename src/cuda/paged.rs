@@ -249,6 +249,162 @@ pub fn attention_launches(
     launches
 }
 
+/// One launch of cute-flashinfer's MLA kernel for tinyllm (`mla::tinyllm_kernel`): rows
+/// `first_row..first_row + rows` of a step as FlashInfer requests, each split into tiles of
+/// `tile_q` packed query rows (a row's heads side by side) and chunks of a fixed number of tokens
+/// counted from position 0. Every work item writes partial states; row `r`'s head `h` (index
+/// `r * heads + h`) merges `merge_count` of them, `merge_stride` rows apart from `merge_start`.
+///
+/// A row's chunks, and the order they are merged in, depend only on its own position, so it gets
+/// the same bits in any step.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MlaLaunch {
+    pub first_row: usize,
+    pub rows: usize,
+    /// Cluster `c`'s work items are `work_indptr[c]..work_indptr[c + 1]`.
+    pub work_indptr: Vec<i32>,
+    /// Per work item: `q_indptr` (its request's first row of the step), `kv_indptr`, its first
+    /// partial row, `q_len`, `kv_len`, its first packed row, and its chunk's `kv_start` and
+    /// `kv_end`.
+    pub work: Vec<i32>,
+    pub kv_indices: Vec<i32>,
+    pub merge_start: Vec<i32>,
+    pub merge_count: Vec<i32>,
+    pub merge_stride: Vec<i32>,
+    /// Partial rows the launch uses.
+    pub partial_rows: usize,
+}
+
+/// The MLA launches for a step's rows, given as their slots, with `heads` query heads, `tile_q`
+/// packed rows per tile, `chunk` tokens per chunk, pages of `page_size` slots and `clusters`
+/// lists of work (one per block of the grid): as few launches as keep each one's partial states
+/// within `scratch` rows.
+pub fn mla_launches(
+    rows: &[&[u32]],
+    heads: usize,
+    tile_q: usize,
+    chunk: usize,
+    page_size: usize,
+    scratch: usize,
+    clusters: usize,
+) -> Vec<MlaLaunch> {
+    let requests = Requests::from_slots(rows);
+    let mut launches = Vec::new();
+    let mut current = MlaLaunch::default();
+    let mut items: Vec<[i32; 8]> = Vec::new();
+    let finish = |launch: &mut MlaLaunch,
+                  items: &mut Vec<[i32; 8]>,
+                  launches: &mut Vec<MlaLaunch>,
+                  next: usize| {
+        if launch.rows == 0 {
+            return;
+        }
+        // Each item to the least loaded cluster; which one doesn't change any result.
+        let mut load = std::collections::BinaryHeap::new();
+        for c in 0..clusters {
+            load.push(std::cmp::Reverse((0usize, c)));
+        }
+        let mut lists: Vec<Vec<[i32; 8]>> = vec![Vec::new(); clusters];
+        for item in items.drain(..) {
+            let std::cmp::Reverse((cost, c)) = load.pop().expect("a cluster");
+            lists[c].push(item);
+            load.push(std::cmp::Reverse((
+                cost + 2 * tile_q + (item[7] - item[6]) as usize,
+                c,
+            )));
+        }
+        launch.work_indptr = vec![0];
+        for list in lists {
+            launch.work.extend(list.iter().flatten());
+            launch.work_indptr.push((launch.work.len() / 8) as i32);
+        }
+        launches.push(std::mem::replace(
+            launch,
+            MlaLaunch {
+                first_row: next,
+                ..Default::default()
+            },
+        ));
+    };
+    let chunks_of = |keys: usize| keys.div_ceil(chunk);
+    for b in 0..requests.batch() {
+        let (start, end) = (
+            requests.qo_indptr[b] as usize,
+            requests.qo_indptr[b + 1] as usize,
+        );
+        let mut first = start;
+        while first < end {
+            // As many of the request's rows as surely fit what's left of the scratch.
+            let bound = |last: usize| {
+                ((last + 1 - first) * heads).div_ceil(tile_q) * chunks_of(rows[last].len()) * tile_q
+            };
+            let room = scratch - current.partial_rows;
+            if bound(first) > room {
+                assert!(current.rows > 0, "a row's chunks don't fit the MLA scratch");
+                finish(&mut current, &mut items, &mut launches, first);
+                continue;
+            }
+            let mut last = first;
+            while last + 1 < end && bound(last + 1) <= room {
+                last += 1;
+            }
+            let (q_len, slots) = (last + 1 - first, rows[last]);
+            let kv_len = slots.len();
+            let kv_indptr = current.kv_indices.len() as i32;
+            for (i, page) in slots.chunks(page_size).enumerate() {
+                assert!(
+                    page[0] as usize % page_size == 0
+                        && page
+                            .iter()
+                            .enumerate()
+                            .all(|(j, &s)| s == page[0] + j as u32),
+                    "page {i} of a request isn't one whole page of the pool"
+                );
+                current
+                    .kv_indices
+                    .push((page[0] as usize / page_size) as i32);
+            }
+            let packed = q_len * heads;
+            let tiles = packed.div_ceil(tile_q);
+            let mut tile_base = Vec::with_capacity(tiles);
+            for t in 0..tiles {
+                let last_token = ((t + 1) * tile_q).min(packed).div_ceil(heads) - 1;
+                let chunks = chunks_of(kv_len - q_len + last_token + 1);
+                let base = current.partial_rows;
+                tile_base.push(base);
+                for c in 0..chunks {
+                    items.push([
+                        first as i32,
+                        kv_indptr,
+                        (base + c * tile_q) as i32,
+                        q_len as i32,
+                        kv_len as i32,
+                        (t * tile_q) as i32,
+                        (c * chunk) as i32,
+                        ((c + 1) * chunk).min(kv_len) as i32,
+                    ]);
+                }
+                current.partial_rows += chunks * tile_q;
+            }
+            for i in 0..q_len {
+                let count = chunks_of(kv_len - q_len + i + 1) as i32;
+                for h in 0..heads {
+                    let p = i * heads + h;
+                    current
+                        .merge_start
+                        .push((tile_base[p / tile_q] + p % tile_q) as i32);
+                    current.merge_count.push(count);
+                    current.merge_stride.push(tile_q as i32);
+                }
+            }
+            current.rows += q_len;
+            first = last + 1;
+        }
+    }
+    finish(&mut current, &mut items, &mut launches, rows.len());
+    launches
+}
+
 /// One launch's plan, with the fields of cute-flashinfer's `decode::Plan`: block `i` takes chunk
 /// `kv_tile_indices[i]` of request `request_indices[i]`, and request `b`'s partial states are
 /// rows `o_indptr[b]..o_indptr[b + 1]`. Requests are numbered within `requests`, which gives each
@@ -377,6 +533,50 @@ mod tests {
             assert_eq!(alone, Some((n > 8, n.div_ceil(8) as i32)));
         }
     }
+    #[test]
+    fn mla_launches_merge_each_rows_chunks_in_order() {
+        // A prompt of 40 rows over 1,000 earlier slots, then two rows generating.
+        let prompt: Vec<u32> = (0..1040).collect();
+        let other: Vec<u32> = (2048..2048 + 700).collect();
+        let third: Vec<u32> = (4096..4096 + 33).collect();
+        let mut rows: Vec<&[u32]> = (1001..=1040).map(|n| &prompt[..n]).collect();
+        rows.push(&other);
+        rows.push(&third);
+        let (heads, tile, chunk) = (16, 64, 256);
+        for scratch in [1 << 20, 1024] {
+            let launches = mla_launches(&rows, heads, tile, chunk, 16, scratch, 5);
+            assert_eq!(launches.len() > 1, scratch == 1024);
+            assert_eq!(launches.iter().map(|l| l.rows).sum::<usize>(), rows.len());
+            for launch in &launches {
+                assert!(launch.partial_rows <= scratch);
+                // Which (step row, head, chunk start) each partial row holds.
+                let mut holds = std::collections::HashMap::new();
+                for item in launch.work.chunks(8) {
+                    let (q, q_len, q_start, kv_start) = (item[0], item[3], item[5], item[6]);
+                    for local in 0..tile as i32 {
+                        let packed = q_start + local;
+                        if packed < q_len * heads as i32 {
+                            let key = (q + packed / heads as i32, packed % heads as i32, kv_start);
+                            assert!(holds.insert(item[2] + local, key).is_none());
+                        }
+                    }
+                }
+                for r in 0..launch.rows {
+                    let row = launch.first_row + r;
+                    let chunks = rows[row].len().div_ceil(chunk) as i32;
+                    for h in 0..heads {
+                        let i = r * heads + h;
+                        assert_eq!(launch.merge_count[i], chunks);
+                        for c in 0..chunks {
+                            let p = launch.merge_start[i] + c * launch.merge_stride[i];
+                            assert_eq!(holds[&p], (row as i32, h as i32, c * chunk as i32));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn attention_launches_fit_the_scratch_and_cover_every_row() {
         let pool: Vec<u32> = (0..100).collect();

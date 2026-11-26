@@ -95,6 +95,7 @@ driver_api! {
     cuGraphExecDestroy(Handle);
     cuDeviceGetCount(*mut c_int);
     cuFuncGetAttribute(*mut c_int, c_int, Handle);
+    cuFuncSetAttribute(Handle, c_int, c_int);
     cuCtxEnablePeerAccess(Handle, c_uint);
     cuEventCreate(*mut Handle, c_uint);
     cuEventRecord(Handle, Handle);
@@ -239,6 +240,12 @@ impl Gpu {
         // SAFETY: a live kernel; attribute 0 is CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK.
         self.check(unsafe { (self.driver.cuFuncGetAttribute)(&mut value, 0, kernel.0) })?;
         Ok(value as usize)
+    }
+
+    /// Let `kernel`'s blocks have up to `bytes` of dynamic shared memory (past the default 48 KB).
+    pub fn allow_shared(&self, kernel: Kernel, bytes: usize) -> Result<()> {
+        // SAFETY: a live kernel; attribute 8 is CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES.
+        self.check(unsafe { (self.driver.cuFuncSetAttribute)(kernel.0, 8, bytes as c_int) })
     }
 
     /// Let kernels here read and write `other`'s memory, through the same addresses.

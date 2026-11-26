@@ -14,6 +14,7 @@
 // Matrices are stored row-major: row `b` of a `[batch, dim]` matrix starts at `b * dim`.
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <float.h>
 #include <mma.h>
 #include <stddef.h>
@@ -2160,6 +2161,86 @@ extern "C" __global__ void latent_store(const float *kv, int stride, int rank, i
         pool[tile_index(slot, rank + 2 * i, chunks)] = __float2bfloat16(a * c[i] - b * s[i]);
         pool[tile_index(slot, rank + 2 * i + 1, chunks)] = __float2bfloat16(b * c[i] + a * s[i]);
     }
+}
+
+// latent_store for cute-flashinfer's MLA kernel: the same values, in 16-bit floats, the latents
+// in `ckv` (`[slots, rank]`) and the rotated parts in `kpe` (`[slots, rope]`).
+extern "C" __global__ void latent_store_f16(const float *kv, int stride, int rank, int rope,
+                                            const float *norm, float eps, const float *cos_table,
+                                            const float *sin_table, const int *write_slots,
+                                            __half *ckv, __half *kpe) {
+    const int row = blockIdx.x, lane = threadIdx.x, half = rope / 2;
+    const size_t slot = write_slots[row];
+    const float *from = kv + (size_t)row * stride;
+    float sum = 0;
+    for (int i = lane; i < rank; i += WARP)
+        sum += from[i] * from[i];
+    const float scale = 1.0f / sqrtf(warp_sum(sum) / rank + eps);
+    for (int i = lane; i < rank; i += WARP)
+        ckv[slot * rank + i] = __float2half(__bfloat162float(__float2bfloat16(from[i] * scale * norm[i])));
+    const float *c = cos_table + (size_t)row * half;
+    const float *s = sin_table + (size_t)row * half;
+    for (int i = lane; i < half; i += WARP) {
+        const float a = from[rank + 2 * i], b = from[rank + 2 * i + 1];
+        kpe[slot * rope + 2 * i] = __float2half(a * c[i] - b * s[i]);
+        kpe[slot * rope + 2 * i + 1] = __float2half(b * c[i] + a * s[i]);
+    }
+}
+
+// One block per row: the queries cute-flashinfer's MLA kernel takes, in 16-bit floats, from each
+// head's query through its key matrix (`q_latent`, `[n_heads][rows, rank]`, heads `q_head_stride`
+// apart) and the rotated part of each head's query (`q_rope`, rows `q_stride` apart and heads
+// `head_width` apart): `q_nope [rows, n_heads, rank]` and `q_pe [rows, n_heads, rope]`.
+extern "C" __global__ void mla_queries(const float *q_latent, unsigned long long q_head_stride,
+                                       const float *q_rope, int q_stride, int head_width,
+                                       int n_heads, int rank, int rope, __half *q_nope,
+                                       __half *q_pe) {
+    const size_t row = blockIdx.x;
+    for (int t = threadIdx.x; t < n_heads * rank; t += blockDim.x) {
+        const int head = t / rank, i = t % rank;
+        q_nope[row * n_heads * rank + t] =
+            __float2half(q_latent[head * q_head_stride + row * rank + i]);
+    }
+    for (int t = threadIdx.x; t < n_heads * rope; t += blockDim.x) {
+        const int head = t / rope, i = t % rope;
+        q_pe[row * n_heads * rope + t] =
+            __float2half(q_rope[row * q_stride + (size_t)head * head_width + i]);
+    }
+}
+
+// One block of rank / 8 threads per row and head (grid `[rows, n_heads]`): merge the partial states
+// cute-flashinfer's MLA kernel wrote for the row's chunks, in order, as FlashInfer merges them.
+// Row `r`'s head `h` (index `r * n_heads + h`) has `merge_count` states, `merge_stride` rows of
+// `partial_o` apart from `merge_start`, each with its base-2 log-sum-exp in `partial_lse`. The
+// result goes to `out`, each head's `[rows, rank]` in tile layout, `out_head_stride` apart, for
+// rows `first_row + r`.
+extern "C" __global__ void mla_merge(const __half *partial_o, const float *partial_lse,
+                                     const int *merge_start, const int *merge_count,
+                                     const int *merge_stride, int first_row, int n_heads, int rank,
+                                     __nv_bfloat16 *out, unsigned long long out_head_stride) {
+    const int r = blockIdx.x, head = blockIdx.y, col = threadIdx.x * 8;
+    const int index = r * n_heads + head;
+    const int start = merge_start[index], count = merge_count[index], stride = merge_stride[index];
+    float m = -INFINITY, d = 1.0f, acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    for (int k = 0; k < count; k++) {
+        const size_t p = (size_t)start + (size_t)k * stride;
+        const float l = partial_lse[p];
+        const float m_new = fmaxf(m, l);
+        const float f1 = exp2f(fmaxf(m - m_new, -INFINITY));
+        const float f2 = exp2f(fmaxf(l - m_new, -INFINITY));
+        d = d * f1 + f2;
+        const __half *o = partial_o + p * rank + col;
+#pragma unroll
+        for (int e = 0; e < 8; e++)
+            acc[e] = acc[e] * f1 + __half2float(o[e]) * f2;
+        m = m_new;
+    }
+    const float inverse = d > 0.0f ? 1.0f / d : 0.0f;
+    const int chunks = rank / TILE;
+#pragma unroll
+    for (int e = 0; e < 8; e++)
+        out[head * out_head_stride + tile_index(first_row + r, col + e, chunks)] =
+            __float2bfloat16(acc[e] * inverse);
 }
 
 // The warps of attention_latent, and the most chunks of a cached row (the latent and the rotated

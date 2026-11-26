@@ -43,6 +43,19 @@ pub const LINEAR_Q4_PTX: &str = include_str!("linear_q4.ptx");
 /// cute-flashinfer's attention for tinyllm, one module per head size and GQA group (its
 /// `tinyllm_attention` example), each after a line `// tinyllm module NAME`.
 pub const ATTENTION_PTX: &str = include_str!("attention.ptx");
+/// cute-flashinfer's MLA kernel for tinyllm, one module per head count (its `tinyllm_mla`
+/// example), each after a line `// tinyllm module NAME`.
+pub const MLA_PTX: &str = include_str!("mla.ptx");
+/// Tokens per chunk the MLA kernel splits a sequence's latents into, from position 0.
+const MLA_CHUNK: usize = 512;
+/// Packed query rows per work item of the MLA kernel (`mla::CTA_TILE_Q`).
+const MLA_TILE_Q: usize = 64;
+/// Rows of partial states (one per head and chunk) the MLA kernel has room for.
+const MLA_SCRATCH_ROWS: usize = 1 << 17;
+/// The MLA kernel's dynamic shared memory: 80 rows of 576 16-bit values.
+const MLA_SHARED_BYTES: usize = 80 * 576 * 2;
+/// Blocks of the MLA kernel per multiprocessor, each looping over its list of work.
+const MLA_BLOCKS_PER_SM: usize = 2;
 /// Packed query rows per block of the attention kernel (`tinyllm::CTA_TILE_Q`).
 const FLASH_TILE_Q: usize = 64;
 /// Tokens per chunk the attention kernel splits a sequence's keys into, from position 0. Fixed,
@@ -364,6 +377,9 @@ struct Kernels {
     matmul_heads_4: Kernel,
     latent_queries: Kernel,
     latent_store: Kernel,
+    latent_store_f16: Kernel,
+    mla_queries: Kernel,
+    mla_merge: Kernel,
     attention_latent: Kernel,
     heads_to_tiles: Kernel,
     copy_rows: Kernel,
@@ -439,6 +455,9 @@ impl Kernels {
             matmul_heads_4: gpu.kernel(module, "matmul_heads_4")?,
             latent_queries: gpu.kernel(module, "latent_queries")?,
             latent_store: gpu.kernel(module, "latent_store")?,
+            latent_store_f16: gpu.kernel(module, "latent_store_f16")?,
+            mla_queries: gpu.kernel(module, "mla_queries")?,
+            mla_merge: gpu.kernel(module, "mla_merge")?,
             attention_latent: gpu.kernel(module, "attention_latent")?,
             heads_to_tiles: gpu.kernel(module, "heads_to_tiles")?,
             copy_rows: gpu.kernel(module, "copy_rows")?,
@@ -585,6 +604,7 @@ pub struct CudaBackend {
     scratch: Growing,
     /// cute-flashinfer's attention, for the models it covers.
     flash: Option<Flash>,
+    mla: Option<Mla>,
     step: StepData,
     /// The kernels of a forward pass, recorded once per batch size, then replayed. That saves
     /// a little GPU time per kernel, which only matters when the batch is small.
@@ -1214,6 +1234,39 @@ impl CudaBackend {
             }
         };
 
+        // cute-flashinfer's MLA kernel covers DeepSeek's latents of 512 and rotated parts of 64.
+        // `TINYLLM_MLA=0` keeps tinyllm's own kernel, to compare.
+        let mla = match latent {
+            Some(l)
+                if precision == Precision::Bf16
+                    && l.kv_lora_rank == 512
+                    && l.rope == 64
+                    && matches!(n_heads, 16 | 32 | 64 | 128)
+                    && std::env::var("TINYLLM_MLA").map_or(true, |v| v != "0") =>
+            {
+                let name = format!("tinyllm_mla_h{n_heads}");
+                eprintln!("Latent attention through cute-flashinfer ({name})");
+                let module = gpu.load_kernels(
+                    ptx_module(MLA_PTX, &name).expect("built for every head count"),
+                )?;
+                let kernel = gpu.kernel(&module, &name)?;
+                gpu.allow_shared(kernel, MLA_SHARED_BYTES)?;
+                let padded = rows.next_multiple_of(TILE) * n_heads;
+                Some(Mla {
+                    kernel,
+                    q_nope: gpu.alloc(padded * 512 / 2)?,
+                    q_pe: gpu.alloc(padded * 64 / 2)?,
+                    partial_o: gpu.alloc(MLA_SCRATCH_ROWS * 512 / 2)?,
+                    partial_lse: gpu.alloc(MLA_SCRATCH_ROWS)?,
+                    clusters: MLA_BLOCKS_PER_SM * gpu.multiprocessors(),
+                    plan: Growing::default(),
+                    pages: Growing::default(),
+                    launches: Vec::new(),
+                })
+            }
+            _ => None,
+        };
+
         // The KV cache gets what's left, unless told otherwise.
         let element_bytes = match precision {
             Precision::Bf16 => 2,
@@ -1296,6 +1349,7 @@ impl CudaBackend {
                 eagle,
                 capture: Vec::new(),
                 flash,
+                mla,
                 features_device: Pointer::NULL,
                 features: Vec::new(),
                 logits_device,
@@ -1576,22 +1630,32 @@ impl CudaBackend {
                 Arg::Int(rows * nope),
             ],
         )?;
-        self.gpu.launch(
-            self.kernels.latent_store,
-            [batch, 1],
-            &[
-                Arg::Ptr(self.qkv.offset(q_width)),
-                Arg::Int(stride),
-                Arg::Int(rank),
-                Arg::Int(rope),
-                Arg::Ptr(latent.kv_a_norm),
-                Arg::Float(self.eps),
-                Arg::Ptr(cos),
-                Arg::Ptr(sin),
-                Arg::Ptr(step.write_slots),
-                Arg::Ptr(latent.pool),
-            ],
-        )?;
+        let store = [
+            Arg::Ptr(self.qkv.offset(q_width)),
+            Arg::Int(stride),
+            Arg::Int(rank),
+            Arg::Int(rope),
+            Arg::Ptr(latent.kv_a_norm),
+            Arg::Float(self.eps),
+            Arg::Ptr(cos),
+            Arg::Ptr(sin),
+            Arg::Ptr(step.write_slots),
+        ];
+        // The MLA kernel's cache is the latents `[slots, rank]` and then the rotated parts
+        // `[slots, rope]`, in 16-bit floats.
+        let kpe = latent.pool.offset(self.capacity * rank / 2);
+        match &self.mla {
+            Some(_) => self.gpu.launch(
+                self.kernels.latent_store_f16,
+                [batch, 1],
+                &[&store[..], &[Arg::Ptr(latent.pool), Arg::Ptr(kpe)]].concat(),
+            )?,
+            None => self.gpu.launch(
+                self.kernels.latent_store,
+                [batch, 1],
+                &[&store[..], &[Arg::Ptr(latent.pool)]].concat(),
+            )?,
+        }
         // Each head's query through its key matrix, to score against latents directly.
         self.matmul_heads(
             latent.absorb_k,
@@ -1600,33 +1664,95 @@ impl CudaBackend {
             batch,
             buffers.q_latent,
         )?;
-        let chunks = (rank + rope) / TILE;
-        let tile_bytes = TILE * TILE * 2;
-        let shared = chunks * tile_bytes + LATENT_WARPS * 2 * tile_bytes + tile_bytes + 4 * TILE;
-        self.gpu.launch_with_shared(
-            self.kernels.attention_latent,
-            [batch * n.div_ceil(TILE), 1],
-            32 * LATENT_WARPS,
-            shared,
-            &[
-                Arg::Ptr(buffers.q_latent),
-                Arg::Int(rows * rank),
-                Arg::Ptr(q.offset(nope)),
-                Arg::Int(q_stride),
-                Arg::Int(head_width),
-                Arg::Ptr(latent.pool),
-                Arg::Int(chunks),
-                Arg::Int(rank / TILE),
-                Arg::Ptr(self.slot_list_buffer.data),
-                Arg::Ptr(step.row_offset),
-                Arg::Ptr(step.row_len),
-                Arg::Ptr(step.team_size),
-                Arg::Ptr(buffers.blended),
-                Arg::Int(rows * rank),
-                Arg::Int(n),
-                Arg::Float(self.architecture.attention_scale),
-            ],
-        )?;
+        if let Some(mla) = &self.mla {
+            self.gpu.launch_blocks(
+                self.kernels.mla_queries,
+                [batch, 1],
+                ROW_THREADS,
+                &[
+                    Arg::Ptr(buffers.q_latent),
+                    Arg::Int(rows * rank),
+                    Arg::Ptr(q.offset(nope)),
+                    Arg::Int(q_stride),
+                    Arg::Int(head_width),
+                    Arg::Int(n),
+                    Arg::Int(rank),
+                    Arg::Int(rope),
+                    Arg::Ptr(mla.q_nope),
+                    Arg::Ptr(mla.q_pe),
+                ],
+            )?;
+            for launch in &mla.launches {
+                self.gpu.launch_full(
+                    mla.kernel,
+                    [1, mla.clusters, 1],
+                    [32, 4, 2],
+                    MLA_SHARED_BYTES,
+                    &[
+                        Arg::Ptr(mla.q_nope),
+                        Arg::Ptr(mla.q_pe),
+                        Arg::Ptr(latent.pool),
+                        Arg::Ptr(kpe),
+                        Arg::Ptr(launch.kv_indices),
+                        Arg::Ptr(launch.work_indptr),
+                        Arg::Ptr(launch.work),
+                        Arg::Ptr(Pointer::NULL),
+                        Arg::Ptr(Pointer::NULL),
+                        Arg::Ptr(Pointer::NULL),
+                        Arg::Ptr(mla.partial_o),
+                        Arg::Ptr(mla.partial_lse),
+                        Arg::Ptr(Pointer::NULL),
+                        Arg::Float(self.architecture.attention_scale * std::f32::consts::LOG2_E),
+                    ],
+                )?;
+                self.gpu.launch_blocks(
+                    self.kernels.mla_merge,
+                    [launch.rows, n],
+                    rank / 8,
+                    &[
+                        Arg::Ptr(mla.partial_o),
+                        Arg::Ptr(mla.partial_lse),
+                        Arg::Ptr(launch.merge_start),
+                        Arg::Ptr(launch.merge_count),
+                        Arg::Ptr(launch.merge_stride),
+                        Arg::Int(launch.first_row),
+                        Arg::Int(n),
+                        Arg::Int(rank),
+                        Arg::Ptr(buffers.blended),
+                        Arg::Int(rows * rank),
+                    ],
+                )?;
+            }
+        } else {
+            let chunks = (rank + rope) / TILE;
+            let tile_bytes = TILE * TILE * 2;
+            let shared =
+                chunks * tile_bytes + LATENT_WARPS * 2 * tile_bytes + tile_bytes + 4 * TILE;
+            self.gpu.launch_with_shared(
+                self.kernels.attention_latent,
+                [batch * n.div_ceil(TILE), 1],
+                32 * LATENT_WARPS,
+                shared,
+                &[
+                    Arg::Ptr(buffers.q_latent),
+                    Arg::Int(rows * rank),
+                    Arg::Ptr(q.offset(nope)),
+                    Arg::Int(q_stride),
+                    Arg::Int(head_width),
+                    Arg::Ptr(latent.pool),
+                    Arg::Int(chunks),
+                    Arg::Int(rank / TILE),
+                    Arg::Ptr(self.slot_list_buffer.data),
+                    Arg::Ptr(step.row_offset),
+                    Arg::Ptr(step.row_len),
+                    Arg::Ptr(step.team_size),
+                    Arg::Ptr(buffers.blended),
+                    Arg::Int(rows * rank),
+                    Arg::Int(n),
+                    Arg::Float(self.architecture.attention_scale),
+                ],
+            )?;
+        }
         // Each head's blend of latents through its value matrix, gathered for o_proj.
         self.matmul_heads(
             latent.absorb_v,
@@ -2363,8 +2489,80 @@ impl CudaBackend {
         Ok(())
     }
 
+    /// Upload the MLA kernel's plans for this step (see `paged::mla_launches`).
+    fn upload_mla_plan(&mut self, rows: &[Row]) -> Result<()> {
+        let Some(mla) = &mut self.mla else {
+            return Ok(());
+        };
+        let slots: Vec<&[u32]> = rows.iter().map(|row| row.slots).collect();
+        let plans = paged::mla_launches(
+            &slots,
+            self.n_heads,
+            MLA_TILE_Q,
+            MLA_CHUNK,
+            TILE,
+            MLA_SCRATCH_ROWS,
+            mla.clusters,
+        );
+        // Fixed-size arrays first, so a launch's places depend only on its rows.
+        let (mut data, mut pages): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
+        let mut regions = Vec::new();
+        // The kernel reads each work item (8 words) with 16-byte loads.
+        let aligned = |n: usize| n.next_multiple_of(8);
+        for plan in &plans {
+            data.resize(aligned(data.len()), 0);
+            let at = data.len();
+            for part in [
+                &plan.work_indptr,
+                &plan.merge_start,
+                &plan.merge_count,
+                &plan.merge_stride,
+            ] {
+                data.extend(part.iter().map(|&v| v as u32));
+            }
+            data.resize(aligned(data.len()), 0);
+            data.extend(plan.work.iter().map(|&v| v as u32));
+            let page_at = pages.len();
+            pages.extend(plan.kv_indices.iter().map(|&v| v as u32));
+            regions.push((plan.first_row, plan.rows, at, page_at));
+        }
+        let grown = mla.plan.reserve(&self.gpu, data.len())?;
+        let grown = mla.pages.reserve(&self.gpu, pages.len().max(1))? || grown;
+        if grown {
+            // Recorded kernels hold on to the old addresses.
+            for (_, graph) in self.graphs.drain() {
+                self.gpu.destroy_graph(graph)?;
+            }
+        }
+        self.gpu.write(mla.plan.data, &data)?;
+        if !pages.is_empty() {
+            self.gpu.write(mla.pages.data, &pages)?;
+        }
+        let (base, page_base, clusters, heads) =
+            (mla.plan.data, mla.pages.data, mla.clusters, self.n_heads);
+        mla.launches = regions
+            .into_iter()
+            .map(|(first_row, rows, at, page_at)| {
+                let merge = rows * heads;
+                let at = |i: usize| base.offset(at + i);
+                MlaLaunch {
+                    first_row,
+                    rows,
+                    work_indptr: at(0),
+                    merge_start: at(clusters + 1),
+                    merge_count: at(clusters + 1 + merge),
+                    merge_stride: at(clusters + 1 + 2 * merge),
+                    work: at((clusters + 1 + 3 * merge).next_multiple_of(8)),
+                    kv_indices: page_base.offset(page_at),
+                }
+            })
+            .collect();
+        Ok(())
+    }
+
     fn upload_step(&mut self, rows: &[Row]) -> Result<StepPointers> {
         self.upload_flash_plan(rows)?;
+        self.upload_mla_plan(rows)?;
         let batch = rows.len();
         let half = self.rope_half;
         let prefill_kernel = self.prefill_kernel();
@@ -2759,7 +2957,8 @@ impl CudaBackend {
         assert!(batch <= self.max_batch, "batch larger than the buffers");
         let step = self.upload_step(rows)?;
         self.place_overrides()?;
-        let one_launch = self.flash.as_ref().is_none_or(|f| f.launches.len() <= 1);
+        let one_launch = self.flash.as_ref().is_none_or(|f| f.launches.len() <= 1)
+            && self.mla.as_ref().is_none_or(|m| m.launches.len() <= 1);
         if batch <= MAX_RECORDED_BATCH && one_launch {
             let key = (
                 batch,
@@ -2971,12 +3170,48 @@ struct FlashLaunch {
 
 /// The PTX of cute-flashinfer's attention module `name`, from `ATTENTION_PTX`.
 fn attention_module(name: &str) -> Option<&'static str> {
+    ptx_module(ATTENTION_PTX, name)
+}
+
+/// Module `name` of `ptx`, a file of modules each after a line `// tinyllm module NAME`.
+fn ptx_module(ptx: &'static str, name: &str) -> Option<&'static str> {
     let marker = format!("// tinyllm module {name}\n");
-    let start = ATTENTION_PTX.find(&marker)? + marker.len();
-    let end = ATTENTION_PTX[start..]
+    let start = ptx.find(&marker)? + marker.len();
+    let end = ptx[start..]
         .find("// tinyllm module ")
-        .map_or(ATTENTION_PTX.len(), |i| start + i);
-    Some(&ATTENTION_PTX[start..end])
+        .map_or(ptx.len(), |i| start + i);
+    Some(&ptx[start..end])
+}
+
+/// cute-flashinfer's MLA kernel (see `MLA_PTX`) and its buffers.
+struct Mla {
+    kernel: Kernel,
+    /// Each row's queries in 16-bit floats, `[rows, n_heads, 512]` and `[rows, n_heads, 64]`.
+    q_nope: Pointer,
+    q_pe: Pointer,
+    /// Partial states: outputs `[MLA_SCRATCH_ROWS, 512]` in 16-bit floats, and their base-2
+    /// log-sum-exps.
+    partial_o: Pointer,
+    partial_lse: Pointer,
+    /// Blocks in the kernel's grid, each with a list of work.
+    clusters: usize,
+    /// The launches' plans and their page lists, which start at fixed places in a buffer each,
+    /// so that a recorded step finds them for any rows of the same size.
+    plan: Growing,
+    pages: Growing,
+    launches: Vec<MlaLaunch>,
+}
+
+/// One launch of the MLA kernel in this step: where its plan's arrays are.
+struct MlaLaunch {
+    first_row: usize,
+    rows: usize,
+    work_indptr: Pointer,
+    work: Pointer,
+    kv_indices: Pointer,
+    merge_start: Pointer,
+    merge_count: Pointer,
+    merge_stride: Pointer,
 }
 
 struct StepPointers {
