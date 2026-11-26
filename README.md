@@ -715,14 +715,20 @@ SGLang 0.5.23 on the same GPU): time to the first token, then the speed of the 6
 
 | Prompt | tinyllm: first token | SGLang: first token | tinyllm: decoding | SGLang: decoding |
 |---|---|---|---|---|
-| 3,100 tokens | 0.29 s | 0.47 s | 108 tok/s | 127 tok/s |
-| 12,300 tokens | 1.8 s | 1.3 s | 67 tok/s | 77 tok/s |
-| 23,100 tokens | 4.9 s | 2.5 s | 47 tok/s | 53 tok/s |
+| 3,100 tokens | 0.24 s | 0.47 s | 110 tok/s | 127 tok/s |
+| 12,300 tokens | 1.4 s | 1.3 s | 71 tok/s | 77 tok/s |
+| 23,100 tokens | 3.6 s | 2.5 s | 50 tok/s | 53 tok/s |
 
-Both keep the softmax in registers, in the tensor cores' own fragment layouts, and load the next
-page while using this one. Past a few thousand tokens SGLang's attention (FlashInfer) is still
-ahead on prompts: tinyllm folds weights in fixed ranges of pages so results don't depend on the
-batch, and its pages of 16 tokens leave more bookkeeping per multiplication.
+Attention now goes through cute-rs's port of FlashInfer's prefill kernel (cute-flashinfer's
+`tinyllm` module, checked in here as `src/cuda/attention.ptx`), reading tinyllm's KV cache in
+place, for every row of a step: prompts, rows checking speculative guesses and generation alike.
+What FlashInfer chooses per batch is fixed instead, so a row's result doesn't depend on what else
+is in its step: one tile shape (64 packed query rows), and keys always split into chunks of 2,048
+tokens counted from position 0, each chunk's partial result merged by tinyllm in order (chunks
+past a row's causal reach are skipped). Speculative replies stay identical to plain decoding.
+Models it doesn't cover yet (sliding windows, soft-capping, attention sinks, latent attention,
+32-bit) keep tinyllm's own kernels, and `TINYLLM_FLASHINFER=0` selects those for any model. Before
+it, the 23,100-token prompt took 4.8 s and decoding after it ran at 47 tok/s.
 
 On a B200 (180 GB, 148 SMs), against SGLang 0.5.23, with the same client and requests, total
 tokens per second:

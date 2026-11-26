@@ -1132,6 +1132,41 @@ extern "C" __global__ void rope_store_bf16(float *qkv, int stride, const float *
         v_pool[tile_index(slot, i, kv_chunks)] = __float2bfloat16(values[i]);
 }
 
+// For cute-flashinfer's attention (src/cuda/attention.ptx): each row's rotated queries from
+// `qkv`, as bfloat16 rows of `q_dim`.
+extern "C" __global__ void queries_bf16(const float *qkv, int stride, __nv_bfloat16 *q, int q_dim) {
+    const float *from = qkv + (size_t)blockIdx.x * stride;
+    __nv_bfloat16 *to = q + (size_t)blockIdx.x * q_dim;
+    for (int i = threadIdx.x; i < q_dim; i += blockDim.x)
+        to[i] = __float2bfloat16(from[i]);
+}
+
+// Merge the attention kernel's partial states for row `first_row + blockIdx.x`, head
+// `blockIdx.y` (one thread per element of the head): scratch rows `start[r] .. start[r] +
+// count[r]`, in order, each a normalised output and its base-2 log-sum-exp. Chunks past the
+// row's causal reach have lse -inf (and no meaningful output) and are skipped, so a row's
+// result doesn't depend on how many such chunks its step gave it. The result goes to `out`
+// in tile layout, `q_chunks` chunks wide.
+extern "C" __global__ void merge_chunks(const float *tmp_o, const float *tmp_lse, const int *start,
+                                        const int *count, int first_row, int n_heads,
+                                        int head_dim, __nv_bfloat16 *out, int q_chunks) {
+    const int r = blockIdx.x, head = blockIdx.y, d = threadIdx.x;
+    const int first = start[r], n = count[r];
+    float m = -INFINITY;
+    for (int k = 0; k < n; k++)
+        m = fmaxf(m, tmp_lse[(size_t)(first + k) * n_heads + head]);
+    float sum = 0.0f, total = 0.0f;
+    for (int k = 0; k < n; k++) {
+        const float lse = tmp_lse[(size_t)(first + k) * n_heads + head];
+        if (!(lse > -INFINITY)) // -inf, or NaN to be safe
+            continue;
+        const float w = exp2f(lse - m);
+        sum += w;
+        total += w * tmp_o[((size_t)(first + k) * n_heads + head) * head_dim + d];
+    }
+    out[tile_index(first_row + r, head * head_dim + d, q_chunks)] = __float2bfloat16(total / sum);
+}
+
 typedef wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> TileA;
 typedef wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> TileBColumns;
 typedef wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> TileBRows;

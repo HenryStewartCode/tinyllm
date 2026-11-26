@@ -496,7 +496,19 @@ impl Gpu {
         shared_bytes: usize,
         args: &[Arg],
     ) -> Result<()> {
-        const MAX_ARGS: usize = 20;
+        self.launch_full(kernel, grid, [threads, 1, 1], shared_bytes, args)
+    }
+
+    /// Launch `kernel` over a grid of blocks with three-dimensional blocks of threads.
+    pub fn launch_full(
+        &self,
+        kernel: Kernel,
+        grid: [usize; 3],
+        block: [usize; 3],
+        shared_bytes: usize,
+        args: &[Arg],
+    ) -> Result<()> {
+        const MAX_ARGS: usize = 32;
         assert!(args.len() <= MAX_ARGS, "too many kernel arguments");
         let mut values = [0u64; MAX_ARGS];
         let mut pointers = [std::ptr::null_mut::<c_void>(); MAX_ARGS];
@@ -516,9 +528,9 @@ impl Gpu {
                 grid[0] as c_uint,
                 grid[1] as c_uint,
                 grid[2] as c_uint,
-                threads as c_uint,
-                1,
-                1,
+                block[0] as c_uint,
+                block[1] as c_uint,
+                block[2] as c_uint,
                 shared_bytes as c_uint,
                 self.stream,
                 pointers.as_mut_ptr(),

@@ -38,6 +38,19 @@ pub const KERNELS_PTX: &str = include_str!("kernels.ptx");
 /// The 16-bit linear layer for steps with many rows, from cute-rs (its `tinyllm_linear` example,
 /// `cargo run --release --example tinyllm_linear -- linear.ptx`).
 pub const LINEAR_PTX: &str = include_str!("linear.ptx");
+/// cute-flashinfer's attention for tinyllm, one module per head size and GQA group (its
+/// `tinyllm_attention` example), each after a line `// tinyllm module NAME`.
+pub const ATTENTION_PTX: &str = include_str!("attention.ptx");
+/// Packed query rows per block of the attention kernel (`tinyllm::CTA_TILE_Q`).
+const FLASH_TILE_Q: usize = 64;
+/// Tokens per chunk the attention kernel splits a sequence's keys into, from position 0. Fixed,
+/// so a row's result doesn't depend on its step.
+const FLASH_CHUNK: usize = 2048;
+/// Rows of partial states the attention kernel has room for; a step that needs more is split
+/// into several launches.
+const FLASH_SCRATCH_ROWS: usize = 8192;
+/// Blocks per multiprocessor of the attention kernel, which loop over the plan's work.
+const FLASH_BLOCKS_PER_SM: usize = 4;
 /// Rows and output columns per block of `tinyllm_linear` (its `BM` and `BN`); its K tiles are 32
 /// wide. Tile-layout inputs are padded to a whole number of `LINEAR_ROWS` rows, which it reads.
 const LINEAR_ROWS: usize = 128;
@@ -308,6 +321,8 @@ struct Kernels {
     matmul_bf16_2: Kernel,
     matmul_bf16_4: Kernel,
     linear: Kernel,
+    queries_bf16: Kernel,
+    merge_chunks: Kernel,
     matmul_i8_1: Kernel,
     matmul_i8_2: Kernel,
     matmul_i8_4: Kernel,
@@ -387,6 +402,8 @@ impl Kernels {
             matmul_bf16_2: gpu.kernel(module, "matmul_bf16_2")?,
             matmul_bf16_4: gpu.kernel(module, "matmul_bf16_4")?,
             linear: gpu.kernel(&gpu.load_kernels(LINEAR_PTX)?, "tinyllm_linear")?,
+            queries_bf16: gpu.kernel(module, "queries_bf16")?,
+            merge_chunks: gpu.kernel(module, "merge_chunks")?,
             matmul_i8_1: gpu.kernel(module, "matmul_i8_1")?,
             matmul_i8_2: gpu.kernel(module, "matmul_i8_2")?,
             matmul_i8_4: gpu.kernel(module, "matmul_i8_4")?,
@@ -562,6 +579,8 @@ pub struct CudaBackend {
 
     slot_list_buffer: Growing,
     scratch: Growing,
+    /// cute-flashinfer's attention, for the models it covers.
+    flash: Option<Flash>,
     step: StepData,
     /// The kernels of a forward pass, recorded once per batch size, then replayed. That saves
     /// a little GPU time per kernel, which only matters when the batch is small.
@@ -1156,6 +1175,41 @@ impl CudaBackend {
             None => None,
         };
 
+        // cute-flashinfer's attention covers 16-bit models with plain causal attention.
+        // `TINYLLM_FLASHINFER=0` keeps tinyllm's own kernels, to compare.
+        let group = n_heads / n_kv_heads.max(1);
+        let flash = match precision == Precision::Bf16
+            && latent.is_none()
+            && architecture.attention_softcap == 0.0
+            && layers
+                .iter()
+                .all(|l| l.window == i32::MAX as usize && l.sinks == Pointer::NULL)
+            && matches!(head_dim, 64 | 128 | 256)
+            && n_heads % n_kv_heads.max(1) == 0
+            && (1..=8).contains(&group)
+            && std::env::var("TINYLLM_FLASHINFER").map_or(true, |v| v != "0")
+        {
+            false => None,
+            true => {
+                let name = format!("tinyllm_attention_hd{head_dim}_g{group}");
+                eprintln!("Attention through cute-flashinfer ({name})");
+                let module =
+                    gpu.load_kernels(attention_module(&name).expect("built for every group"))?;
+                let q_dim = n_heads * head_dim;
+                Some(Flash {
+                    kernel: gpu.kernel(&module, &name)?,
+                    block: [32, 4, 1],
+                    group,
+                    queries: gpu.alloc((rows.next_multiple_of(TILE) * q_dim).div_ceil(2))?,
+                    tmp_o: gpu.alloc(FLASH_SCRATCH_ROWS * q_dim)?,
+                    tmp_lse: gpu.alloc(FLASH_SCRATCH_ROWS * n_heads)?,
+                    lse: gpu.alloc(rows.next_multiple_of(TILE) * n_heads)?,
+                    plan: Growing::default(),
+                    launches: Vec::new(),
+                })
+            }
+        };
+
         // The KV cache gets what's left, unless told otherwise.
         let element_bytes = match precision {
             Precision::Bf16 => 2,
@@ -1237,6 +1291,7 @@ impl CudaBackend {
                 latent_buffers,
                 eagle,
                 capture: Vec::new(),
+                flash,
                 features_device: Pointer::NULL,
                 features: Vec::new(),
                 logits_device,
@@ -1356,6 +1411,9 @@ impl CudaBackend {
 
     /// Queue the attention step, which leaves its result in `attn_out`.
     fn attention(&self, layer: &Layer, batch: usize, step: &StepPointers) -> Result<()> {
+        if let Some(flash) = &self.flash {
+            return self.flash_attention(flash, layer, batch);
+        }
         let head_dim = self.head_dim;
         let q_dim = self.n_heads * head_dim;
         let kv_dim = self.n_kv_heads * head_dim;
@@ -2138,7 +2196,171 @@ impl CudaBackend {
 
     /// Work out and queue the uploads that describe this batch.
     /// Returns pointers to the arrays inside the step buffer.
+    /// Plan the attention kernel's launches for this step's rows and send the plans. Each launch's
+    /// arrays have room for its rows' worst case, so with one launch they are at the same place
+    /// for a given number of rows, as recorded steps need.
+    fn upload_flash_plan(&mut self, rows: &[Row]) -> Result<()> {
+        let Some(flash) = &mut self.flash else {
+            return Ok(());
+        };
+        let slots: Vec<&[u32]> = rows.iter().map(|row| row.slots).collect();
+        let plans = paged::attention_launches(
+            &slots,
+            flash.group,
+            FLASH_TILE_Q,
+            FLASH_CHUNK,
+            TILE,
+            FLASH_SCRATCH_ROWS,
+        );
+        let max_chunks = self.capacity.div_ceil(FLASH_CHUNK);
+        let mut data: Vec<u32> = Vec::new();
+        let mut regions = Vec::new();
+        for plan in &plans {
+            let n = plan.rows;
+            let ctas = (n + (n * flash.group).div_ceil(FLASH_TILE_Q)) * max_chunks;
+            let mut put = |values: &[i32], room: usize| {
+                let at = data.len();
+                data.extend(values.iter().map(|&v| v as u32));
+                data.resize(at + room, 0);
+                at
+            };
+            let num_ctas = put(&[plan.request_indices.len() as i32], 1);
+            let qo_indptr = put(&plan.qo_indptr, n + 1);
+            let kv_indptr = put(&plan.table.kv_indptr, n + 1);
+            let kv_last_page_len = put(&plan.table.kv_last_page_len, n);
+            let o_indptr = put(&plan.o_indptr, n + 1);
+            let merge_start = put(&plan.merge_start, n);
+            let merge_count = put(&plan.merge_count, n);
+            let request_indices = put(&plan.request_indices, ctas);
+            let qo_tile_indices = put(&plan.qo_tile_indices, ctas);
+            let kv_tile_indices = put(&plan.kv_tile_indices, ctas);
+            let kv_indices = put(&plan.table.kv_indices, plan.table.kv_indices.len());
+            regions.push((
+                plan.first_row,
+                n,
+                [
+                    num_ctas,
+                    qo_indptr,
+                    kv_indptr,
+                    kv_indices,
+                    kv_last_page_len,
+                    request_indices,
+                    qo_tile_indices,
+                    kv_tile_indices,
+                    o_indptr,
+                    merge_start,
+                    merge_count,
+                ],
+            ));
+        }
+        if flash.plan.reserve(&self.gpu, data.len())? {
+            // Recorded kernels hold on to the old addresses.
+            for (_, graph) in self.graphs.drain() {
+                self.gpu.destroy_graph(graph)?;
+            }
+        }
+        self.gpu.write(flash.plan.data, &data)?;
+        let base = flash.plan.data;
+        flash.launches = regions
+            .into_iter()
+            .map(|(first_row, rows, at)| {
+                let p = |i: usize| base.offset(at[i]);
+                FlashLaunch {
+                    first_row,
+                    rows,
+                    num_ctas: p(0),
+                    qo_indptr: p(1),
+                    kv_indptr: p(2),
+                    kv_indices: p(3),
+                    kv_last_page_len: p(4),
+                    request_indices: p(5),
+                    qo_tile_indices: p(6),
+                    kv_tile_indices: p(7),
+                    o_indptr: p(8),
+                    merge_start: p(9),
+                    merge_count: p(10),
+                }
+            })
+            .collect();
+        Ok(())
+    }
+
+    /// Queue attention through cute-flashinfer's kernel: queries to bfloat16, then each
+    /// launch's partial states and their merge into `attn_out`.
+    fn flash_attention(&self, flash: &Flash, layer: &Layer, batch: usize) -> Result<()> {
+        let head_dim = self.head_dim;
+        let q_dim = self.n_heads * head_dim;
+        let stride = q_dim + 2 * self.n_kv_heads * head_dim;
+        let scale = self.architecture.attention_scale;
+        self.gpu.launch_blocks(
+            self.kernels.queries_bf16,
+            [batch, 1],
+            128,
+            &[
+                Arg::Ptr(self.qkv),
+                Arg::Int(stride),
+                Arg::Ptr(flash.queries),
+                Arg::Int(q_dim),
+            ],
+        )?;
+        let blocks = FLASH_BLOCKS_PER_SM * self.gpu.multiprocessors();
+        for launch in &flash.launches {
+            self.gpu.launch_full(
+                flash.kernel,
+                [blocks, self.n_kv_heads, 1],
+                flash.block,
+                0,
+                &[
+                    Arg::Ptr(flash.queries),
+                    Arg::Ptr(layer.k_pool),
+                    Arg::Ptr(layer.v_pool),
+                    Arg::Ptr(launch.qo_indptr),
+                    Arg::Ptr(launch.kv_indptr),
+                    Arg::Ptr(launch.kv_indices),
+                    Arg::Ptr(launch.kv_last_page_len),
+                    Arg::Ptr(launch.request_indices),
+                    Arg::Ptr(launch.qo_tile_indices),
+                    Arg::Ptr(launch.kv_tile_indices),
+                    Arg::Ptr(launch.o_indptr),
+                    Arg::Ptr(self.attn_out),
+                    Arg::Ptr(flash.lse),
+                    Arg::Ptr(flash.tmp_o),
+                    Arg::Ptr(flash.tmp_lse),
+                    Arg::Ptr(launch.merge_start),
+                    Arg::Int(self.n_kv_heads),
+                    Arg::Float(scale * std::f32::consts::LOG2_E),
+                    Arg::Int(FLASH_CHUNK),
+                    Arg::Float(scale),
+                    Arg::Int(u32::MAX as usize),
+                    Arg::Ptr(Pointer::NULL),
+                    Arg::Ptr(Pointer::NULL),
+                    Arg::Ptr(Pointer::NULL),
+                    Arg::Float(1.0),
+                    Arg::Ptr(launch.num_ctas),
+                ],
+            )?;
+            self.gpu.launch_blocks(
+                self.kernels.merge_chunks,
+                [launch.rows, self.n_heads],
+                head_dim,
+                &[
+                    Arg::Ptr(flash.tmp_o),
+                    Arg::Ptr(flash.tmp_lse),
+                    Arg::Ptr(launch.merge_start),
+                    Arg::Ptr(launch.merge_count),
+                    Arg::Int(launch.first_row),
+                    Arg::Int(self.n_heads),
+                    Arg::Int(head_dim),
+                    Arg::Ptr(self.attn_out),
+                    Arg::Int(q_dim.div_ceil(TILE)),
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
     fn upload_step(&mut self, rows: &[Row]) -> Result<StepPointers> {
+        self.upload_flash_plan(rows)?;
         let batch = rows.len();
         let half = self.rope_half;
         let prefill_kernel = self.prefill_kernel();
@@ -2533,7 +2755,8 @@ impl CudaBackend {
         assert!(batch <= self.max_batch, "batch larger than the buffers");
         let step = self.upload_step(rows)?;
         self.place_overrides()?;
-        if batch <= MAX_RECORDED_BATCH {
+        let one_launch = self.flash.as_ref().is_none_or(|f| f.launches.len() <= 1);
+        if batch <= MAX_RECORDED_BATCH && one_launch {
             let key = (
                 batch,
                 step.any_adapter,
@@ -2706,6 +2929,50 @@ impl CudaBackend {
         }
         Ok(())
     }
+}
+
+/// cute-flashinfer's attention (see `ATTENTION_PTX`) and its buffers.
+struct Flash {
+    kernel: Kernel,
+    /// Threads per block, in three dimensions.
+    block: [usize; 3],
+    group: usize,
+    /// Each row's queries in bfloat16, `[rows, n_heads * head_dim]`.
+    queries: Pointer,
+    /// Partial states: outputs `[FLASH_SCRATCH_ROWS, n_heads, head_dim]` and their log-sum-exps.
+    tmp_o: Pointer,
+    tmp_lse: Pointer,
+    /// What the kernel writes as the final log-sum-exp; not read.
+    lse: Pointer,
+    plan: Growing,
+    launches: Vec<FlashLaunch>,
+}
+
+/// One launch of the attention kernel in this step: where its plan's arrays are.
+struct FlashLaunch {
+    first_row: usize,
+    rows: usize,
+    num_ctas: Pointer,
+    qo_indptr: Pointer,
+    kv_indptr: Pointer,
+    kv_indices: Pointer,
+    kv_last_page_len: Pointer,
+    request_indices: Pointer,
+    qo_tile_indices: Pointer,
+    kv_tile_indices: Pointer,
+    o_indptr: Pointer,
+    merge_start: Pointer,
+    merge_count: Pointer,
+}
+
+/// The PTX of cute-flashinfer's attention module `name`, from `ATTENTION_PTX`.
+fn attention_module(name: &str) -> Option<&'static str> {
+    let marker = format!("// tinyllm module {name}\n");
+    let start = ATTENTION_PTX.find(&marker)? + marker.len();
+    let end = ATTENTION_PTX[start..]
+        .find("// tinyllm module ")
+        .map_or(ATTENTION_PTX.len(), |i| start + i);
+    Some(&ATTENTION_PTX[start..end])
 }
 
 struct StepPointers {
