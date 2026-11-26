@@ -496,7 +496,8 @@ __device__ __forceinline__ void matmul_split(const __nv_bfloat16 *w, int m, int 
     if (active) {
         wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
         wmma::fill_fragment(acc, 0.0f);
-        const int per = (chunks + SPLIT_K - 1) / SPLIT_K;
+        // Whole K tiles of cute-rs's tinyllm_linear (32 wide), which adds up the same ranges.
+        const int per = ((chunks + SPLIT_K - 1) / SPLIT_K + 1) & ~1;
         const int begin = min(chunks, range * per), end = min(chunks, begin + per);
         const __nv_bfloat16 *x_tiles = x + (size_t)x_group * chunks * TILE_ELEMENTS;
         const __nv_bfloat16 *w_tiles = w + (size_t)w_group * chunks * TILE_ELEMENTS;
@@ -539,16 +540,87 @@ __device__ __forceinline__ void matmul_split(const __nv_bfloat16 *w, int m, int 
     }
 }
 
-// matmul_bf16_TX: out[b][m] = dot(w[m], x[b]) (+ bias[m]), added to what's there if `accumulate`.
-// `scratch` isn't used.
-#define MATMUL_BF16(TX)                                                                        \
-    extern "C" __global__ void matmul_bf16_##TX(const __nv_bfloat16 *w, int m, int chunks,     \
-                                                const __nv_bfloat16 *x, int batch, float *out, \
-                                                const float *bias, int accumulate,             \
-                                                float *scratch) {                              \
-        matmul_split(w, m, chunks, x, batch, out, bias, accumulate);                          \
+// As matmul_tiles (blocks of WARPS_ACROSS weight tiles by TX input groups, a warp for each
+// pairing, so a block's warps share tiles through the cache), but adding up the inner dimension
+// in matmul_split's ranges: each range's products from zero, then the ranges' sums in order, then
+// what was there (if accumulating), then the bias. So it gives the same bits as matmul_split and
+// cute-rs's tinyllm_linear, for steps with more rows than suit the one and fewer than the other.
+template <int TX>
+__device__ __forceinline__ void matmul_ranged(const __nv_bfloat16 *w, int m, int chunks,
+                                              const __nv_bfloat16 *x, int batch, float *out,
+                                              const float *bias, int accumulate, float *scratch) {
+    __shared__ float tiles[WARPS_ACROSS * TX][TILE_ELEMENTS];
+    const int warp = threadIdx.x / WARP, lane = threadIdx.x % WARP;
+    const int x_group = blockIdx.x * TX + warp / WARPS_ACROSS;
+    const int w_group = blockIdx.y * WARPS_ACROSS + warp % WARPS_ACROSS;
+    const int first_row = x_group * TILE, first_column = w_group * TILE;
+    if (first_row >= batch || first_column >= m)
+        return;
+
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc, total;
+    wmma::fill_fragment(total, 0.0f);
+    const __nv_bfloat16 *x_tiles = x + (size_t)x_group * chunks * TILE_ELEMENTS;
+    const __nv_bfloat16 *w_tiles = w + (size_t)w_group * chunks * TILE_ELEMENTS;
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a[LOAD_AHEAD];
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> b[LOAD_AHEAD];
+    const int per = ((chunks + SPLIT_K - 1) / SPLIT_K + 1) & ~1;
+    for (int begin = 0; begin < chunks; begin += per) {
+        const int end = min(chunks, begin + per);
+        wmma::fill_fragment(acc, 0.0f);
+        for (int c = begin; c < end; c += LOAD_AHEAD) {
+            const int n = min(LOAD_AHEAD, end - c);
+#pragma unroll
+            for (int i = 0; i < LOAD_AHEAD; i++)
+                if (i < n) {
+                    wmma::load_matrix_sync(a[i], x_tiles + (size_t)(c + i) * TILE_ELEMENTS, TILE);
+                    wmma::load_matrix_sync(b[i], w_tiles + (size_t)(c + i) * TILE_ELEMENTS, TILE);
+                }
+#pragma unroll
+            for (int i = 0; i < LOAD_AHEAD; i++)
+                if (i < n)
+                    wmma::mma_sync(acc, a[i], b[i], acc);
+        }
+        for (int i = 0; i < acc.num_elements; i++)
+            total.x[i] += acc.x[i];
     }
-MATMUL_BF16(1)
+
+    // Through the warp's tile in shared memory, adding what was there and the bias element by
+    // element.
+    float *target = out + (size_t)first_row * m + first_column;
+    float *tile = tiles[warp];
+    wmma::store_matrix_sync(tile, total, TILE, wmma::mem_row_major);
+    __syncwarp();
+    for (int i = lane; i < TILE_ELEMENTS; i += WARP) {
+        const int row = first_row + i / TILE, column = first_column + i % TILE;
+        if (row >= batch || column >= m)
+            continue;
+        float sum = tile[i];
+        float *at = target + (size_t)(i / TILE) * m + i % TILE;
+        if (accumulate)
+            sum = *at + sum;
+        if (bias)
+            sum += bias[column];
+        *at = sum;
+    }
+}
+
+// matmul_bf16_TX: out[b][m] = dot(w[m], x[b]) (+ bias[m]), added to what's there if `accumulate`.
+// matmul_bf16_1 is matmul_split, the others matmul_ranged, held to 64 registers so two blocks of
+// 512 threads fit on a multiprocessor. `scratch` isn't used.
+extern "C" __global__ void matmul_bf16_1(const __nv_bfloat16 *w, int m, int chunks,
+                                         const __nv_bfloat16 *x, int batch, float *out,
+                                         const float *bias, int accumulate, float *scratch) {
+    matmul_split(w, m, chunks, x, batch, out, bias, accumulate);
+}
+#define MATMUL_BF16(TX)                                                                        \
+    extern "C" __global__ void __launch_bounds__(32 * WARPS_ACROSS * TX, 8 / TX)              \
+        matmul_bf16_##TX(const __nv_bfloat16 *w, int m, int chunks, const __nv_bfloat16 *x,    \
+                         int batch, float *out, const float *bias, int accumulate,             \
+                         float *scratch) {                                                     \
+        matmul_ranged<TX>(w, m, chunks, x, batch, out, bias, accumulate, scratch);             \
+    }
+MATMUL_BF16(2)
+MATMUL_BF16(4)
 
 // ---------------------------------------------------------------------------------------------
 // Mixtures of experts

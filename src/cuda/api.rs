@@ -70,6 +70,7 @@ driver_api! {
     cuInit(c_uint);
     cuDeviceGet(*mut c_int, c_int);
     cuDeviceGetName(*mut c_char, c_int, c_int);
+    cuDeviceGetAttribute(*mut c_int, c_int, c_int);
     cuDeviceTotalMem_v2(*mut usize, c_int);
     cuCtxCreate_v2(*mut Handle, c_uint, c_int);
     cuCtxSetCurrent(Handle);
@@ -154,6 +155,7 @@ pub struct Gpu {
     context: Handle,
     stream: Handle,
     device: c_int,
+    multiprocessors: usize,
     /// A GPU context can only be used from one thread at a time.
     _not_sync: PhantomData<std::cell::Cell<()>>,
 }
@@ -189,6 +191,7 @@ impl Gpu {
             context: std::ptr::null_mut(),
             stream: std::ptr::null_mut(),
             device: 0,
+            multiprocessors: 1,
             _not_sync: PhantomData,
         };
         // SAFETY: each call follows its documented contract, with pointers to live variables.
@@ -199,6 +202,10 @@ impl Gpu {
             gpu.check((gpu.driver.cuDeviceGet)(&mut device, index as c_int))
                 .context("no usable NVIDIA GPU")?;
             gpu.device = device;
+            // CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT
+            let mut count = 0;
+            gpu.check((gpu.driver.cuDeviceGetAttribute)(&mut count, 16, device))?;
+            gpu.multiprocessors = count.max(1) as usize;
             let mut context = std::ptr::null_mut();
             gpu.check((gpu.driver.cuCtxCreate_v2)(&mut context, 0, device))?;
             gpu.context = context;
@@ -267,6 +274,11 @@ impl Gpu {
     pub fn attach(&self) -> Result<()> {
         // SAFETY: `context` is a live context.
         self.check(unsafe { (self.driver.cuCtxSetCurrent)(self.context) })
+    }
+
+    /// The GPU's streaming multiprocessors.
+    pub fn multiprocessors(&self) -> usize {
+        self.multiprocessors
     }
 
     pub fn name(&self) -> String {

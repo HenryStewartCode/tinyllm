@@ -716,8 +716,8 @@ SGLang 0.5.23 on the same GPU): time to the first token, then the speed of the 6
 | Prompt | tinyllm: first token | SGLang: first token | tinyllm: decoding | SGLang: decoding |
 |---|---|---|---|---|
 | 3,100 tokens | 0.29 s | 0.47 s | 108 tok/s | 127 tok/s |
-| 12,300 tokens | 1.8 s | 1.3 s | 68 tok/s | 77 tok/s |
-| 23,100 tokens | 5.1 s | 2.5 s | 47 tok/s | 53 tok/s |
+| 12,300 tokens | 1.8 s | 1.3 s | 67 tok/s | 77 tok/s |
+| 23,100 tokens | 4.9 s | 2.5 s | 47 tok/s | 53 tok/s |
 
 Both keep the softmax in registers, in the tensor cores' own fragment layouts, and load the next
 page while using this one. Past a few thousand tokens SGLang's attention (FlashInfer) is still
@@ -751,6 +751,18 @@ and 256 on Qwen2.5-0.5B from 19,600 to 24,700. The rows for 4 and 64 requests we
 an earlier form of that split (blocks of 4 tiles, 4 tiles in flight per warp, where the final
 form has 1 and 8), which was slightly slower below 256 requests; the long-prompt rows were
 measured before any of it.
+
+Since then, 16-bit matrix products go through one of three kernels, which all add up the inner
+dimension in the same ranges (an eighth of it each, in whole 32-column steps), each range from
+zero and the ranges in order, so they give the same bits and a step can use whichever suits it:
+a warp per range for up to 16 rows; blocks of 16 warps sharing their tiles through the cache for
+more; and, for steps with enough rows to fill the GPU, cute-rs's `tinyllm_linear` (its
+`examples/tinyllm_linear.rs`, checked in here as `src/cuda/linear.ptx`), which stages 128x64 tiles in shared memory with
+`cp.async`, reads them with `ldmatrix` and keeps three steps in flight. A test checks the three
+against each other bit for bit. On the RTX 2000 Ada that took a 23,100-token prompt on Qwen3-0.6B
+from 6.2 s to 4.9 s, and a 3,100-token one from 0.46 s to 0.29 s, and brought decoding with many
+requests back from what the split had cost it there (256 requests on Qwen2.5-0.5B, 5,000 to
+7,800 tok/s). The B200 tables above were measured before it.
 
 These requests set only a temperature. SmolLM2 has no sampling defaults of its own, so its tokens
 are drawn on the GPU. Qwen2.5's generation config adds top-k, top-p and a repetition penalty, so
