@@ -38,6 +38,8 @@ pub const KERNELS_PTX: &str = include_str!("kernels.ptx");
 /// The 16-bit linear layer for steps with many rows, from cute-rs (its `tinyllm_linear` example,
 /// `cargo run --release --example tinyllm_linear -- linear.ptx`).
 pub const LINEAR_PTX: &str = include_str!("linear.ptx");
+/// cute-rs's `tinyllm_linear_q4`: `tinyllm_linear` with 4-bit weights in `matmul_q4`'s format.
+pub const LINEAR_Q4_PTX: &str = include_str!("linear_q4.ptx");
 /// cute-flashinfer's attention for tinyllm, one module per head size and GQA group (its
 /// `tinyllm_attention` example), each after a line `// tinyllm module NAME`.
 pub const ATTENTION_PTX: &str = include_str!("attention.ptx");
@@ -321,6 +323,7 @@ struct Kernels {
     matmul_bf16_2: Kernel,
     matmul_bf16_4: Kernel,
     linear: Kernel,
+    linear_q4: Kernel,
     queries_bf16: Kernel,
     merge_chunks: Kernel,
     matmul_i8_1: Kernel,
@@ -402,6 +405,7 @@ impl Kernels {
             matmul_bf16_2: gpu.kernel(module, "matmul_bf16_2")?,
             matmul_bf16_4: gpu.kernel(module, "matmul_bf16_4")?,
             linear: gpu.kernel(&gpu.load_kernels(LINEAR_PTX)?, "tinyllm_linear")?,
+            linear_q4: gpu.kernel(&gpu.load_kernels(LINEAR_Q4_PTX)?, "tinyllm_linear_q4")?,
             queries_bf16: gpu.kernel(module, "queries_bf16")?,
             merge_chunks: gpu.kernel(module, "merge_chunks")?,
             matmul_i8_1: gpu.kernel(module, "matmul_i8_1")?,
@@ -3008,7 +3012,43 @@ fn launch_matmul(
     out: Pointer,
     accumulate: bool,
 ) -> Result<()> {
+    // cute-rs's GEMMs, for steps with enough rows to fill the GPU with their 128-row blocks.
+    let wanted = match LINEAR_CHOICE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => true,
+        2 | 3 => false,
+        _ => {
+            batch >= LINEAR_ROWS / 2
+                && batch.div_ceil(LINEAR_ROWS) * (w.rows / LINEAR_COLUMNS)
+                    >= LINEAR_BLOCKS_PER_SM * gpu.multiprocessors()
+        }
+    };
+    let fits = w.rows.is_multiple_of(LINEAR_COLUMNS) && w.cols.is_multiple_of(2 * TILE);
     if w.zeros != Pointer::NULL {
+        // With 4-bit weights the GEMM only gains with whole 128-row blocks (on the RTX 2000
+        // Ada, Qwen2.5-0.5B-AWQ: 10% faster with 128 or 256 requests, 7% slower with 64).
+        let forced = LINEAR_CHOICE.load(std::sync::atomic::Ordering::Relaxed) == 1;
+        if wanted && fits && (forced || batch >= LINEAR_ROWS) {
+            // It adds up each group of 128 columns and folds it in with its scale as
+            // `matmul_q4` does, so a row's results don't depend on which one ran it.
+            return gpu.launch_blocks(
+                kernels.linear_q4,
+                [batch.div_ceil(LINEAR_ROWS), w.rows / LINEAR_COLUMNS],
+                128,
+                &[
+                    Arg::Ptr(w.data),
+                    Arg::Ptr(w.scales),
+                    Arg::Ptr(w.zeros),
+                    Arg::Ptr(x),
+                    Arg::Ptr(out),
+                    Arg::Ptr(w.bias),
+                    Arg::Int(w.rows),
+                    Arg::Int(w.cols),
+                    Arg::Int(batch),
+                    Arg::Int(accumulate as usize),
+                    Arg::Int((w.bias != Pointer::NULL) as usize),
+                ],
+            );
+        }
         let (kernel, groups) = match batch {
             1..=16 => (kernels.matmul_q4_1, 1),
             17..=32 => (kernels.matmul_q4_2, 2),
@@ -3068,16 +3108,7 @@ fn launch_matmul(
         // Both kernels add up the inner dimension in the same ranges, in the same order, so a
         // row's results don't depend on which one ran it.
         let chunks = w.cols.div_ceil(TILE);
-        let wanted = match LINEAR_CHOICE.load(std::sync::atomic::Ordering::Relaxed) {
-            1 => true,
-            2 | 3 => false,
-            _ => {
-                batch >= LINEAR_ROWS / 2
-                    && batch.div_ceil(LINEAR_ROWS) * (w.rows / LINEAR_COLUMNS)
-                        >= LINEAR_BLOCKS_PER_SM * gpu.multiprocessors()
-            }
-        };
-        if wanted && w.rows.is_multiple_of(LINEAR_COLUMNS) && w.cols.is_multiple_of(2 * TILE) {
+        if wanted && fits {
             return gpu.launch_blocks(
                 kernels.linear,
                 [batch.div_ceil(LINEAR_ROWS), w.rows / LINEAR_COLUMNS],
@@ -4744,7 +4775,15 @@ mod tests {
             (64, 896, 200),
             (128, 4864, 70),
         ] {
-            for (use_bias, accumulate) in [(false, false), (true, true)] {
+            for (use_bias, accumulate, quantized) in [
+                (false, false, false),
+                (true, true, false),
+                (false, false, true),
+                (true, true, true),
+            ] {
+                if quantized && n % QUANT_GROUP != 0 {
+                    continue;
+                }
                 let w16: Vec<u16> = pseudo_random(m * n, 11)
                     .iter()
                     .map(|&v| f32_to_bf16(v))
@@ -4764,7 +4803,7 @@ mod tests {
                 } else {
                     Pointer::NULL
                 };
-                let matrix = Matrix {
+                let mut matrix = Matrix {
                     data,
                     rows: m,
                     cols: n,
@@ -4774,6 +4813,23 @@ mod tests {
                     fp8: false,
                     zeros: Pointer::NULL,
                 };
+                if quantized {
+                    let groups = n / QUANT_GROUP;
+                    let values: Vec<u8> =
+                        (0..m * n).map(|i| ((i * 7 + i / 5) % 16) as u8).collect();
+                    let zeros: Vec<u8> = (0..m * groups).map(|i| ((i * 5) % 17) as u8).collect();
+                    let scales: Vec<f32> = pseudo_random(m * groups, 13)
+                        .iter()
+                        .map(|v| v * 0.1)
+                        .collect();
+                    let packed = pack_int4(&values, m, n);
+                    matrix.data = gpu.alloc(packed.len().div_ceil(4)).unwrap();
+                    gpu.write_now(matrix.data, &packed).unwrap();
+                    matrix.scales = gpu.alloc(scales.len()).unwrap();
+                    gpu.write_now(matrix.scales, &scales).unwrap();
+                    matrix.zeros = gpu.alloc(zeros.len().div_ceil(4)).unwrap();
+                    gpu.write_now(matrix.zeros, &zeros).unwrap();
+                }
                 // `x16`'s rows from `first`, `count` of them, as one step.
                 let step = |first: usize, count: usize| -> Vec<f32> {
                     let x = input_buffer(&gpu, Precision::Bf16, count, n).unwrap();
@@ -4807,7 +4863,7 @@ mod tests {
                     assert_eq!(
                         a.to_bits(),
                         b.to_bits(),
-                        "{m}x{n}, {rows} rows, bias {use_bias}, matmul_ranged: row {}, column {}",
+                        "{m}x{n}, {rows} rows, bias {use_bias}, 4-bit {quantized}, matmul_ranged: row {}, column {}",
                         i / m,
                         i % m
                     );
@@ -4823,7 +4879,7 @@ mod tests {
                         assert_eq!(
                             a.to_bits(),
                             b.to_bits(),
-                            "{m}x{n}, {rows} rows, bias {use_bias}: row {}, column {}",
+                            "{m}x{n}, {rows} rows, bias {use_bias}, 4-bit {quantized}: row {}, column {}",
                             first + i / m,
                             i % m
                         );

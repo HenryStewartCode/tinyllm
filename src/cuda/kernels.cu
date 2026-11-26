@@ -885,8 +885,8 @@ __device__ __forceinline__ void matmul_tiles_q8(const unsigned char *w, const fl
             for (int j = 0; j < 2; j++) {
                 const int row = min(first_column + h * 8 + 2 * t + j, m - 1);
                 const float scale = scales[(size_t)row * groups + group];
-                acc[h][j] += part[h][j] * scale;
-                acc[h][j + 2] += part[h][j + 2] * scale;
+                acc[h][j] = fmaf(part[h][j], scale, acc[h][j]);
+                acc[h][j + 2] = fmaf(part[h][j + 2], scale, acc[h][j + 2]);
             }
         }
     }
@@ -1001,8 +1001,8 @@ __device__ __forceinline__ void matmul_tiles_q4(const unsigned *w, const float *
             for (int j = 0; j < 2; j++) {
                 const int row = min(first_column + h * 8 + 2 * t + j, m - 1);
                 const float scale = scales[(size_t)row * groups + group];
-                acc[h][j] += part[h][j] * scale;
-                acc[h][j + 2] += part[h][j + 2] * scale;
+                acc[h][j] = fmaf(part[h][j], scale, acc[h][j]);
+                acc[h][j + 2] = fmaf(part[h][j + 2], scale, acc[h][j + 2]);
             }
         }
     }
@@ -1013,11 +1013,12 @@ __device__ __forceinline__ void matmul_tiles_q4(const unsigned *w, const float *
             const int column = first_column + h * 8 + 2 * t + j % 2;
             if (column >= m)
                 continue;
-            float value = acc[h][j];
+            // In the order of cute-rs's tinyllm_linear_q4: the old value, then the bias.
+            float *at = out + (size_t)row * m + column;
+            float value = accumulate ? *at + acc[h][j] : acc[h][j];
             if (bias)
                 value += bias[column];
-            float *at = out + (size_t)row * m + column;
-            *at = accumulate ? *at + value : value;
+            *at = value;
         }
     }
 }

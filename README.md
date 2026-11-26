@@ -691,12 +691,12 @@ batch size on first use. Total tokens per second:
 
 | Concurrent requests | Qwen2.5-0.5B, tinyllm | Qwen2.5-0.5B, SGLang | SmolLM2-135M, tinyllm | SmolLM2-135M, SGLang |
 |---|---|---|---|---|
-| 1 | 162 | 179 | 402 | 478 |
-| 4 | 640 | 676 | 1,575 | 1,686 |
-| 16 | 2,449 | 1,039 | 6,026 | 852 |
-| 64 | 7,644 | 3,382 | 16,736 | 3,334 |
-| 128 | 10,035 | 5,454 | 23,345 | 6,273 |
-| 256 | 10,840 | 7,941 | 26,062 | 11,032 |
+| 1 | 176 | 175 | 444 | 449 |
+| 4 | 681 | 672 | 1,711 | 1,601 |
+| 16 | 2,530 | 900 | 6,007 | 817 |
+| 64 | 6,696 | 3,062 | 14,093 | 3,004 |
+| 128 | 9,754 | 4,892 | 20,009 | 5,677 |
+| 256 | 10,057 | 7,017 | 20,411 | 9,280 |
 
 | Time to first token, ~1,400-token prompt | tinyllm | SGLang |
 |---|---|---|
@@ -706,7 +706,9 @@ batch size on first use. Total tokens per second:
 | SmolLM2-135M, prompt already cached | 10–12 ms | 17–22 ms |
 
 So from 16 concurrent requests up, tinyllm is ahead by 1.4× to 7× on these two models, and for a
-single stream SGLang is still about 10–20% faster. SGLang's own
+single stream the two are level (within 1%). Both measured lower at high concurrency in this run
+than in earlier ones (SGLang by 10–15%), which looks like the shared GPU rather than either
+program. SGLang's own
 numbers dip at 16 requests in every run, for reasons not looked into, so the largest ratios there
 may say more about its default settings than about the GPU work.
 
@@ -769,6 +771,14 @@ against each other bit for bit. On the RTX 2000 Ada that took a 23,100-token pro
 from 6.2 s to 4.9 s, and a 3,100-token one from 0.46 s to 0.29 s, and brought decoding with many
 requests back from what the split had cost it there (256 requests on Qwen2.5-0.5B, 5,000 to
 7,800 tok/s). The B200 tables above were measured before it.
+
+4-bit AWQ and GPTQ weights have the same pair: `matmul_q4` for small steps, and for steps of 128
+rows or more cute-rs's `tinyllm_linear_q4` (`src/cuda/linear_q4.ptx`), the same GEMM with each
+16-column block of a K tile unpacked from the 4-bit words into shared memory as `v - z`. Both add
+up each group of 128 columns from zero and fold it in as `fma(sum, scale, total)`, so they give
+the same bits, which the same test checks. On Qwen2.5-0.5B-AWQ it raised 128 and 256 requests
+from 8,440 and 8,750 tok/s to 9,260 and 9,560; with 64 rows it was 7% slower, so smaller steps keep
+`matmul_q4`.
 
 These requests set only a temperature. SmolLM2 has no sampling defaults of its own, so its tokens
 are drawn on the GPU. Qwen2.5's generation config adds top-k, top-p and a repetition penalty, so
@@ -909,8 +919,8 @@ Checked against Hugging Face `transformers` (float32) and `tokenizers`:
 ## How it compares with SGLang
 
 SGLang is a large project aimed at GPU clusters. The serving design here is the same, and on one
-GPU, with the two models tested, throughput is ahead from 16 concurrent requests up. What's
-missing is breadth, and the last 10–20% of single-stream speed.
+GPU, with the two models tested, throughput is ahead from 16 concurrent requests up. Single-stream
+speed is level on those models; what's missing is breadth.
 
 | | SGLang | tinyllm |
 |---|---|---|
@@ -924,7 +934,7 @@ missing is breadth, and the last 10–20% of single-stream speed.
 | Model's own Jinja chat templates | yes | yes |
 | Deterministic results across batch shapes | optional | always |
 | Prometheus metrics | yes | yes |
-| GPU execution | yes | **one NVIDIA GPU**, or an Apple GPU through Metal; no AMD. Slightly slower for one stream, faster under load: see [Performance](#performance) |
+| GPU execution | yes | **one NVIDIA GPU**, or an Apple GPU through Metal; no AMD. Level for one stream, faster under load: see [Performance](#performance) |
 | Reusable compiled batches (CUDA graphs) | yes | yes, for batches of up to 64 |
 | Scheduling overlapped with the GPU's work | yes | not needed so far: scheduling, sampling and streaming take 0–3% of each step with up to 256 requests at once (Qwen2.5-0.5B on the RTX 2000 Ada), and the GPU is busy 96% of the time. `/metrics` shows the split as `tinyllm_forward_seconds_total` |
 | Quantized weights | yes: FP8, INT8, AWQ, GPTQ, GGUF, bitsandbytes, MXFP4 and more | FP8 and 4-bit AWQ/GPTQ checkpoints, 8-bit integers, and GPT-OSS's MXFP4 experts, on the NVIDIA GPU (the CPU and Apple GPU unpack quantized checkpoints); bfloat16 weights stay 16-bit on the CPU. **No GGUF, bitsandbytes, or GPTQ with 8 bits** |
@@ -942,7 +952,7 @@ missing is breadth, and the last 10–20% of single-stream speed.
 | One model across GPUs or nodes (tensor, pipeline, expert parallelism) | yes | tensor parallelism across the GPUs of one machine, for dense models (see [Several GPUs](#several-gpus)). **No pipeline or expert parallelism, no multi-node, no quantized or MoE models split yet** |
 | The SGL frontend language (`gen`, `select`, `fork`) | yes | **no** |
 
-Biggest gaps first, the plan is: faster attention for prompts past a few thousand tokens, wider
+Biggest gaps first, the plan is: the rest of the attention gap on prompts past ten thousand tokens, wider
 draft trees for EAGLE (branches off branches) and DeepSeek's multi-token prediction, then GPT-OSS on the Apple GPU and closing the gap with SGLang
 on DeepSeek.
 
