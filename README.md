@@ -490,9 +490,13 @@ a warm-up run; tinyllm's replies were identical to plain decoding in every run:
 | tinyllm 4 ahead, 4 runs; SGLang 4 steps, topk 4, 8 tokens | 41.4 tok/s | 44.4 tok/s |
 | tinyllm 3 ahead, 6 runs; SGLang 5 steps, topk 8, 16 tokens | 43.4 tok/s | 45.4 tok/s |
 
-SGLang's trees can branch anywhere, where tinyllm's branches only split off the main run, and it
+Branches can split off other branches too: at each guess the head's likely alternatives, the
+main run's and the branches', compete for the runs left, most likely first. On the 20 requests of
+`scripts/speculative_test.py` (greedy and sampled) that changed little: 43.8 tok/s with 3 ahead
+and 6 runs against 43.9 before, the same replies as plain decoding. Most runs still go to the
+first guess's alternatives, and keeping half back for later guesses was slower (43.5). SGLang
 checks a tree's tokens once each, where tinyllm works out a branch's rows from the page where it
-splits off again.
+splits off again (a branch off a branch from its parent's page).
 
 The same requests on a B200: tinyllm 149 tok/s without guessing, 195 with 3 ahead and 6 runs, 192
 with 4 ahead and 4 runs (replies identical to plain decoding); SGLang 657 tok/s with 3 steps and
@@ -940,7 +944,7 @@ speed is level on those models; what's missing is breadth.
 | Quantized weights | yes: FP8, INT8, AWQ, GPTQ, GGUF, bitsandbytes, MXFP4 and more | FP8 and 4-bit AWQ/GPTQ checkpoints, 8-bit integers, and GPT-OSS's MXFP4 experts, on the NVIDIA GPU (the CPU and Apple GPU unpack quantized checkpoints); bfloat16 weights stay 16-bit on the CPU. **No GGUF, bitsandbytes, or GPTQ with 8 bits** |
 | Tool calling, with `tool_choice` and strict schemas | yes, with parsers for many model families | yes, for the families that run here: Qwen and Hermes, Mistral, Llama 3, and GPT-OSS's harmony messages |
 | Reasoning parsers, thinking budgets | yes, for many families | yes, for `<think>` models (Qwen3, SmolLM3, DeepSeek-R1 and others) and GPT-OSS's harmony channels (budgets for `<think>` models only) |
-| Speculative decoding | yes: EAGLE (with draft trees), MTP, draft models, n-grams | EAGLE-3 heads, draft models and n-grams, with replies exactly as without it; EAGLE-3 accepts as many tokens a step as SGLang's with the same head. EAGLE-3 draft trees as branches off the main guesses (`--speculative-eagle-topk`). **No MTP** |
+| Speculative decoding | yes: EAGLE (with draft trees), MTP, draft models, n-grams | EAGLE-3 heads, draft models and n-grams, with replies exactly as without it; EAGLE-3 accepts as many tokens a step as SGLang's with the same head. EAGLE-3 draft trees as branches off the main guesses and off each other (`--speculative-eagle-topk`). **No MTP** |
 | LoRA adapters | yes, mixed in batches, loaded and unloaded while running | yes, mixed in batches, chosen by `model` or `lora_path`, loaded and unloaded while running (unloading doesn't free their memory yet) |
 | Architectures | many | Llama-style (Llama, Mistral, Qwen2/3, SmolLM2/3, Phi-3, Granite, Gemma 1–3) and mixtures of experts (Qwen3-MoE, Qwen2-MoE, Mixtral, OLMoE, Granite MoE, GPT-OSS, and DeepSeek V2/V3, with only the latent in the cache on the GPUs: on a B200, 2–3.2x behind SGLang on DeepSeek-V2-Lite-Chat and 3.1–5.1x on Qwen3-30B-A3B). GPT-OSS doesn't run on the Apple GPU yet. **No hybrid attention models (Qwen3-Next, Jamba)** |
 | Sliding-window attention, logit soft-capping | yes | yes |
@@ -952,8 +956,8 @@ speed is level on those models; what's missing is breadth.
 | One model across GPUs or nodes (tensor, pipeline, expert parallelism) | yes | tensor parallelism across the GPUs of one machine, for dense models (see [Several GPUs](#several-gpus)). **No pipeline or expert parallelism, no multi-node, no quantized or MoE models split yet** |
 | The SGL frontend language (`gen`, `select`, `fork`) | yes | **no** |
 
-Biggest gaps first, the plan is: the rest of the attention gap on prompts past ten thousand tokens, wider
-draft trees for EAGLE (branches off branches) and DeepSeek's multi-token prediction, then GPT-OSS on the Apple GPU and closing the gap with SGLang
+Biggest gaps first, the plan is: the rest of the attention gap on prompts past ten thousand tokens,
+checking EAGLE trees' tokens once each, DeepSeek's multi-token prediction, then GPT-OSS on the Apple GPU and closing the gap with SGLang
 on DeepSeek.
 
 Other limitations: only BPE tokenizers are supported (not SentencePiece Unigram or WordPiece,

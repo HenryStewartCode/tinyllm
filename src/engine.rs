@@ -477,6 +477,10 @@ pub fn start(
 /// Their keys and values from the start of that page are copied over, and the rows from there are
 /// worked out again, which gives exactly the same results. So a branch's guesses are checked just
 /// as the main ones would be, and replies stay the same.
+///
+/// A branch can also split off another branch. It's kept flat: it starts from its parent's own
+/// page, with the parent's keys and values for the head copied over, so its slots before
+/// `own_from` are still the main guesses', and the model works out all its rows from there.
 struct Branch {
     tokens: Vec<u32>,
     split: usize,
@@ -489,6 +493,8 @@ struct Branch {
     logits_row: usize,
     /// The model's features for the branch's rows, for the head, if the branch is taken.
     features: Vec<f32>,
+    /// How likely the head thinks the branch's guesses are, as a log probability.
+    score: f32,
 }
 
 impl Branch {
@@ -1269,17 +1275,26 @@ impl Engine {
                     }
                     seq.accepted += 1;
                 }
-                // A branch that splits off where the main guesses went wrong, with what came out
-                // there, may go further.
+                // A branch that splits off where the guesses taken so far went wrong, with what
+                // came out there, may go further; and so on, for branches off branches.
                 seq.winner = None;
-                for (k, views) in branch_views[i].iter().enumerate() {
+                let mut path: Vec<u32> = seq.tokens[real..].to_vec();
+                let mut tried = vec![false; branch_views[i].len()];
+                loop {
+                    let next = (0..tried.len()).find(|&k| {
+                        let b = &seq.branches[k];
+                        !tried[k]
+                            && seq.accepted == b.split
+                            && seq.sampled == b.tokens[b.split]
+                            && path.len() >= b.split
+                            && path[..b.split] == b.tokens[..b.split]
+                    });
+                    let Some(k) = next else {
+                        break;
+                    };
+                    tried[k] = true;
+                    let views = &branch_views[i][k];
                     let split = seq.branches[k].split;
-                    if seq.winner.is_some()
-                        || seq.accepted != split
-                        || seq.sampled != seq.branches[k].tokens[split]
-                    {
-                        continue;
-                    }
                     let mut history = seq.tokens[..real].to_vec();
                     history.extend_from_slice(&seq.branches[k].tokens);
                     let length = seq.branches[k].tokens.len();
@@ -1301,6 +1316,7 @@ impl Engine {
                     seq.winner = Some(k);
                     seq.accepted = accepted;
                     seq.sampled = sampled;
+                    path = seq.branches[k].tokens.clone();
                 }
                 seq.token_logprob = None;
                 return;
@@ -1586,6 +1602,9 @@ impl Engine {
         // main guesses so far are.
         let mut forks: Vec<(Vec<(f32, u32)>, f32)> = vec![(Vec::new(), 0.0); self.active.len()];
         let mut scores = vec![0.0f32; self.active.len()];
+        // Branches' other choices for their newest guesses: (branch, choices) for each sequence.
+        let mut branch_forks: Vec<Vec<(usize, Vec<(f32, u32)>)>> =
+            vec![Vec::new(); self.active.len()];
 
         // Go through what's new, a batch at a time.
         let budget = self.config.max_batch.max(1);
@@ -1691,32 +1710,56 @@ impl Engine {
         let main_backend = &mut self.backend;
         let mut lists: Vec<Vec<u32>> = Vec::new();
         for round in 0..=longest {
-            // Branches off the guess just made.
+            // Branches off the guesses just made, the main ones' and the branches', most likely
+            // first.
             if branches > 0 {
                 for &(i, ref slots) in &borrowed {
                     let seq = &mut self.active[i];
+                    let mut candidates: Vec<(f32, u32, Option<usize>)> = Vec::new();
                     let (choices, _) = std::mem::take(&mut forks[i]);
-                    let split = seq.draft - 1;
-                    if split != round || seq.draft != round + 1 {
-                        continue;
+                    if seq.draft - 1 == round && seq.draft == round + 1 {
+                        candidates.extend(choices.into_iter().map(|(p, t)| (p, t, None)));
                     }
-                    for (_, token) in choices {
+                    for (k, choices) in std::mem::take(&mut branch_forks[i]) {
+                        candidates.extend(choices.into_iter().map(|(p, t)| (p, t, Some(k))));
+                    }
+                    candidates.sort_by(|a, b| b.0.total_cmp(&a.0));
+                    let first = seq.slots.len();
+                    let head_list: Vec<u32> = seq.slots.iter().chain(slots).copied().collect();
+                    let real = seq.tokens.len() - seq.draft;
+                    for (score, token, parent) in candidates {
                         if seq.branches.len() >= branches {
                             break;
                         }
-                        let first = seq.slots.len();
-                        let head_list: Vec<u32> = seq.slots.iter().chain(slots).copied().collect();
-                        let real = seq.tokens.len() - seq.draft;
-                        let mut tokens = seq.tokens[real..real + split].to_vec();
+                        let split = round;
+                        let (mut tokens, head_source, own_from, hidden) = match parent {
+                            None => (
+                                seq.tokens[real..real + split].to_vec(),
+                                head_list.clone(),
+                                None,
+                                outputs[i].clone(),
+                            ),
+                            Some(k) => {
+                                let parent = &seq.branches[k];
+                                (
+                                    parent.tokens[..split].to_vec(),
+                                    parent.slots(&head_list, first + split, page_size),
+                                    Some(parent.own_from),
+                                    parent.hidden.clone(),
+                                )
+                            }
+                        };
                         tokens.push(token);
                         let Some(branch) = new_branch(
                             &mut self.cache,
                             [main_backend.as_mut(), draft.as_mut()],
-                            [&seq.slots, &head_list],
+                            [&seq.slots, &head_source],
                             first,
                             tokens,
                             wants[i],
-                            outputs[i].clone(),
+                            hidden,
+                            own_from,
+                            score,
                         ) else {
                             break;
                         };
@@ -1797,9 +1840,18 @@ impl Engine {
                         let mut history = seq.tokens[..real].to_vec();
                         history.extend_from_slice(&seq.branches[k].tokens);
                         let guess = (seq.sampler).sample(logits, &history, generated, None);
+                        let room = branches.saturating_sub(seq.branches.len());
                         let branch = &mut seq.branches[k];
                         branch.tokens.push(guess);
                         branch.hidden = draft.features(row).to_vec();
+                        if room > 0 {
+                            let (choices, with_guess) =
+                                alternatives(logits, guess, branch.score, room);
+                            branch.score = with_guess;
+                            if !choices.is_empty() {
+                                branch_forks[i].push((k, choices));
+                            }
+                        }
                     }
                 }
             }
@@ -2299,22 +2351,28 @@ fn new_branch(
     tokens: Vec<u32>,
     length: usize,
     hidden: Vec<f32>,
+    own_from: Option<usize>,
+    score: f32,
 ) -> Option<Branch> {
     let page_size = cache.page_size();
     let split = tokens.len() - 1;
     // The head's first row for the branch.
     let start = first + split;
-    let own_from = start / page_size * page_size;
+    let own_from = own_from.unwrap_or(start / page_size * page_size);
     let count = (first + length + 1).div_ceil(page_size) - own_from / page_size;
     let mut pages = Vec::new();
     if !cache.allocate(count, &mut pages) {
         return None;
     }
     let [model, head] = backends;
+    // The head's keys and values from `own_from` to the split.
+    let head_pages: Vec<(u32, u32)> = (own_from..start)
+        .step_by(page_size)
+        .zip(&pages)
+        .map(|(position, &page)| (slots[1][position] / page_size as u32, page))
+        .collect();
     let copied = own_from == start
-        || (head
-            .copy_pages(&[(slots[1][own_from] / page_size as u32, pages[0])])
-            .is_ok()
+        || (head.copy_pages(&head_pages).is_ok()
             && (own_from >= first
                 || model
                     .copy_pages(&[(slots[0][own_from] / page_size as u32, pages[0])])
@@ -2333,6 +2391,7 @@ fn new_branch(
         hidden,
         logits_row: 0,
         features: Vec::new(),
+        score,
     })
 }
 
