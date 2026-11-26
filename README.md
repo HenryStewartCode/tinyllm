@@ -784,6 +784,30 @@ the same bits, which the same test checks. On Qwen2.5-0.5B-AWQ it raised 128 and
 from 8,440 and 8,750 tok/s to 9,260 and 9,560; with 64 rows it was 7% slower, so smaller steps keep
 `matmul_q4`.
 
+On an H100 (80 GB HBM3), against SGLang 0.5.23 with the same client, total tokens per second
+(128-token replies), measured with the current kernels:
+
+| Concurrent requests | Qwen2.5-0.5B, tinyllm | SGLang | SmolLM2-135M, tinyllm | SGLang |
+|---|---|---|---|---|
+| 1 | 625 | 521 | 757 | 606 |
+| 4 | 2,305 | 1,854 | 2,908 | 2,316 |
+| 16 | 8,218 | 6,113 | 10,295 | 5,755 |
+| 64 | 11,399 | 14,546 | 17,675 | 15,463 |
+| 256 | 17,380 | 27,530 | 29,157 | 34,618 |
+
+| Concurrent requests | Qwen3-30B-A3B, tinyllm | SGLang | DeepSeek-V2-Lite, tinyllm | SGLang |
+|---|---|---|---|---|
+| 1 | 102 | 110 | 138 | 129 |
+| 64 | 2,213 | 1,864 | 2,815 | 2,132 |
+| 256 | 3,542 | 5,051 | 4,809 | 5,597 |
+
+Long prompts there show the larger gaps. Qwen3-0.6B, 18,500 tokens: 0.66 s to the first token and
+224 tok/s after it, against SGLang's 420 tok/s. Qwen3-30B-A3B, 6,200 tokens: 0.87 s against
+0.48 s. DeepSeek-V2-Lite, 6,200 tokens: 0.96 s against 0.50 s, then 23 tok/s against 117, because
+its latent attention still runs on tinyllm's own kernels, which slow down in step with the context.
+cute-rs's grouped GEMM for experts (`tinyllm_moe_linear`, a 128-row block per expert) was tried
+for MoE prompts here and changed nothing (0.86 s against 0.87 s on Qwen3-30B-A3B), so it isn't used.
+
 These requests set only a temperature. SmolLM2 has no sampling defaults of its own, so its tokens
 are drawn on the GPU. Qwen2.5's generation config adds top-k, top-p and a repetition penalty, so
 there the GPU narrows each row to its candidates instead.
@@ -956,7 +980,9 @@ speed is level on those models; what's missing is breadth.
 | One model across GPUs or nodes (tensor, pipeline, expert parallelism) | yes | tensor parallelism across the GPUs of one machine, for dense models (see [Several GPUs](#several-gpus)). **No pipeline or expert parallelism, no multi-node, no quantized or MoE models split yet** |
 | The SGL frontend language (`gen`, `select`, `fork`) | yes | **no** |
 
-Biggest gaps first, the plan is: the rest of the attention gap on prompts past ten thousand tokens,
+Biggest gaps first, the plan is: DeepSeek's latent attention through cute-flashinfer's MLA kernels
+(5x behind SGLang decoding after a 6,000-token prompt on an H100), throughput past 64 concurrent
+requests on fast GPUs (1.6x behind at 256 on an H100), the rest of the attention gap on long prompts,
 checking EAGLE trees' tokens once each, DeepSeek's multi-token prediction, then GPT-OSS on the Apple GPU and closing the gap with SGLang
 on DeepSeek.
 
