@@ -288,6 +288,19 @@ impl Gpu {
         self.multiprocessors
     }
 
+    /// The most shared memory one block can opt in to, in bytes.
+    pub fn max_shared_per_block(&self) -> usize {
+        let mut value = 0;
+        // SAFETY: a live device; attribute 97 is
+        // CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN.
+        let status = unsafe { (self.driver.cuDeviceGetAttribute)(&mut value, 97, self.device) };
+        if status == 0 {
+            value.max(0) as usize
+        } else {
+            0
+        }
+    }
+
     pub fn name(&self) -> String {
         let mut buffer = [0 as c_char; 256];
         // SAFETY: the driver writes a NUL-terminated string that fits the given length.

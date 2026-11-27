@@ -69,8 +69,15 @@ fn mla_chunk() -> usize {
 const MLA_TILE_Q: usize = 64;
 /// Rows of partial states (one per head and chunk) the MLA kernel has room for.
 const MLA_SCRATCH_ROWS: usize = 1 << 17;
-/// The MLA kernel's dynamic shared memory: 80 rows of 576 16-bit values.
-const MLA_SHARED_BYTES: usize = 80 * 576 * 2;
+/// The MLA kernel's dynamic shared memory for KV tiles of `tile_kv` tokens (cute-flashinfer's
+/// `SmemConfig::shared_bytes`): the 64-row Q tile and the KV stages, rows of 576 16-bit values,
+/// and with 2 stages (QK sharded) the warpgroups' row maxima.
+fn mla_shared_bytes(tile_kv: usize) -> usize {
+    match tile_kv {
+        16 => 80 * 576 * 2,
+        _ => (64 + 2 * tile_kv) * 576 * 2 + 2 * 64 * 4,
+    }
+}
 /// Blocks of the MLA kernel per multiprocessor, each looping over its list of work.
 const MLA_BLOCKS_PER_SM: usize = 2;
 /// Packed query rows per block of the attention kernel (`tinyllm::CTA_TILE_Q`).
@@ -1289,16 +1296,34 @@ impl CudaBackend {
                     && matches!(n_heads, 16 | 32 | 64 | 128)
                     && std::env::var("TINYLLM_MLA").map_or(true, |v| v != "0") =>
             {
-                let name = format!("tinyllm_mla_h{n_heads}");
+                // FlashInfer's pipeline for the GPU's shared memory: 2 stages of 64 tokens where
+                // it fits (H100), of 32 (A100), else 1 of 16. `TINYLLM_MLA_KV` picks one.
+                let room = gpu.max_shared_per_block();
+                let tile_kv = std::env::var("TINYLLM_MLA_KV")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .filter(|t| matches!(t, 16 | 32 | 64))
+                    .unwrap_or_else(|| {
+                        [64, 32, 16]
+                            .into_iter()
+                            .find(|&t| mla_shared_bytes(t) <= room)
+                            .unwrap_or(16)
+                    });
+                let suffix = match tile_kv {
+                    16 => String::new(),
+                    t => format!("_kv{t}"),
+                };
+                let name = format!("tinyllm_mla_h{n_heads}{suffix}");
                 eprintln!("Latent attention through cute-flashinfer ({name})");
                 let module = gpu.load_kernels(
                     ptx_module(MLA_PTX, &name).expect("built for every head count"),
                 )?;
                 let kernel = gpu.kernel(&module, &name)?;
-                gpu.allow_shared(kernel, MLA_SHARED_BYTES)?;
+                gpu.allow_shared(kernel, mla_shared_bytes(tile_kv))?;
                 let padded = rows.next_multiple_of(TILE) * n_heads;
                 Some(Mla {
                     kernel,
+                    shared_bytes: mla_shared_bytes(tile_kv),
                     q_nope: gpu.alloc(padded * 512 / 2)?,
                     q_pe: gpu.alloc(padded * 64 / 2)?,
                     partial_o: gpu.alloc(MLA_SCRATCH_ROWS * 512 / 2)?,
@@ -1733,7 +1758,7 @@ impl CudaBackend {
                     mla.kernel,
                     [1, mla.clusters, 1],
                     [32, 4, 2],
-                    MLA_SHARED_BYTES,
+                    mla.shared_bytes,
                     &[
                         Arg::Ptr(mla.q_nope),
                         Arg::Ptr(mla.q_pe),
@@ -3260,6 +3285,8 @@ fn ptx_module(ptx: &'static str, name: &str) -> Option<&'static str> {
 /// cute-flashinfer's MLA kernel (see `MLA_PTX`) and its buffers.
 struct Mla {
     kernel: Kernel,
+    /// Its dynamic shared memory per block.
+    shared_bytes: usize,
     /// Each row's queries in 16-bit floats, `[rows, n_heads, 512]` and `[rows, n_heads, 64]`.
     q_nope: Pointer,
     q_pe: Pointer,
