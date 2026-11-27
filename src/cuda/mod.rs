@@ -1713,7 +1713,7 @@ impl CudaBackend {
         if let Some(mla) = &self.mla {
             self.gpu.launch_blocks(
                 self.kernels.mla_queries,
-                [batch, 1],
+                [batch, n],
                 ROW_THREADS,
                 &[
                     Arg::Ptr(buffers.q_latent),
@@ -2135,7 +2135,7 @@ impl CudaBackend {
         self.gpu.launch_blocks(
             self.kernels.moe_sort,
             [1, 1],
-            256,
+            16 * 32,
             &[
                 Arg::Ptr(moe.topk_ids),
                 Arg::Int(batch),
@@ -2149,9 +2149,10 @@ impl CudaBackend {
         )?;
         // Launched for as many slots as there could be; the kernels stop at the real number.
         let slots = moe_slots(batch, &spec);
-        self.gpu.launch(
+        self.gpu.launch_blocks(
             self.kernels.moe_gather,
             [slots, 1],
+            128,
             &[
                 Arg::Ptr(self.xb),
                 Arg::Int(dim / TILE),
@@ -2186,7 +2187,7 @@ impl CudaBackend {
         self.moe_matmul(experts.down, dim, hidden, slots, moe.gated, moe.down)?;
         self.gpu.launch_blocks(
             self.kernels.moe_combine,
-            [batch, 1],
+            [batch, dim.div_ceil(ROW_THREADS)],
             ROW_THREADS,
             &[
                 Arg::Ptr(moe.down),
@@ -2278,7 +2279,18 @@ impl CudaBackend {
             );
         }
         let w = w.data;
-        let (kernel, tx) = match groups {
+        // Fewer groups per block when there are few, to give the GPU enough blocks (the variants
+        // add up in the same order). On an H100, DeepSeek-V2-Lite at one request: 1 group per
+        // block for its 6 is faster than 4.
+        let per_block: usize = std::env::var("TINYLLM_MOE_TX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(match groups {
+                ..=16 => 1,
+                17..=64 => 2,
+                _ => 4,
+            });
+        let (kernel, tx) = match per_block {
             1 => (self.kernels.moe_matmul_1, 1),
             2 => (self.kernels.moe_matmul_2, 2),
             _ => (self.kernels.moe_matmul_4, 4),

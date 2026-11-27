@@ -686,22 +686,26 @@ extern "C" __global__ void moe_route(const float *scores, int experts, int top_k
     }
 }
 
-// One block: lay out the (row, expert) pairs grouped by expert, each expert's run padded to a
-// whole number of 16-row groups. Each thread takes some experts and finds their pairs in order,
-// so the layout is the same every time. `slot_of[pair]` is where a pair went; `sorted_rows[slot]`
-// is its row (or -1 for padding); `group_expert[group]` is each group's expert.
+// One block of MOE_SORT_WARPS warps: lay out the (row, expert) pairs grouped by expert, each
+// expert's run padded to a whole number of 16-row groups, a run's pairs in their order. The block
+// takes the pairs a warp-full at a time: a pair's place is its expert's start, the expert's pairs
+// in earlier rounds and earlier warps, and its rank among its warp's lanes with that expert, so the
+// layout is the same every time. `slot_of[pair]` is where a pair went; `sorted_rows[slot]` is its
+// row (or -1 for padding); `group_expert[group]` is each group's expert.
+#define MOE_SORT_WARPS 16
 extern "C" __global__ void moe_sort(const int *topk_ids, int rows, int top_k, int experts,
                                     int *sorted_rows, int *slot_of, int *group_expert,
                                     int *num_groups) {
     __shared__ int counts[MAX_EXPERTS];
     __shared__ int starts[MAX_EXPERTS + 1];
-    const int pairs = rows * top_k;
-    for (int e = threadIdx.x; e < experts; e += blockDim.x) {
-        int count = 0;
-        for (int i = 0; i < pairs; i++)
-            count += topk_ids[i] == e;
-        counts[e] = count;
-    }
+    __shared__ int before[MOE_SORT_WARPS][MAX_EXPERTS];
+    const int pairs = rows * top_k, warp = threadIdx.x / WARP, lane = threadIdx.x % WARP;
+    const int threads = MOE_SORT_WARPS * WARP;
+    for (int e = threadIdx.x; e < experts; e += threads)
+        counts[e] = 0;
+    __syncthreads();
+    for (int i = threadIdx.x; i < pairs; i += threads)
+        atomicAdd(&counts[topk_ids[i]], 1);
     __syncthreads();
     if (threadIdx.x == 0) {
         int at = 0;
@@ -713,22 +717,44 @@ extern "C" __global__ void moe_sort(const int *topk_ids, int rows, int top_k, in
         *num_groups = at / TILE;
     }
     __syncthreads();
-    for (int e = threadIdx.x; e < experts; e += blockDim.x) {
-        int at = starts[e];
-        for (int i = 0; i < pairs; i++) {
-            if (topk_ids[i] == e) {
-                sorted_rows[at] = i / top_k;
-                slot_of[i] = at;
-                at++;
+    // counts[e] now counts the expert's pairs placed so far.
+    for (int e = threadIdx.x; e < experts; e += threads)
+        counts[e] = 0;
+    for (int base = 0; base < pairs; base += threads) {
+        for (int i = threadIdx.x; i < MOE_SORT_WARPS * experts; i += threads)
+            before[i / experts][i % experts] = 0;
+        __syncthreads();
+        const int i = base + threadIdx.x;
+        const int e = i < pairs ? topk_ids[i] : -1;
+        const unsigned same = __match_any_sync(0xffffffffu, e);
+        const int rank = __popc(same & ((1u << lane) - 1));
+        if (e >= 0 && rank == 0)
+            before[warp][e] = __popc(same);
+        __syncthreads();
+        for (int x = threadIdx.x; x < experts; x += threads) {
+            int total = counts[x];
+            for (int w = 0; w < MOE_SORT_WARPS; w++) {
+                const int n = before[w][x];
+                before[w][x] = total;
+                total += n;
             }
+            counts[x] = total;
         }
-        for (; at < starts[e + 1]; at++)
+        __syncthreads();
+        if (e >= 0) {
+            const int at = starts[e] + before[warp][e] + rank;
+            sorted_rows[at] = i / top_k;
+            slot_of[i] = at;
+        }
+        __syncthreads();
+    }
+    for (int e = threadIdx.x; e < experts; e += threads) {
+        for (int at = starts[e] + counts[e]; at < starts[e + 1]; at++)
             sorted_rows[at] = -1;
         for (int g = starts[e] / TILE; g < starts[e + 1] / TILE; g++)
             group_expert[g] = e;
     }
 }
-
 // One block per slot: copy its row of the 16-bit tile-layout input (zeros for padding).
 extern "C" __global__ void moe_gather(const __nv_bfloat16 *x, int chunks, const int *sorted_rows,
                                       const int *num_groups, __nv_bfloat16 *out) {
@@ -736,7 +762,7 @@ extern "C" __global__ void moe_gather(const __nv_bfloat16 *x, int chunks, const 
     if (slot >= *num_groups * TILE)
         return;
     const int row = sorted_rows[slot];
-    for (int c = threadIdx.x; c < chunks * TILE; c += WARP)
+    for (int c = threadIdx.x; c < chunks * TILE; c += blockDim.x)
         out[tile_index(slot, c, chunks)] =
             row < 0 ? __float2bfloat16(0.0f) : x[tile_index(row, c, chunks)];
 }
@@ -766,7 +792,7 @@ extern "C" __global__ void moe_combine(const float *down, int dim, const int *sl
                                        const float *topk_weights, int top_k, float *x,
                                        const int *topk_ids, const float *down_bias) {
     const int row = blockIdx.x;
-    for (int c = threadIdx.x; c < dim; c += blockDim.x) {
+    for (int c = blockIdx.y * blockDim.x + threadIdx.x; c < dim; c += gridDim.y * blockDim.x) {
         float sum = 0.0f;
         for (int k = 0; k < top_k; k++) {
             float value = down[(size_t)slot_of[row * top_k + k] * dim + c];
@@ -2179,7 +2205,7 @@ extern "C" __global__ void latent_store_f16(const float *kv, int stride, int ran
     }
 }
 
-// One block per row: the queries cute-flashinfer's MLA kernel takes, in 16-bit floats, from each
+// One block per row and head: the queries cute-flashinfer's MLA kernel takes, in 16-bit floats, from each
 // head's query through its key matrix (`q_latent`, `[n_heads][rows, rank]`, heads `q_head_stride`
 // apart) and the rotated part of each head's query (`q_rope`, rows `q_stride` apart and heads
 // `head_width` apart): `q_nope [rows, n_heads, rank]` and `q_pe [rows, n_heads, rope]`.
@@ -2187,17 +2213,13 @@ extern "C" __global__ void mla_queries(const float *q_latent, unsigned long long
                                        const float *q_rope, int q_stride, int head_width,
                                        int n_heads, int rank, int rope, __half *q_nope,
                                        __half *q_pe) {
-    const size_t row = blockIdx.x;
-    for (int t = threadIdx.x; t < n_heads * rank; t += blockDim.x) {
-        const int head = t / rank, i = t % rank;
-        q_nope[row * n_heads * rank + t] =
+    const size_t row = blockIdx.x, head = blockIdx.y;
+    for (int i = threadIdx.x; i < rank; i += blockDim.x)
+        q_nope[(row * n_heads + head) * rank + i] =
             __float2half(q_latent[head * q_head_stride + row * rank + i]);
-    }
-    for (int t = threadIdx.x; t < n_heads * rope; t += blockDim.x) {
-        const int head = t / rope, i = t % rope;
-        q_pe[row * n_heads * rope + t] =
-            __float2half(q_rope[row * q_stride + (size_t)head * head_width + i]);
-    }
+    for (int i = threadIdx.x; i < rope; i += blockDim.x)
+        q_pe[(row * n_heads + head) * rope + i] =
+            __float2half(q_rope[row * q_stride + head * head_width + i]);
 }
 
 // One block of rank / 8 threads per row and head (grid `[rows, n_heads]`): merge the partial states
