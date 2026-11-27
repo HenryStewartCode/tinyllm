@@ -398,7 +398,7 @@ extern "C" __global__ void rmsnorm_add(const float *y, float *x, const float *we
 // block use the same tiles at about the same time, so they come from the cache after the first.
 #define WARPS_ACROSS 4
 
-template <int TX>
+template <int TX, int AHEAD = LOAD_AHEAD>
 __device__ __forceinline__ void matmul_tiles(const __nv_bfloat16 *w, int m, int chunks,
                                              const __nv_bfloat16 *x, int batch, float *out,
                                              const float *bias, int accumulate, float *scratch) {
@@ -433,10 +433,10 @@ __device__ __forceinline__ void matmul_tiles(const __nv_bfloat16 *w, int m, int 
 
     const __nv_bfloat16 *x_tiles = x + (size_t)x_group * chunks * TILE_ELEMENTS;
     const __nv_bfloat16 *w_tiles = w + (size_t)w_group * chunks * TILE_ELEMENTS;
-    wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a[LOAD_AHEAD];
-    wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> b[LOAD_AHEAD];
-    for (int c = 0; c < chunks; c += LOAD_AHEAD) {
-        const int n = min(LOAD_AHEAD, chunks - c);
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a[AHEAD];
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> b[AHEAD];
+    for (int c = 0; c < chunks; c += AHEAD) {
+        const int n = min(AHEAD, chunks - c);
         for (int i = 0; i < n; i++) {
             wmma::load_matrix_sync(a[i], x_tiles + (size_t)(c + i) * TILE_ELEMENTS, TILE);
             wmma::load_matrix_sync(b[i], w_tiles + (size_t)(c + i) * TILE_ELEMENTS, TILE);
@@ -769,6 +769,10 @@ extern "C" __global__ void moe_gather(const __nv_bfloat16 *x, int chunks, const 
 
 // moe_matmul_TX: out = W_e x for each 16-row group of `x`, with `e` that group's expert and the
 // experts' weight matrices `expert_stride` elements apart, all in the 16-bit tile layout.
+// Tiles each warp keeps in flight in moe_matmul: experts' matrices are read by few rows each.
+#ifndef MOE_AHEAD
+#define MOE_AHEAD 8
+#endif
 #define MOE_MATMUL(TX)                                                                         \
     extern "C" __global__ void moe_matmul_##TX(                                                \
         const __nv_bfloat16 *w, unsigned long long expert_stride, const int *group_expert,    \
@@ -778,7 +782,7 @@ extern "C" __global__ void moe_gather(const __nv_bfloat16 *x, int chunks, const 
         const int groups = *num_groups;                                                        \
         if (x_group >= groups)                                                                 \
             return;                                                                            \
-        matmul_tiles<TX>(w + group_expert[x_group] * expert_stride, m, chunks, x,              \
+        matmul_tiles<TX, MOE_AHEAD>(w + group_expert[x_group] * expert_stride, m, chunks, x,   \
                          groups * TILE, out, nullptr, 0, nullptr);                             \
     }
 MOE_MATMUL(1)
