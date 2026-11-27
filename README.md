@@ -610,7 +610,7 @@ cargo run --release -- -m models/Qwen2.5-0.5B-Instruct --chat --system "You are 
 | `--seed N` | clock | for reproducible sampling |
 | `--ctx-size N` | model max | longest allowed conversation, in tokens |
 | `--threads N` | performance cores − 2 | CPU worker threads (on a GPU, all available, for choosing tokens) |
-| `--parallel N` | 32 CPU, 128 GPU | requests in progress at once |
+| `--parallel N` | 32 CPU, 256 GPU | requests in progress at once |
 | `--speculative-algorithm A` | none | `ngram`, `standalone` or `eagle3` to guess tokens ahead (see [Speculative decoding](#speculative-decoding)) |
 | `--speculative-draft-model-path DIR` | | the smaller model that guesses for `standalone` |
 | `--schedule-policy P` | fcfs | `fcfs`, or `lpm` to start the requests with the longest cached prefix first (with up to 128 waiting) |
@@ -784,29 +784,36 @@ the same bits, which the same test checks. On Qwen2.5-0.5B-AWQ it raised 128 and
 from 8,440 and 8,750 tok/s to 9,260 and 9,560; with 64 rows it was 7% slower, so smaller steps keep
 `matmul_q4`.
 
-On an H100 (80 GB HBM3), against SGLang 0.5.23 with the same client, total tokens per second
-(128-token replies), measured with the current kernels:
+On an H100 NVL (94 GB), against SGLang 0.5.23 with the same client, total tokens per second
+(128-token replies):
 
-| Concurrent requests | Qwen2.5-0.5B, tinyllm | SGLang | SmolLM2-135M, tinyllm | SGLang |
-|---|---|---|---|---|
-| 1 | 625 | 521 | 757 | 606 |
-| 4 | 2,305 | 1,854 | 2,908 | 2,316 |
-| 16 | 8,218 | 6,113 | 10,295 | 5,755 |
-| 64 | 11,399 | 14,546 | 17,675 | 15,463 |
-| 256 | 17,380 | 27,530 | 29,157 | 34,618 |
+| Concurrent requests | Qwen2.5-0.5B, tinyllm | SGLang | SmolLM2-135M, tinyllm | SGLang | DeepSeek-V2-Lite, tinyllm | SGLang |
+|---|---|---|---|---|---|---|
+| 1 | 652 | 693 | 802 | 350 | 150 | 223 |
+| 16 | 8,652 | 8,567 | 10,358 | 9,211 | 1,203 | 1,402 |
+| 64 | 20,792 | 25,454 | 31,749 | 26,485 | 3,071 | 3,865 |
+| 256 | 35,334 | 45,130 | 57,469 | 51,103 | 6,353 | 10,067 |
 
-| Concurrent requests | Qwen3-30B-A3B, tinyllm | SGLang | DeepSeek-V2-Lite, tinyllm | SGLang |
-|---|---|---|---|---|
-| 1 | 102 | 110 | 138 | 129 |
-| 64 | 2,213 | 1,864 | 2,815 | 2,132 |
-| 256 | 3,542 | 5,051 | 4,809 | 5,597 |
+What closed most of the gap at 64 and more requests (Qwen2.5-0.5B at 256: 17,380 tok/s on the
+earlier H100, 21,200 on this one before):
 
-Long prompts there show the larger gaps. Qwen3-0.6B, 18,500 tokens: 0.66 s to the first token and
-224 tok/s after it, against SGLang's 420 tok/s. Qwen3-30B-A3B, 6,200 tokens: 0.87 s against
-0.48 s. DeepSeek-V2-Lite, 6,200 tokens: 0.96 s against 0.50 s, then 23 tok/s against 117, because
-its latent attention still runs on tinyllm's own kernels, which slow down in step with the context.
-cute-rs's grouped GEMM for experts (`tinyllm_moe_linear`, a 128-row block per expert) was tried
-for MoE prompts here and changed nothing (0.86 s against 0.87 s on Qwen3-30B-A3B), so it isn't used.
+- **Up to 256 requests at once** by default on a GPU (it was 128, so 256 clients ran in two waves).
+- **Split inner dimensions past 16 rows** (`matmul_split`, 8 warps per output tile): the other
+  kernel gave a narrow matrix such as `o_proj` only a dozen blocks on 132 SMs. At 64 requests
+  11,700 -> 19,600 tok/s. All matmul kernels add up in the same order, so results don't change.
+- **A step's attention plan sized to what it uses**: it held room for the longest possible
+  sequence, 2.4 MB uploaded every step with the H100's 5.8 million cache slots (0.83 ms a step).
+- **Recorded steps up to 256 rows** (they were up to 64), and 64-row blocks of cute-rs's
+  `tinyllm_linear` (64 x 64 and 64 x 32) for matrices that 128-row blocks leave too few of.
+
+DeepSeek-V2-Lite's latent attention now runs on cute-flashinfer's MLA kernel, which spreads a
+sequence's cache over the GPU in 512-token chunks: after a 10,800-token prompt it decodes at
+89 tok/s, against 10 with tinyllm's own kernel (SGLang: 236), and the prompt takes 1.6 s against
+2.4 s (SGLang: 0.6 s). What's left there is mostly the mixture of experts: at one request, a step
+spends 2.1 ms in the expert matmuls (about half of the memory bandwidth) and 1.2 ms in small MoE
+kernels (gathering, routing, sorting, combining), against SGLang's 3.8 ms for the whole step.
+cute-rs's grouped GEMM for experts (`tinyllm_moe_linear`) was tried for MoE prompts on the earlier
+H100 and changed nothing (0.86 s against 0.87 s on Qwen3-30B-A3B), so it isn't used.
 
 These requests set only a temperature. SmolLM2 has no sampling defaults of its own, so its tokens
 are drawn on the GPU. Qwen2.5's generation config adds top-k, top-p and a repetition penalty, so
@@ -980,11 +987,10 @@ speed is level on those models; what's missing is breadth.
 | One model across GPUs or nodes (tensor, pipeline, expert parallelism) | yes | tensor parallelism across the GPUs of one machine, for dense models (see [Several GPUs](#several-gpus)). **No pipeline or expert parallelism, no multi-node, no quantized or MoE models split yet** |
 | The SGL frontend language (`gen`, `select`, `fork`) | yes | **no** |
 
-Biggest gaps first, the plan is: DeepSeek's latent attention through cute-flashinfer's MLA kernels
-(5x behind SGLang decoding after a 6,000-token prompt on an H100), throughput past 64 concurrent
-requests on fast GPUs (1.6x behind at 256 on an H100), the rest of the attention gap on long prompts,
-checking EAGLE trees' tokens once each, DeepSeek's multi-token prediction, then GPT-OSS on the Apple GPU and closing the gap with SGLang
-on DeepSeek.
+Biggest gaps first, the plan is: DeepSeek's mixture-of-experts kernels (1.5x behind SGLang at one
+request and 1.6x at 256 on an H100, 2.6x decoding after a long prompt), dense models' throughput at
+256 requests (1.3x behind on Qwen2.5-0.5B), the rest of the attention gap on long prompts, checking
+EAGLE trees' tokens once each, DeepSeek's multi-token prediction, then GPT-OSS on the Apple GPU.
 
 Other limitations: only BPE tokenizers are supported (not SentencePiece Unigram or WordPiece,
 though that covers the Llama family), embeddings only use last-token pooling, and sliding windows

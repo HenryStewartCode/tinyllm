@@ -344,31 +344,23 @@ extern "C" __global__ void embed_bf16(const __nv_bfloat16 *embeddings, const int
 extern "C" __global__ void rmsnorm_bf16(const float *x, __nv_bfloat16 *out, const float *weight,
                                         int dim, float eps, const int *rows, int chunks,
                                         int stride) {
-    const int row = blockIdx.x;
+    // Any whole number of warps per block, up to 32; the warps' sums are added in order.
+    __shared__ float partial[WARP];
+    const int row = blockIdx.x, warp = threadIdx.x / WARP, warps = blockDim.x / WARP;
     const float *from = x + (size_t)(rows ? rows[row] : row) * stride;
     float sum = 0;
-    for (int i = threadIdx.x; i < dim; i += WARP * LOAD_AHEAD) {
-        float value[LOAD_AHEAD];
-        for (int j = 0; j < LOAD_AHEAD; j++)
-            value[j] = i + j * WARP < dim ? from[i + j * WARP] : 0.0f;
-        for (int j = 0; j < LOAD_AHEAD; j++)
-            sum += value[j] * value[j];
-    }
-    const float scale = 1.0f / sqrtf(warp_sum(sum) / dim + eps);
-    for (int i = threadIdx.x; i < dim; i += WARP * LOAD_AHEAD) {
-        float value[LOAD_AHEAD], factor[LOAD_AHEAD];
-        for (int j = 0; j < LOAD_AHEAD; j++) {
-            if (i + j * WARP < dim) {
-                value[j] = from[i + j * WARP];
-                factor[j] = weight[i + j * WARP];
-            }
-        }
-        for (int j = 0; j < LOAD_AHEAD; j++) {
-            if (i + j * WARP < dim)
-                out[tile_index(row, i + j * WARP, chunks)] =
-                    __float2bfloat16(value[j] * scale * factor[j]);
-        }
-    }
+    for (int i = threadIdx.x; i < dim; i += blockDim.x)
+        sum += from[i] * from[i];
+    sum = warp_sum(sum);
+    if (threadIdx.x % WARP == 0)
+        partial[warp] = sum;
+    __syncthreads();
+    float total = 0;
+    for (int w = 0; w < warps; w++)
+        total += partial[w];
+    const float scale = 1.0f / sqrtf(total / dim + eps);
+    for (int i = threadIdx.x; i < dim; i += blockDim.x)
+        out[tile_index(row, i, chunks)] = __float2bfloat16(from[i] * scale * weight[i]);
 }
 
 // One block per row: x += y / sqrt(mean(y^2) + eps) * weight, for models that normalize what

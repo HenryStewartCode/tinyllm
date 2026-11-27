@@ -39,6 +39,11 @@ pub const KERNELS_PTX: &str = include_str!("kernels.ptx");
 /// `cargo run --release --example tinyllm_linear -- linear.ptx`).
 pub const LINEAR_PTX: &str = include_str!("linear.ptx");
 /// cute-rs's `tinyllm_linear_q4`: `tinyllm_linear` with 4-bit weights in `matmul_q4`'s format.
+/// `tinyllm_linear` with blocks of 64 x 64 and 64 x 32 outputs, for steps with fewer rows and
+/// narrower matrices (same example, its second and third paths). Every variant adds up in the
+/// same order.
+pub const LINEAR_64_PTX: &str = include_str!("linear_64.ptx");
+pub const LINEAR_64X32_PTX: &str = include_str!("linear_64x32.ptx");
 pub const LINEAR_Q4_PTX: &str = include_str!("linear_q4.ptx");
 /// cute-flashinfer's attention for tinyllm, one module per head size and GQA group (its
 /// `tinyllm_attention` example), each after a line `// tinyllm module NAME`.
@@ -48,6 +53,18 @@ pub const ATTENTION_PTX: &str = include_str!("attention.ptx");
 pub const MLA_PTX: &str = include_str!("mla.ptx");
 /// Tokens per chunk the MLA kernel splits a sequence's latents into, from position 0.
 const MLA_CHUNK: usize = 512;
+
+/// `MLA_CHUNK`, or `TINYLLM_MLA_CHUNK` (a multiple of 16) to try others.
+fn mla_chunk() -> usize {
+    static CHUNK: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CHUNK.get_or_init(|| {
+        std::env::var("TINYLLM_MLA_CHUNK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|c: &usize| c % TILE == 0 && *c > 0)
+            .unwrap_or(MLA_CHUNK)
+    })
+}
 /// Packed query rows per work item of the MLA kernel (`mla::CTA_TILE_Q`).
 const MLA_TILE_Q: usize = 64;
 /// Rows of partial states (one per head and chunk) the MLA kernel has room for.
@@ -99,8 +116,20 @@ const WARPS_ACROSS: usize = 4;
 const SWIGLU_COLUMNS: usize = 256;
 /// Threads per block in the kernels that go through all of a row's logits (`SCAN_THREADS`).
 const SCAN_THREADS: usize = 1024;
-/// The largest batch to keep a recorded graph for. Each takes about 2 MB of GPU memory.
-const MAX_RECORDED_BATCH: usize = 64;
+/// The largest batch to keep a recorded graph for. Each takes about 2 MB of GPU memory. (On an
+/// H100, Qwen2.5-0.5B at 256 requests: 8% faster than recording up to 64 rows.)
+const MAX_RECORDED_BATCH: usize = 256;
+
+/// `MAX_RECORDED_BATCH`, or `TINYLLM_GRAPH_ROWS` to try others.
+fn max_recorded_batch() -> usize {
+    static ROWS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *ROWS.get_or_init(|| {
+        std::env::var("TINYLLM_GRAPH_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(MAX_RECORDED_BATCH)
+    })
+}
 
 /// Teams of rows in a block of `attention_prefill` (`PREFILL_TILES` in `kernels.cu`).
 const PREFILL_TILES: usize = 4;
@@ -336,6 +365,8 @@ struct Kernels {
     matmul_bf16_2: Kernel,
     matmul_bf16_4: Kernel,
     linear: Kernel,
+    linear_64: Kernel,
+    linear_64x32: Kernel,
     linear_q4: Kernel,
     queries_bf16: Kernel,
     merge_chunks: Kernel,
@@ -421,6 +452,9 @@ impl Kernels {
             matmul_bf16_2: gpu.kernel(module, "matmul_bf16_2")?,
             matmul_bf16_4: gpu.kernel(module, "matmul_bf16_4")?,
             linear: gpu.kernel(&gpu.load_kernels(LINEAR_PTX)?, "tinyllm_linear")?,
+            linear_64: gpu.kernel(&gpu.load_kernels(LINEAR_64_PTX)?, "tinyllm_linear_64")?,
+            linear_64x32: gpu
+                .kernel(&gpu.load_kernels(LINEAR_64X32_PTX)?, "tinyllm_linear_64x32")?,
             linear_q4: gpu.kernel(&gpu.load_kernels(LINEAR_Q4_PTX)?, "tinyllm_linear_q4")?,
             queries_bf16: gpu.kernel(module, "queries_bf16")?,
             merge_chunks: gpu.kernel(module, "merge_chunks")?,
@@ -1229,6 +1263,7 @@ impl CudaBackend {
                     tmp_lse: gpu.alloc(FLASH_SCRATCH_ROWS * n_heads)?,
                     lse: gpu.alloc(rows.next_multiple_of(TILE) * n_heads)?,
                     plan: Growing::default(),
+                    room: 0,
                     launches: Vec::new(),
                 })
             }
@@ -1236,6 +1271,16 @@ impl CudaBackend {
 
         // cute-flashinfer's MLA kernel covers DeepSeek's latents of 512 and rotated parts of 64.
         // `TINYLLM_MLA=0` keeps tinyllm's own kernel, to compare.
+        // `TINYLLM_LINEAR=gemm`, `split` or `ranged` forces one 16-bit matmul, to compare.
+        if let Ok(v) = std::env::var("TINYLLM_LINEAR") {
+            let choice = match v.as_str() {
+                "gemm" => 1,
+                "split" => 2,
+                "ranged" => 3,
+                _ => 0,
+            };
+            LINEAR_CHOICE.store(choice, std::sync::atomic::Ordering::Relaxed);
+        }
         let mla = match latent {
             Some(l)
                 if precision == Precision::Bf16
@@ -1593,9 +1638,10 @@ impl CudaBackend {
         // Queries straight from the layer's input, or through a latent of their own.
         let (q, q_stride) = match &latent.q_low {
             Some((norm, q_b)) => {
-                self.gpu.launch(
+                self.gpu.launch_blocks(
                     self.kernels.rmsnorm_bf16,
                     [batch, 1],
+                    ROW_THREADS,
                     &[
                         Arg::Ptr(self.qkv),
                         Arg::Ptr(buffers.q_low),
@@ -2319,7 +2365,10 @@ impl CudaBackend {
             Arg::Int(self.dim),
         ];
         match self.precision {
-            Precision::Bf16 => self.gpu.launch(self.kernels.rmsnorm_bf16, [rows, 1], &args),
+            Precision::Bf16 => {
+                self.gpu
+                    .launch_blocks(self.kernels.rmsnorm_bf16, [rows, 1], ROW_THREADS, &args)
+            }
             Precision::F32 => self.gpu.launch(self.kernels.rmsnorm, [rows, 1], &args[..6]),
         }
     }
@@ -2342,12 +2391,23 @@ impl CudaBackend {
             TILE,
             FLASH_SCRATCH_ROWS,
         );
-        let max_chunks = self.capacity.div_ceil(FLASH_CHUNK);
+        // Room for the per-block arrays and the page list: what this step needs, rounded up to a
+        // power of two that only grows, so a recorded step finds them in the same places.
+        let need = plans
+            .iter()
+            .map(|p| p.request_indices.len().max(p.table.kv_indices.len()))
+            .max()
+            .unwrap_or(0);
+        let mut moved = false;
+        if need > flash.room {
+            flash.room = need.next_power_of_two().max(256);
+            moved = true;
+        }
+        let room = flash.room;
         let mut data: Vec<u32> = Vec::new();
         let mut regions = Vec::new();
         for plan in &plans {
             let n = plan.rows;
-            let ctas = (n + (n * flash.group).div_ceil(FLASH_TILE_Q)) * max_chunks;
             let mut put = |values: &[i32], room: usize| {
                 let at = data.len();
                 data.extend(values.iter().map(|&v| v as u32));
@@ -2361,10 +2421,10 @@ impl CudaBackend {
             let o_indptr = put(&plan.o_indptr, n + 1);
             let merge_start = put(&plan.merge_start, n);
             let merge_count = put(&plan.merge_count, n);
-            let request_indices = put(&plan.request_indices, ctas);
-            let qo_tile_indices = put(&plan.qo_tile_indices, ctas);
-            let kv_tile_indices = put(&plan.kv_tile_indices, ctas);
-            let kv_indices = put(&plan.table.kv_indices, plan.table.kv_indices.len());
+            let request_indices = put(&plan.request_indices, room);
+            let qo_tile_indices = put(&plan.qo_tile_indices, room);
+            let kv_tile_indices = put(&plan.kv_tile_indices, room);
+            let kv_indices = put(&plan.table.kv_indices, room);
             regions.push((
                 plan.first_row,
                 n,
@@ -2383,7 +2443,7 @@ impl CudaBackend {
                 ],
             ));
         }
-        if flash.plan.reserve(&self.gpu, data.len())? {
+        if flash.plan.reserve(&self.gpu, data.len())? || moved {
             // Recorded kernels hold on to the old addresses.
             for (_, graph) in self.graphs.drain() {
                 self.gpu.destroy_graph(graph)?;
@@ -2499,7 +2559,7 @@ impl CudaBackend {
             &slots,
             self.n_heads,
             MLA_TILE_Q,
-            MLA_CHUNK,
+            mla_chunk(),
             TILE,
             MLA_SCRATCH_ROWS,
             mla.clusters,
@@ -2959,7 +3019,7 @@ impl CudaBackend {
         self.place_overrides()?;
         let one_launch = self.flash.as_ref().is_none_or(|f| f.launches.len() <= 1)
             && self.mla.as_ref().is_none_or(|m| m.launches.len() <= 1);
-        if batch <= MAX_RECORDED_BATCH && one_launch {
+        if batch <= max_recorded_batch() && one_launch {
             let key = (
                 batch,
                 step.any_adapter,
@@ -3148,6 +3208,8 @@ struct Flash {
     /// What the kernel writes as the final log-sum-exp; not read.
     lse: Pointer,
     plan: Growing,
+    /// Room in the plan for each per-block array and the page list.
+    room: usize,
     launches: Vec<FlashLaunch>,
 }
 
@@ -3233,6 +3295,24 @@ struct StepPointers {
     temperatures: Pointer,
     keys: Pointer,
     n_logits: usize,
+}
+
+/// Blocks per multiprocessor a `tinyllm_linear` variant needs to be chosen (`TINYLLM_LINEAR_BLOCKS`
+/// to try others).
+fn linear_blocks_per_sm() -> usize {
+    static BLOCKS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BLOCKS.get_or_init(|| {
+        std::env::var("TINYLLM_LINEAR_BLOCKS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2)
+    })
+}
+
+/// Whether the smaller `tinyllm_linear` blocks are used (`TINYLLM_LINEAR_SMALL=0` to compare).
+fn linear_small() -> bool {
+    static SMALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SMALL.get_or_init(|| std::env::var("TINYLLM_LINEAR_SMALL").map_or(true, |v| v != "0"))
 }
 
 /// Queue `out = W x`, or `out += W x` if `accumulate`, choosing the kernel for this batch size.
@@ -3343,6 +3423,45 @@ fn launch_matmul(
         // Both kernels add up the inner dimension in the same ranges, in the same order, so a
         // row's results don't depend on which one ran it.
         let chunks = w.cols.div_ceil(TILE);
+        // The largest blocks that still give the GPU enough of them, for steps past 32 rows.
+        let choice = LINEAR_CHOICE.load(std::sync::atomic::Ordering::Relaxed);
+        let enough = linear_blocks_per_sm() * gpu.multiprocessors();
+        let tiles = [
+            (kernels.linear, LINEAR_ROWS, LINEAR_COLUMNS),
+            (kernels.linear_64, 64, 64),
+            (kernels.linear_64x32, 64, 32),
+        ];
+        let shape = tiles
+            .iter()
+            .filter(|&&(_, _, bn)| w.rows.is_multiple_of(bn) && w.cols.is_multiple_of(2 * TILE))
+            .find(|&&(_, bm, bn)| batch.div_ceil(bm) * (w.rows / bn) >= enough)
+            .or(match choice {
+                1 => tiles
+                    .iter()
+                    .rev()
+                    .find(|&&(_, _, bn)| w.rows.is_multiple_of(bn)),
+                _ => None,
+            })
+            .filter(|_| choice == 1 || (choice == 0 && batch > 2 * TILE && linear_small()));
+        if let Some(&(kernel, bm, bn)) = shape.filter(|_| w.cols.is_multiple_of(2 * TILE)) {
+            return gpu.launch_blocks(
+                kernel,
+                [batch.div_ceil(bm), w.rows / bn],
+                128,
+                &[
+                    Arg::Ptr(w.data),
+                    Arg::Ptr(x),
+                    Arg::Ptr(out),
+                    Arg::Ptr(w.bias),
+                    Arg::Int(w.rows),
+                    Arg::Int(w.cols),
+                    Arg::Int(batch),
+                    Arg::Int(split_range(chunks) / 2),
+                    Arg::Int(accumulate as usize),
+                    Arg::Int((w.bias != Pointer::NULL) as usize),
+                ],
+            );
+        }
         if wanted && fits {
             return gpu.launch_blocks(
                 kernels.linear,
@@ -3374,7 +3493,9 @@ fn launch_matmul(
             Arg::Ptr(w.scratch),
         ];
         let choice = LINEAR_CHOICE.load(std::sync::atomic::Ordering::Relaxed);
-        if choice == 3 || (choice == 0 && batch > TILE) {
+        // `matmul_ranged` only when asked for: `matmul_split` spreads narrow matrices over the
+        // whole GPU (on an H100 at 64 rows, Qwen2.5-0.5B: 11,700 -> 19,600 tok/s).
+        if choice == 3 {
             // Blocks of `WARPS_ACROSS` weight tiles by 2 or 4 input groups: `matmul_ranged`.
             let groups = if batch <= 2 * TILE { 2 } else { 4 };
             let kernel = if groups == 2 {

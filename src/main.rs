@@ -182,7 +182,7 @@ struct Args {
     #[arg(long)]
     show_tokens: bool,
 
-    /// How many requests can run at the same time (default: 32 on CPU, 128 on GPU)
+    /// How many requests can run at the same time (default: 32 on CPU, 256 on GPU)
     #[arg(long)]
     parallel: Option<usize>,
 
@@ -294,7 +294,7 @@ fn main() -> Result<()> {
         .max(1);
     let parallel = args
         .parallel
-        .unwrap_or(if on_gpu { 128 } else { 32 })
+        .unwrap_or(if on_gpu { 256 } else { 32 })
         .max(1);
     let batch_size = args
         .batch_size
