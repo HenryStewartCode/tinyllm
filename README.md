@@ -807,9 +807,10 @@ earlier H100, 21,200 on this one before):
   `tinyllm_linear` (64 x 64 and 64 x 32) for matrices that 128-row blocks leave too few of.
 
 DeepSeek-V2-Lite's latent attention now runs on cute-flashinfer's MLA kernel, which spreads a
-sequence's cache over the GPU in 512-token chunks: after a 10,800-token prompt it decodes at
-89 tok/s, against 10 with tinyllm's own kernel (SGLang: 236), and the prompt takes 1.6 s against
-2.4 s (SGLang: 0.6 s). The small MoE kernels were then reworked (sorting pairs by expert a warp at a time instead of
+sequence's cache over the GPU in 256-token chunks: after a 10,800-token prompt it decodes at
+116-151 tok/s (runs vary), against 10 with tinyllm's own kernel (SGLang: 236), and the prompt
+takes 1.5 s against 2.4 s (SGLang: 0.6 s). 512-token chunks decoded at 132 and 128-token ones
+made prompts 11% slower. The small MoE kernels were then reworked (sorting pairs by expert a warp at a time instead of
 each thread scanning every pair, more threads for gathering and combining): one request
 150 -> 174 tok/s, 256 requests 6,350 -> 7,240. What's left is mostly the experts' matmul, which
 reads weights at about half the memory bandwidth: at 256 requests it takes 14.7 ms of a 25 ms
@@ -992,8 +993,9 @@ speed is level on those models; what's missing is breadth.
 | The SGL frontend language (`gen`, `select`, `fork`) | yes | **no** |
 
 Biggest gaps first, the plan is: the experts' matmul for DeepSeek and other mixtures of experts
-(DeepSeek-V2-Lite 1.2x behind SGLang at one request and 1.4x at 256 on an H100, 2.6x decoding
-after a long prompt), dense models' throughput at
+(DeepSeek-V2-Lite 1.2x behind SGLang at one request and 1.4x at 256 on an H100, 1.6-2x decoding
+after a long prompt; the MLA kernel is FlashInfer's 1-stage, 16-token configuration for smaller
+GPUs), dense models' throughput at
 256 requests (1.3x behind on Qwen2.5-0.5B), the rest of the attention gap on long prompts, checking
 EAGLE trees' tokens once each, DeepSeek's multi-token prediction, then GPT-OSS on the Apple GPU.
 

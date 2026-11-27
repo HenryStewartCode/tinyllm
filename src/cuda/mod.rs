@@ -52,7 +52,7 @@ pub const ATTENTION_PTX: &str = include_str!("attention.ptx");
 /// example), each after a line `// tinyllm module NAME`.
 pub const MLA_PTX: &str = include_str!("mla.ptx");
 /// Tokens per chunk the MLA kernel splits a sequence's latents into, from position 0.
-const MLA_CHUNK: usize = 512;
+const MLA_CHUNK: usize = 256;
 
 /// `MLA_CHUNK`, or `TINYLLM_MLA_CHUNK` (a multiple of 16) to try others.
 fn mla_chunk() -> usize {
